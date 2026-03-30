@@ -370,7 +370,6 @@ containers:
 |-------|------|-------------|
 | [#747](https://github.com/defenseunicorns/peat/issues/747) | peat | peat-sidecar umbrella |
 | [#748](https://github.com/defenseunicorns/peat/issues/748) | peat | Agent watcher (poll UDS Remote Agent) |
-| [#749](https://github.com/defenseunicorns/peat/issues/749) | peat | peat-uds-remote-agent Go client |
 | [#750](https://github.com/defenseunicorns/peat/issues/750) | peat | Cluster-to-cluster integration test |
 | [#751](https://github.com/defenseunicorns/peat/issues/751) | peat | Fleet state propagation design |
 | [#533](https://github.com/defenseunicorns/uds-remote-agent/issues/533) | uds-remote-agent | FleetService (future) |

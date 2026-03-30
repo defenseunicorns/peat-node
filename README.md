@@ -220,7 +220,11 @@ peat-sidecar/
 ├── bundle/uds-bundle.yaml       # UDS bundle
 ├── zarf.yaml                    # Zarf package config
 ├── Dockerfile                   # Multi-stage build
-└── docs/DESIGN.md               # Architecture and integration design
+├── docs/DESIGN.md               # Architecture and integration design
+└── test/go/                     # Go client + integration tests
+    ├── client.go                # Idiomatic Go client (Connect RPC)
+    ├── cmd/{smoketest,synctest,watchertest,query}/
+    └── cluster/                 # Cross-cluster k3d e2e test
 ```
 
 ## Related Projects
@@ -228,7 +232,7 @@ peat-sidecar/
 | Project | Description |
 |---------|-------------|
 | [peat](https://github.com/defenseunicorns/peat) | Decentralized mesh protocol (Rust) |
-| [peat-uds-remote-agent](https://github.com/defenseunicorns/peat-uds-remote-agent) | Pure Go client for this sidecar |
+| [test/go/](test/go/) | Go client library + integration tests (in this repo) |
 | [uds-remote-agent](https://github.com/defenseunicorns/uds-remote-agent) | UDS Remote Agent (primary integration target) |
 | [peat-registry](https://github.com/defenseunicorns/peat-registry) | OCI registry sync (validates the sidecar pattern) |
 
@@ -238,7 +242,6 @@ peat-sidecar/
 |-------|-------------|
 | [peat#747](https://github.com/defenseunicorns/peat/issues/747) | peat-sidecar umbrella |
 | [peat#748](https://github.com/defenseunicorns/peat/issues/748) | Agent watcher |
-| [peat#749](https://github.com/defenseunicorns/peat/issues/749) | Go client |
 | [peat#750](https://github.com/defenseunicorns/peat/issues/750) | Cluster-to-cluster test |
 | [peat#751](https://github.com/defenseunicorns/peat/issues/751) | Fleet state propagation design |
 | [uds-remote-agent#533](https://github.com/defenseunicorns/uds-remote-agent/issues/533) | FleetService (future agent-side APIs) |
