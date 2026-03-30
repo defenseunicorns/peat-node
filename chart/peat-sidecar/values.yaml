@@ -26,6 +26,11 @@ peers: []
 # -- Auto-start CRDT sync on boot
 autoSync: true
 
+# -- Agent watcher: poll a co-located service (e.g. UDS Remote Agent)
+# Set agentAddr to enable. Example: http://localhost:8080
+agentAddr: ""
+agentPollInterval: 10
+
 # -- Persistent storage for Automerge CRDT state and Iroh blobs
 persistence:
   enabled: false
@@ -45,3 +50,9 @@ resources:
 
 # -- Verbose logging
 verbose: false
+
+# -- UDS Operator Package CR (enables NetworkPolicies)
+package:
+  enabled: false
+  serviceMeshMode: ""
+  additionalNetworkAllow: []

@@ -1,0 +1,39 @@
+{{- if .Values.package.enabled }}
+apiVersion: uds.dev/v1alpha1
+kind: Package
+metadata:
+  name: peat-sidecar
+  namespace: {{ .Release.Namespace }}
+spec:
+  network:
+    allow:
+      # Egress to Iroh relay servers and mesh peers (QUIC/UDP)
+      - direction: Egress
+        selector:
+          app.kubernetes.io/name: peat-sidecar
+        remoteGenerated: Anywhere
+        description: "Iroh QUIC mesh egress (relay + direct peers)"
+
+      # Ingress from mesh peers (Iroh QUIC connections)
+      - direction: Ingress
+        selector:
+          app.kubernetes.io/name: peat-sidecar
+        remoteGenerated: Anywhere
+        description: "Iroh QUIC mesh ingress from peers"
+
+      # gRPC API ingress (for co-located apps or external fleet queries)
+      - direction: Ingress
+        selector:
+          app.kubernetes.io/name: peat-sidecar
+        port: 50051
+        description: "gRPC API ingress"
+
+      {{- with .Values.package.additionalNetworkAllow }}
+      {{ toYaml . | nindent 6 }}
+      {{- end }}
+
+    {{- if .Values.package.serviceMeshMode }}
+    serviceMesh:
+      mode: {{ .Values.package.serviceMeshMode }}
+    {{- end }}
+{{- end }}

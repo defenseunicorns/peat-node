@@ -1,4 +1,27 @@
 {{/*
+Standard name helpers
+*/}}
+{{- define "peat-sidecar.name" -}}
+peat-sidecar
+{{- end -}}
+
+{{- define "peat-sidecar.fullname" -}}
+{{ .Release.Name }}-peat-sidecar
+{{- end -}}
+
+{{- define "peat-sidecar.labels" -}}
+app.kubernetes.io/name: peat-sidecar
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "peat-sidecar.selectorLabels" -}}
+app.kubernetes.io/name: peat-sidecar
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/*
 peat-sidecar container spec — inject this into any pod as an additional container.
 
 Usage in a parent chart:
@@ -34,6 +57,12 @@ Usage in a parent chart:
     {{- if .Values.autoSync }}
     - name: PEAT_SIDECAR_AUTO_SYNC
       value: "true"
+    {{- end }}
+    {{- if .Values.agentAddr }}
+    - name: PEAT_SIDECAR_AGENT_ADDR
+      value: {{ .Values.agentAddr | quote }}
+    - name: PEAT_SIDECAR_AGENT_POLL_INTERVAL
+      value: {{ .Values.agentPollInterval | quote }}
     {{- end }}
     {{- if .Values.verbose }}
     - name: RUST_LOG
@@ -87,7 +116,7 @@ Usage:
 - name: peat-sidecar-data
   {{- if .Values.persistence.enabled }}
   persistentVolumeClaim:
-    claimName: {{ .Release.Name }}-peat-sidecar-data
+    claimName: {{ include "peat-sidecar.fullname" . }}-data
   {{- else }}
   emptyDir: {}
   {{- end }}
@@ -95,14 +124,4 @@ Usage:
 - name: peat-sidecar-socket
   emptyDir: {}
 {{- end }}
-{{- end -}}
-
-{{/*
-Standard labels
-*/}}
-{{- define "peat-sidecar.labels" -}}
-app.kubernetes.io/name: peat-sidecar
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
