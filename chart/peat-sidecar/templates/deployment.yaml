@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-peat-sidecar
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "peat-sidecar.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: peat-sidecar
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: peat-sidecar
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        {{- include "peat-sidecar.container" . | nindent 8 }}
+      volumes:
+        {{- include "peat-sidecar.volumes" . | nindent 8 }}

@@ -1,0 +1,61 @@
+[package]
+name = "peat-sidecar"
+version = "0.1.0"
+edition = "2021"
+authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/defenseunicorns/peat-sidecar"
+description = "Peat mesh sidecar — exposes peat-protocol as a gRPC API for co-located applications"
+
+[[bin]]
+name = "peat-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+# Mesh networking (Automerge CRDT sync + Iroh blob transfer)
+peat-mesh = { version = "0.6", features = ["automerge-backend"] }
+
+# Automerge CRDT
+automerge = "0.7"
+
+# P2P networking
+iroh = "0.97"
+
+# gRPC server
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = "0.1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (for agent watcher — Connect RPC JSON encoding)
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
+hyper-util = { version = "0.1", features = ["http2", "tokio"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio = { version = "1", features = ["full", "test-util"] }

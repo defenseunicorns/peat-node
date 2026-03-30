@@ -1,0 +1,19 @@
+{{- if hasPrefix "tcp://" .Values.listen }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-peat-sidecar
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "peat-sidecar.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: peat-sidecar
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: grpc
+      port: {{ (split ":" .Values.listen)._2 }}
+      targetPort: grpc
+      protocol: TCP
+{{- end }}

@@ -1,0 +1,47 @@
+# peat-sidecar Helm chart values
+
+# -- Container image
+image:
+  repository: ghcr.io/defenseunicorns/peat-sidecar
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# -- gRPC listen address (inside the pod)
+# Use "unix:///tmp/peat.sock" for Unix socket or "tcp://127.0.0.1:50051" for TCP.
+# Unix socket is preferred for sidecar-to-app communication (no port conflicts).
+listen: "tcp://127.0.0.1:50051"
+
+# -- Node identifier. If empty, a random UUID is generated on startup.
+nodeId: ""
+
+# -- Formation/application identifier for group authentication
+appId: "peat-default"
+
+# -- Base64-encoded 32-byte shared key for formation authentication
+sharedKey: ""
+
+# -- Peer endpoint IDs to connect to on startup (comma-separated or list)
+peers: []
+
+# -- Auto-start CRDT sync on boot
+autoSync: true
+
+# -- Persistent storage for Automerge CRDT state and Iroh blobs
+persistence:
+  enabled: false
+  storageClass: ""
+  size: 1Gi
+  accessModes:
+    - ReadWriteOnce
+
+# -- Pod resource requests and limits (sidecar is lightweight)
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# -- Verbose logging
+verbose: false
