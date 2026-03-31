@@ -58,9 +58,7 @@ async fn list_documents() {
 
     node.put_document("col", "a", r#"{"x":1}"#).await.unwrap();
     node.put_document("col", "b", r#"{"x":2}"#).await.unwrap();
-    node.put_document("other", "c", r#"{"x":3}"#)
-        .await
-        .unwrap();
+    node.put_document("other", "c", r#"{"x":3}"#).await.unwrap();
 
     let mut ids = node.list_documents("col").await.unwrap();
     ids.sort();
@@ -91,9 +89,7 @@ async fn invalid_json_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let node = test_node(dir.path()).await;
 
-    let result = node
-        .put_document("test", "bad", "not valid json")
-        .await;
+    let result = node.put_document("test", "bad", "not valid json").await;
     assert!(result.is_err());
 }
 
