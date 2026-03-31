@@ -64,12 +64,15 @@ graph TB
         hubapi["API Server + Agent Manager + Postgres"]
         hubsidecar["peat-sidecar<br/>(consumes fleet state from CRDT)"]
     end
-    hubsidecar <-. "Peat CRDT Mesh<br/>(Automerge + Iroh QUIC)" .-> e1sidecar
+    hubsidecar <-. "CRDT sync" .-> e1sidecar
     hubsidecar <-.-> e2sidecar
     hubsidecar <-.-> e3sidecar
+    e1sidecar <-. "peer-to-peer<br/>sync" .-> e2sidecar
+    e2sidecar <-.-> e3sidecar
+    e1sidecar <-.-> e3sidecar
     subgraph e1["Edge Cluster 1"]
         e1agent["Remote Agent"]
-        e1sidecar["peat-sidecar<br/>(watcher + mesh node)"]
+        e1sidecar["peat-sidecar"]
         e1sidecar --> e1agent
     end
     subgraph e2["Edge Cluster 2"]
@@ -84,7 +87,7 @@ graph TB
     end
 ```
 
-The mesh is peer-to-peer — edge clusters can also sync directly with each other without routing through the hub.
+The mesh is fully peer-to-peer. Edge clusters sync directly with each other — state propagates even when the hub is unreachable. When connectivity to the hub resumes, it catches up automatically via CRDT merge.
 
 What Peat adds:
 1. **Partition tolerance** — agents sync state via CRDT even when the
