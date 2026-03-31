@@ -62,30 +62,29 @@ the DDIL-resilient transport layer underneath it.**
 graph TB
     subgraph hub["Fleet Command Hub"]
         hubapi["API Server + Agent Manager + Postgres"]
-        hubsidecar["peat-sidecar<br/>(mesh participant — consumes<br/>fleet state from CRDT)"]
+        hubsidecar["peat-sidecar<br/>(consumes fleet state from CRDT)"]
     end
-    subgraph mesh["Peat CRDT Mesh<br/>Peer-to-peer · Partition tolerant<br/>Multi-transport: QUIC, BLE, relay"]
-        hubsidecar <--> edge1sidecar
-        hubsidecar <--> edge2sidecar
-        hubsidecar <--> edge3sidecar
-        edge1sidecar <--> edge2sidecar
-    end
+    hubsidecar <-. "Peat CRDT Mesh<br/>(Automerge + Iroh QUIC)" .-> e1sidecar
+    hubsidecar <-.-> e2sidecar
+    hubsidecar <-.-> e3sidecar
     subgraph e1["Edge Cluster 1"]
-        edge1agent["Remote Agent"]
-        edge1sidecar["peat-sidecar<br/>(watcher + mesh node)"]
-        edge1sidecar --> edge1agent
+        e1agent["Remote Agent"]
+        e1sidecar["peat-sidecar<br/>(watcher + mesh node)"]
+        e1sidecar --> e1agent
     end
     subgraph e2["Edge Cluster 2"]
-        edge2agent["Remote Agent"]
-        edge2sidecar["peat-sidecar<br/>(watcher + mesh node)"]
-        edge2sidecar --> edge2agent
+        e2agent["Remote Agent"]
+        e2sidecar["peat-sidecar"]
+        e2sidecar --> e2agent
     end
     subgraph e3["Edge Cluster 3"]
-        edge3agent["Remote Agent"]
-        edge3sidecar["peat-sidecar<br/>(watcher + mesh node)"]
-        edge3sidecar --> edge3agent
+        e3agent["Remote Agent"]
+        e3sidecar["peat-sidecar"]
+        e3sidecar --> e3agent
     end
 ```
+
+The mesh is peer-to-peer — edge clusters can also sync directly with each other without routing through the hub.
 
 What Peat adds:
 1. **Partition tolerance** — agents sync state via CRDT even when the
@@ -174,21 +173,16 @@ state flows without any real-time network connectivity.
 ## Architecture (Pod-Level)
 
 ```mermaid
-graph TB
+graph LR
     subgraph pod["Kubernetes Pod"]
-        subgraph agent["uds-remote-agent"]
-            agentserver["Connect RPC :8080<br/>ZarfAPI, RegistryAPI,<br/>SettingsAPI, OSAPI"]
-            agentclient["As client:<br/>OCI registry pulls<br/>Zarf registry proxy<br/>Kubernetes API<br/>Fleet Mgmt heartbeat"]
-        end
-        subgraph sidecar["peat-sidecar"]
-            watcher["Agent Watcher<br/>(Connect RPC client)"]
-            crdt["CRDT Store (Automerge)<br/>platforms/ · deployments/ · packages/"]
-            mesh["Mesh Transport<br/>(Iroh QUIC)"]
-            watcher --> crdt --> mesh
-        end
-        watcher -- "polls /status,<br/>ListPackages, etc." --> agentserver
+        agent["uds-remote-agent<br/>Connect RPC :8080"]
+        watcher["peat-sidecar<br/>Agent Watcher"]
+        crdt["CRDT Store<br/>platforms/ · deployments/ · packages/"]
+        mesh["Iroh QUIC<br/>Mesh Transport"]
     end
-    mesh -. "Iroh QUIC / BLE / relay" .-> others["Other peat-sidecar instances"]
+    watcher -- "polls /status,<br/>ListPackages" --> agent
+    watcher --> crdt --> mesh
+    mesh -. "QUIC / BLE / relay" .-> others["Other<br/>peat-sidecars"]
 ```
 
 ## UDS Remote Agent: Server AND Client
