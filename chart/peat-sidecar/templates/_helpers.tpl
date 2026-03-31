@@ -50,6 +50,16 @@ Usage in a parent chart:
     - name: PEAT_SIDECAR_SHARED_KEY
       value: {{ .Values.sharedKey | quote }}
     {{- end }}
+    {{- if .Values.encryptionKey }}
+    - name: PEAT_SIDECAR_ENCRYPTION_KEY
+      value: {{ .Values.encryptionKey | quote }}
+    {{- else if and .Values.encryptionKeySecret.name .Values.encryptionKeySecret.key }}
+    - name: PEAT_SIDECAR_ENCRYPTION_KEY
+      valueFrom:
+        secretKeyRef:
+          name: {{ .Values.encryptionKeySecret.name }}
+          key: {{ .Values.encryptionKeySecret.key }}
+    {{- end }}
     {{- if .Values.peers }}
     - name: PEAT_SIDECAR_PEERS
       value: {{ join "," .Values.peers | quote }}
@@ -63,6 +73,14 @@ Usage in a parent chart:
       value: {{ .Values.agentAddr | quote }}
     - name: PEAT_SIDECAR_AGENT_POLL_INTERVAL
       value: {{ .Values.agentPollInterval | quote }}
+    {{- if .Values.agentTls.enabled }}
+    - name: PEAT_SIDECAR_AGENT_TLS_CERT
+      value: /etc/peat-sidecar/agent-tls/tls.crt
+    - name: PEAT_SIDECAR_AGENT_TLS_KEY
+      value: /etc/peat-sidecar/agent-tls/tls.key
+    - name: PEAT_SIDECAR_AGENT_TLS_CA
+      value: /etc/peat-sidecar/agent-tls/ca.crt
+    {{- end }}
     {{- end }}
     {{- if .Values.verbose }}
     - name: RUST_LOG
@@ -103,6 +121,11 @@ Usage in a parent chart:
     - name: peat-sidecar-socket
       mountPath: {{ dir (trimPrefix "unix://" .Values.listen) }}
     {{- end }}
+    {{- if and .Values.agentTls.enabled .Values.agentTls.secretName }}
+    - name: peat-sidecar-agent-tls
+      mountPath: /etc/peat-sidecar/agent-tls
+      readOnly: true
+    {{- end }}
 {{- end -}}
 
 {{/*
@@ -123,5 +146,10 @@ Usage:
 {{- if hasPrefix "unix://" .Values.listen }}
 - name: peat-sidecar-socket
   emptyDir: {}
+{{- end }}
+{{- if and .Values.agentTls.enabled .Values.agentTls.secretName }}
+- name: peat-sidecar-agent-tls
+  secret:
+    secretName: {{ .Values.agentTls.secretName }}
 {{- end }}
 {{- end -}}

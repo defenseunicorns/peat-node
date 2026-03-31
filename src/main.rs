@@ -52,6 +52,11 @@ struct Args {
     #[arg(long, env = "PEAT_SIDECAR_SHARED_KEY", default_value = "")]
     shared_key: String,
 
+    /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
+    /// When set, all document payloads are encrypted before storage and decrypted on read.
+    #[arg(long, env = "PEAT_SIDECAR_ENCRYPTION_KEY")]
+    encryption_key: Option<String>,
+
     /// Peer endpoint IDs to connect to on startup.
     #[arg(long, env = "PEAT_SIDECAR_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
@@ -69,6 +74,19 @@ struct Args {
     /// Agent poll interval in seconds.
     #[arg(long, env = "PEAT_SIDECAR_AGENT_POLL_INTERVAL", default_value = "10")]
     agent_poll_interval: u64,
+
+    // --- Agent Watcher TLS ---
+    /// Path to PEM-encoded client certificate for mTLS to the agent.
+    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_CERT")]
+    agent_tls_cert: Option<PathBuf>,
+
+    /// Path to PEM-encoded client private key for mTLS to the agent.
+    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_KEY")]
+    agent_tls_key: Option<PathBuf>,
+
+    /// Path to PEM-encoded CA certificate for verifying the agent's server certificate.
+    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_CA")]
+    agent_tls_ca: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -102,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         shared_key: args.shared_key,
         data_dir: args.data_dir,
         peers: args.peer.clone(),
+        encryption_key: args.encryption_key,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
@@ -127,6 +146,11 @@ async fn main() -> anyhow::Result<()> {
             agent_addr,
             poll_interval: Duration::from_secs(args.agent_poll_interval),
             node_id: node_id.clone(),
+            tls: watcher::TlsConfig {
+                cert: args.agent_tls_cert,
+                key: args.agent_tls_key,
+                ca_cert: args.agent_tls_ca,
+            },
         };
         let watcher_node = Arc::clone(&node);
         tokio::spawn(async move {

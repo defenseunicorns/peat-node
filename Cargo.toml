@@ -42,12 +42,17 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 
+# Encryption at rest
+aes-gcm = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client (for agent watcher — Connect RPC JSON encoding)
-reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls"] }
 hyper-util = { version = "0.1", features = ["http2", "tokio"] }
 
 # CLI

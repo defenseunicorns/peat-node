@@ -3039,9 +3039,11 @@ dependencies = [
 name = "peat-sidecar"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "automerge",
+ "base64",
  "chrono",
  "clap",
  "hex",
@@ -3050,6 +3052,7 @@ dependencies = [
  "peat-mesh",
  "prost",
  "prost-types",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",

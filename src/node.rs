@@ -16,6 +16,8 @@ use peat_mesh::storage::{
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+use crate::crypto::StoreCipher;
+
 /// Configuration for the sidecar node.
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
@@ -24,6 +26,9 @@ pub struct SidecarConfig {
     pub shared_key: String,
     pub data_dir: PathBuf,
     pub peers: Vec<String>,
+    /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
+    /// When set, all document payloads are encrypted before storage and decrypted on read.
+    pub encryption_key: Option<String>,
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -35,6 +40,7 @@ pub struct SidecarNode {
     blob_store: Arc<NetworkedIrohBlobStore>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
+    cipher: Option<StoreCipher>,
 }
 
 /// Internal change event for the broadcast channel.
@@ -99,14 +105,26 @@ impl SidecarNode {
         // from_endpoint_with_protocols already returns Arc<NetworkedIrohBlobStore>
         let blob_store = blob_store;
 
+        // Initialize optional encryption cipher
+        let cipher = match &config.encryption_key {
+            Some(key) if !key.is_empty() => {
+                let c = StoreCipher::from_base64_key(key)?;
+                info!("encryption at rest enabled (AES-256-GCM)");
+                Some(c)
+            }
+            _ => None,
+        };
+
         let (change_tx, _) = broadcast::channel(256);
 
         // Spawn a task to forward store observer changes to the broadcast channel
         let observer_rx = store.subscribe_to_observer_changes();
         let change_tx_clone = change_tx.clone();
         let store_clone = Arc::clone(&store);
+        let cipher_clone = cipher.clone();
         tokio::spawn(async move {
-            Self::forward_store_changes(observer_rx, change_tx_clone, store_clone).await;
+            Self::forward_store_changes(observer_rx, change_tx_clone, store_clone, cipher_clone)
+                .await;
         });
 
         // Spawn a sync loop: when local documents change, push to all peers
@@ -124,6 +142,7 @@ impl SidecarNode {
             blob_store,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
+            cipher,
         })
     }
 
@@ -152,6 +171,7 @@ impl SidecarNode {
         mut rx: broadcast::Receiver<String>,
         tx: broadcast::Sender<ChangeEvent>,
         store: Arc<AutomergeStore>,
+        cipher: Option<StoreCipher>,
     ) {
         loop {
             match rx.recv().await {
@@ -159,9 +179,23 @@ impl SidecarNode {
                     // Keys are "collection:doc_id"
                     if let Some((collection, doc_id)) = key.split_once(':') {
                         // Try to read the current value to include in the change event
-                        let json_data = match store.get(&key) {
+                        let raw = match store.get(&key) {
                             Ok(Some(doc)) => extract_json_from_automerge(&doc),
                             _ => None,
+                        };
+                        // Decrypt if encrypted
+                        let json_data = match raw {
+                            Some(v) if crate::crypto::is_encrypted(&v) => match &cipher {
+                                Some(c) => match c.decrypt(&v) {
+                                    Ok(plain) => Some(plain),
+                                    Err(e) => {
+                                        warn!(key, "failed to decrypt change event: {e}");
+                                        None
+                                    }
+                                },
+                                None => Some(v),
+                            },
+                            other => other,
                         };
                         let _ = tx.send(ChangeEvent {
                             collection: collection.to_string(),
@@ -284,13 +318,19 @@ impl SidecarNode {
 
         let key = format!("{collection}:{doc_id}");
 
-        // Create or update an Automerge document with the JSON value
+        // Optionally encrypt the payload before storing
+        let store_value = match &self.cipher {
+            Some(c) => c.encrypt(json_data)?,
+            None => json_data.to_string(),
+        };
+
+        // Create or update an Automerge document with the (possibly encrypted) value
         let mut doc = match self.store.get(&key)? {
             Some(existing) => existing,
             None => automerge::Automerge::new(),
         };
         let mut tx = doc.transaction();
-        tx.put(automerge::ROOT, "value", json_data)?;
+        tx.put(automerge::ROOT, "value", store_value.as_str())?;
         tx.commit();
 
         self.store.put(&key, &doc)?;
@@ -313,7 +353,7 @@ impl SidecarNode {
     ) -> anyhow::Result<Option<String>> {
         let key = format!("{collection}:{doc_id}");
         match self.store.get(&key)? {
-            Some(doc) => Ok(extract_json_from_automerge(&doc)),
+            Some(doc) => Ok(self.maybe_decrypt(extract_json_from_automerge(&doc))?),
             None => Ok(None),
         }
     }
@@ -339,6 +379,18 @@ impl SidecarNode {
             .into_iter()
             .filter_map(|(k, _)| k.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect())
+    }
+
+    /// Decrypt a value if it's encrypted and a cipher is configured.
+    /// Transparently passes through plaintext values (backward compatible).
+    fn maybe_decrypt(&self, value: Option<String>) -> anyhow::Result<Option<String>> {
+        match value {
+            Some(v) if crate::crypto::is_encrypted(&v) => match &self.cipher {
+                Some(c) => Ok(Some(c.decrypt(&v)?)),
+                None => Ok(Some(v)), // no cipher configured, return as-is
+            },
+            other => Ok(other),
+        }
     }
 
     /// Subscribe to document changes. Returns a broadcast receiver.
