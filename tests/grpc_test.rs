@@ -13,10 +13,7 @@ use peat_sidecar::proto::{
 };
 use peat_sidecar::service::PeatSidecarService;
 
-async fn boot_grpc_server(
-    port: u16,
-    encryption_key: Option<String>,
-) -> PeatSidecarClient<Channel> {
+async fn boot_grpc_server(port: u16, encryption_key: Option<String>) -> PeatSidecarClient<Channel> {
     let dir = tempfile::tempdir().unwrap();
     let node = std::sync::Arc::new(
         SidecarNode::new(SidecarConfig {
