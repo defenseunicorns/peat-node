@@ -7,23 +7,23 @@ Peat mesh sidecar — a Rust binary that runs alongside applications in Kubernet
 ## How It Works
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  Kubernetes Pod                                               │
-│                                                               │
-│  ┌────────────────────┐     ┌──────────────────────────────┐ │
-│  │ Your Application    │     │ peat-sidecar                 │ │
-│  │                     │     │                              │ │
-│  │  gRPC client    ────┼─────┤  gRPC API (:50051)          │ │
-│  │  (any language)     │     │  21 RPCs: documents, peers,  │ │
-│  │                     │     │  subscriptions, sync control │ │
-│  └────────────────────┘     │                              │ │
-│                              │  CRDT Store (Automerge)      │ │
-│                              │  P2P Transport (Iroh QUIC)   │ │
-│                              └───────────┬──────────────────┘ │
-└──────────────────────────────────────────┼────────────────────┘
-                                           │
++--------------------------------------------------------------+
+|  Kubernetes Pod                                               |
+|                                                               |
+|  +--------------------+     +------------------------------+ |
+|  | Your Application    |     | peat-sidecar                 | |
+|  |                     |     |                              | |
+|  |  gRPC client    ----+-----+  gRPC API (:50051)          | |
+|  |  (any language)     |     |  21 RPCs: documents, peers,  | |
+|  |                     |     |  subscriptions, sync control | |
+|  +--------------------+     |                              | |
+|                              |  CRDT Store (Automerge)      | |
+|                              |  P2P Transport (Iroh QUIC)   | |
+|                              +-----------+------------------+ |
++------------------------------------------+--------------------+
+                                           |
                                   Iroh QUIC (relay or direct)
-                                           │
+                                           |
                                   Other peat-sidecar instances
                                   on other clusters
 ```
@@ -35,18 +35,18 @@ Documents written on one cluster automatically sync to all connected peers via A
 When deployed alongside [UDS Remote Agent](https://github.com/defenseunicorns/uds-remote-agent), the sidecar's agent watcher polls the agent's existing Connect RPC APIs and syncs fleet state across clusters:
 
 ```
-┌─ Edge Cluster Alpha ────────────────┐     ┌─ Edge Cluster Bravo ────────────────┐
-│                                      │     │                                      │
-│  UDS Remote Agent (:8080)            │     │  UDS Remote Agent (:8080)            │
-│       ▲                              │     │       ▲                              │
-│       │ Connect RPC (same as CLI/UI) │     │       │ Connect RPC (same as CLI/UI) │
-│       │                              │     │       │                              │
-│  peat-sidecar (:50051)              │     │  peat-sidecar (:50051)              │
-│  ● Polls /status, ListPackages      │     │  ● Polls /status, ListPackages      │
-│  ● Writes to CRDT store             │     │  ● Writes to CRDT store             │
-│  ● Syncs via Iroh QUIC ─────────────┼─────┼──● Receives CRDT state              │
-│                                      │     │                                      │
-└──────────────────────────────────────┘     └──────────────────────────────────────┘
++- Edge Cluster Alpha ----------------+     +- Edge Cluster Bravo ----------------+
+|                                      |     |                                      |
+|  UDS Remote Agent (:8080)            |     |  UDS Remote Agent (:8080)            |
+|       ^                              |     |       ^                              |
+|       | Connect RPC (same as CLI/UI) |     |       | Connect RPC (same as CLI/UI) |
+|       |                              |     |       |                              |
+|  peat-sidecar (:50051)              |     |  peat-sidecar (:50051)              |
+|  * Polls /status, ListPackages      |     |  * Polls /status, ListPackages      |
+|  * Writes to CRDT store             |     |  * Writes to CRDT store             |
+|  * Syncs via Iroh QUIC -------------+-----+--* Receives CRDT state              |
+|                                      |     |                                      |
++--------------------------------------+     +--------------------------------------+
 
 Result: Query either sidecar → see fleet-wide agent state from both clusters
 ```
@@ -203,28 +203,28 @@ See [docs/DESIGN.md](docs/DESIGN.md) for:
 
 ```
 peat-sidecar/
-├── proto/sidecar.proto          # gRPC service definition
-├── src/
-│   ├── main.rs                  # CLI + server bootstrap
-│   ├── lib.rs                   # Module exports
-│   ├── node.rs                  # SidecarNode (Automerge + Iroh mesh stack)
-│   ├── service.rs               # gRPC service implementation
-│   └── watcher.rs               # Agent watcher (Connect RPC poller)
-├── chart/peat-sidecar/          # Helm chart
-│   ├── templates/
-│   │   ├── deployment.yaml      # Standalone deployment
-│   │   ├── service.yaml         # ClusterIP service
-│   │   ├── uds-package.yaml     # UDS Package CR (NetworkPolicies)
-│   │   └── _helpers.tpl         # Injectable container/volume templates
-│   └── values.yaml
-├── bundle/uds-bundle.yaml       # UDS bundle
-├── zarf.yaml                    # Zarf package config
-├── Dockerfile                   # Multi-stage build
-├── docs/DESIGN.md               # Architecture and integration design
-└── test/go/                     # Go client + integration tests
-    ├── client.go                # Idiomatic Go client (Connect RPC)
-    ├── cmd/{smoketest,synctest,watchertest,query}/
-    └── cluster/                 # Cross-cluster k3d e2e test
++-- proto/sidecar.proto          # gRPC service definition
++-- src/
+|   +-- main.rs                  # CLI + server bootstrap
+|   +-- lib.rs                   # Module exports
+|   +-- node.rs                  # SidecarNode (Automerge + Iroh mesh stack)
+|   +-- service.rs               # gRPC service implementation
+|   +-- watcher.rs               # Agent watcher (Connect RPC poller)
++-- chart/peat-sidecar/          # Helm chart
+|   +-- templates/
+|   |   +-- deployment.yaml      # Standalone deployment
+|   |   +-- service.yaml         # ClusterIP service
+|   |   +-- uds-package.yaml     # UDS Package CR (NetworkPolicies)
+|   |   +-- _helpers.tpl         # Injectable container/volume templates
+|   +-- values.yaml
++-- bundle/uds-bundle.yaml       # UDS bundle
++-- zarf.yaml                    # Zarf package config
++-- Dockerfile                   # Multi-stage build
++-- docs/DESIGN.md               # Architecture and integration design
++-- test/go/                     # Go client + integration tests
+    +-- client.go                # Idiomatic Go client (Connect RPC)
+    +-- cmd/{smoketest,synctest,watchertest,query}/
+    +-- cluster/                 # Cross-cluster k3d e2e test
 ```
 
 ## Related Projects
