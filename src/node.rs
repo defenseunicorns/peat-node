@@ -7,13 +7,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use automerge::transaction::Transactable;
+use automerge::ReadDoc;
 use peat_mesh::storage::{
     AutomergeStore, AutomergeSyncCoordinator, MeshSyncTransport, NetworkedIrohBlobStore,
     SyncProtocolHandler, SyncTransport, CAP_AUTOMERGE_ALPN,
 };
 use tokio::sync::broadcast;
-use automerge::transaction::Transactable;
-use automerge::ReadDoc;
 use tracing::{info, warn};
 
 /// Configuration for the sidecar node.
@@ -356,11 +356,8 @@ impl SidecarNode {
 /// Extract the JSON string stored in an Automerge document.
 fn extract_json_from_automerge(doc: &automerge::Automerge) -> Option<String> {
     match doc.get(automerge::ROOT, "value") {
-        Ok(Some((value, _))) => match value {
-            automerge::Value::Scalar(s) => match s.as_ref() {
-                automerge::ScalarValue::Str(s) => Some(s.to_string()),
-                _ => None,
-            },
+        Ok(Some((automerge::Value::Scalar(s), _))) => match s.as_ref() {
+            automerge::ScalarValue::Str(s) => Some(s.to_string()),
             _ => None,
         },
         _ => None,

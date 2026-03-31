@@ -157,9 +157,8 @@ impl PeatSidecar for PeatSidecarService {
             .into_inner()
             .platform
             .ok_or_else(|| Status::invalid_argument("platform is required"))?;
-        let json = serde_json::to_string(&platform_to_map(&platform)).map_err(|e| {
-            Status::internal(format!("serialization error: {e}"))
-        })?;
+        let json = serde_json::to_string(&platform_to_map(&platform))
+            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
         self.node
             .put_document("platforms", &platform.id, &json)
             .await
@@ -213,11 +212,7 @@ impl PeatSidecar for PeatSidecarService {
         &self,
         _req: Request<proto::GetCellsRequest>,
     ) -> Result<Response<proto::GetCellsResponse>, Status> {
-        let doc_ids = self
-            .node
-            .list_documents("cells")
-            .await
-            .map_err(internal)?;
+        let doc_ids = self.node.list_documents("cells").await.map_err(internal)?;
         let mut cells = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
             if let Some(json) = self
@@ -255,11 +250,7 @@ impl PeatSidecar for PeatSidecarService {
         &self,
         _req: Request<proto::GetTracksRequest>,
     ) -> Result<Response<proto::GetTracksResponse>, Status> {
-        let doc_ids = self
-            .node
-            .list_documents("tracks")
-            .await
-            .map_err(internal)?;
+        let doc_ids = self.node.list_documents("tracks").await.map_err(internal)?;
         let mut tracks = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
             if let Some(json) = self
@@ -505,10 +496,7 @@ fn map_to_track(id: &str, json: &str) -> anyhow::Result<proto::Track> {
         cep_m: v["cep_m"].as_f64(),
         heading_deg: v["heading_deg"].as_f64(),
         speed_mps: v["speed_mps"].as_f64(),
-        classification: v["classification"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        classification: v["classification"].as_str().unwrap_or_default().to_string(),
         confidence: v["confidence"].as_f64().unwrap_or_default(),
         category: v["category"].as_i64().unwrap_or_default() as i32,
     })
