@@ -25,11 +25,19 @@ use peat_sidecar::watcher;
 struct Args {
     /// Listen address. Use "unix:///path/to/sock" for Unix socket or
     /// "tcp://0.0.0.0:50051" for TCP. Default: tcp://0.0.0.0:50051
-    #[arg(long, env = "PEAT_SIDECAR_LISTEN", default_value = "tcp://0.0.0.0:50051")]
+    #[arg(
+        long,
+        env = "PEAT_SIDECAR_LISTEN",
+        default_value = "tcp://0.0.0.0:50051"
+    )]
     listen: String,
 
     /// Persistent data directory.
-    #[arg(long, env = "PEAT_SIDECAR_DATA_DIR", default_value = "/data/peat-sidecar")]
+    #[arg(
+        long,
+        env = "PEAT_SIDECAR_DATA_DIR",
+        default_value = "/data/peat-sidecar"
+    )]
     data_dir: PathBuf,
 
     /// Node identifier. Defaults to a random UUID.
@@ -53,7 +61,6 @@ struct Args {
     auto_sync: bool,
 
     // --- Agent Watcher ---
-
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
     /// Example: http://localhost:8080
     #[arg(long, env = "PEAT_SIDECAR_AGENT_ADDR")]
@@ -151,10 +158,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
     } else {
         // TCP
-        let addr_str = args
-            .listen
-            .strip_prefix("tcp://")
-            .unwrap_or(&args.listen);
+        let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
         let addr: std::net::SocketAddr = addr_str.parse()?;
 
         info!(%addr, "listening on TCP");

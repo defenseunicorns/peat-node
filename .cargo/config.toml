@@ -1,4 +1,0 @@
-# Use mold linker on Linux for faster linking (Docker builds)
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]

@@ -4,16 +4,18 @@
 
 FROM rust:1.93-bookworm AS builder
 
-# Install build tools: clang + mold linker (per .cargo/config.toml) + protoc
+# Install build tools: clang + mold linker + protoc
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang mold protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
+# Configure mold linker for faster Docker builds
+RUN mkdir -p .cargo && printf '[target.x86_64-unknown-linux-gnu]\nlinker = "clang"\nrustflags = ["-C", "link-arg=-fuse-ld=mold"]\n' > .cargo/config.toml
+
 # Copy everything needed for the build
 COPY Cargo.toml Cargo.lock ./
-COPY .cargo .cargo
 COPY build.rs build.rs
 COPY proto proto
 COPY src src

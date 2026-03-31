@@ -17,28 +17,18 @@ Command Hub.
 UDS Fleet Management (see `UDS Fleet Management` TDD) defines a
 hub-spoke architecture:
 
-```
-+- Fleet Command Hub (central cluster) ----------------------+
-|                                                              |
-|  +--------------+  +--------------+  +------------------+  |
-|  | API Server   |  | Agent Manager|  | Postgres         |  |
-|  | (Svelte UI + |  | (ConnectRPC) |  | (fleet state)    |  |
-|  |  REST API)   |  |              |  |                  |  |
-|  +--------------+  +------^-------+  +------------------+  |
-|                           |                                  |
-+---------------------------+----------------------------------+
-                            |
-              AgentService.Connect(AgentMessage)
-              South → North only
-              Heartbeat: status + workloads + labels
-                            |
-           +----------------+----------------+
-           |                |                |
-    +------+-------+ +-----+--------+ +-----+--------+
-    | Edge Cluster | | Edge Cluster | | Edge Cluster |
-    |  + Remote    | |  + Remote    | |  + Remote    |
-    |    Agent     | |    Agent     | |    Agent     |
-    +--------------+ +--------------+ +--------------+
+```mermaid
+graph BT
+    edge1["Edge Cluster<br/>+ Remote Agent"] -- "AgentService.Connect()<br/>Heartbeat: status +<br/>workloads + labels" --> mgr
+    edge2["Edge Cluster<br/>+ Remote Agent"] -- "South → North" --> mgr
+    edge3["Edge Cluster<br/>+ Remote Agent"] --> mgr
+    subgraph hub["Fleet Command Hub (central cluster)"]
+        api["API Server<br/>(Svelte UI + REST)"]
+        mgr["Agent Manager<br/>(ConnectRPC)"]
+        db["Postgres<br/>(fleet state)"]
+        mgr --> db
+        api --> db
+    end
 ```
 
 Key characteristics:
@@ -68,33 +58,36 @@ Customer scenarios that expose this:
 Peat doesn't replace the Fleet Management architecture — it **provides
 the DDIL-resilient transport layer underneath it.**
 
+```mermaid
+graph TB
+    subgraph hub["Fleet Command Hub"]
+        hubapi["API Server + Agent Manager + Postgres"]
+        hubsidecar["peat-sidecar<br/>(consumes fleet state from CRDT)"]
+    end
+    hubsidecar <-. "CRDT sync" .-> e1sidecar
+    hubsidecar <-.-> e2sidecar
+    hubsidecar <-.-> e3sidecar
+    e1sidecar <-. "peer-to-peer<br/>sync" .-> e2sidecar
+    e2sidecar <-.-> e3sidecar
+    e1sidecar <-.-> e3sidecar
+    subgraph e1["Edge Cluster 1"]
+        e1agent["Remote Agent"]
+        e1sidecar["peat-sidecar"]
+        e1sidecar --> e1agent
+    end
+    subgraph e2["Edge Cluster 2"]
+        e2agent["Remote Agent"]
+        e2sidecar["peat-sidecar"]
+        e2sidecar --> e2agent
+    end
+    subgraph e3["Edge Cluster 3"]
+        e3agent["Remote Agent"]
+        e3sidecar["peat-sidecar"]
+        e3sidecar --> e3agent
+    end
 ```
-+- Fleet Command Hub ----------------------------------------+
-|  API Server + Agent Manager + Postgres                      |
-|                                                              |
-|  +------------------------------------------------------+   |
-|  | peat-sidecar                                          |   |
-|  | (mesh participant — consumes fleet state from CRDT)   |   |
-|  +------------------------+-----------------------------+   |
-+---------------------------+----------------------------------+
-                            |
-              Peat CRDT Mesh (Automerge + Iroh QUIC)
-              * Peer-to-peer — no central dependency
-              * Survives network partitions
-              * Multi-transport: QUIC, BLE, relay
-              * Eventually consistent
-                            |
-           +----------------+----------------+
-           |                |                |
-    +------+-------+ +-----+--------+ +-----+--------+
-    | Edge Cluster | | Edge Cluster | | Edge Cluster |
-    |              | |              | |              |
-    | Remote Agent | | Remote Agent | | Remote Agent |
-    | peat-sidecar | | peat-sidecar | | peat-sidecar |
-    | (watcher +   | | (watcher +   | | (watcher +   |
-    |  mesh node)  | |  mesh node)  | |  mesh node)  |
-    +--------------+ +--------------+ +--------------+
-```
+
+The mesh is fully peer-to-peer. Edge clusters sync directly with each other — state propagates even when the hub is unreachable. When connectivity to the hub resumes, it catches up automatically via CRDT merge.
 
 What Peat adds:
 1. **Partition tolerance** — agents sync state via CRDT even when the
@@ -157,13 +150,21 @@ The Fleet Management TDD describes a UDS Android tablet as an
 "enrollment authority" for provisioning edge clusters. The same
 tablet could run peat-sidecar and serve as a **mobile mesh bridge**:
 
-```
-Air-gapped environment                    Connected environment
----------------------                    ---------------------
-
-Edge Cluster A <--BLE--> Tablet ···sneakernet···> Hub Cluster
-Edge Cluster B <--BLE-->   (peat-sidecar)         (peat-sidecar)
-Edge Cluster C <--BLE-->
+```mermaid
+graph LR
+    subgraph airgap["Air-Gapped Environment"]
+        a["Edge Cluster A"]
+        b["Edge Cluster B"]
+        c["Edge Cluster C"]
+        tablet["Tablet<br/>(peat-sidecar)"]
+        a <-- "BLE" --> tablet
+        b <-- "BLE" --> tablet
+        c <-- "BLE" --> tablet
+    end
+    tablet -. "sneakernet" .-> hubsidecar
+    subgraph connected["Connected Environment"]
+        hubsidecar["Hub Cluster<br/>(peat-sidecar)"]
+    end
 ```
 
 The tablet syncs with edge clusters via BLE, physically moves to
@@ -174,30 +175,17 @@ state flows without any real-time network connectivity.
 
 ## Architecture (Pod-Level)
 
-```
-+----------------------------------------------------------------------+
-|  Kubernetes Pod                                                       |
-|                                                                       |
-|  +--------------------------+     +--------------------------------+ |
-|  | uds-remote-agent         |     | peat-sidecar                   | |
-|  |                          |     |                                | |
-|  |  Connect RPC :8080    <--+-----+  Agent Watcher                 | |
-|  |  (ZarfAPI, RegistryAPI,  |     |  (Connect RPC client, polls    | |
-|  |   SettingsAPI, OSAPI)    |     |   /status, ListPackages, etc.) | |
-|  |                          |     |                                | |
-|  |  As client:              |     |  CRDT Store (Automerge)        | |
-|  |  - OCI registry pulls    |     |  * platforms/  (agent state)   | |
-|  |  - Zarf registry proxy   |     |  * deployments/(packages)     | |
-|  |  - Kubernetes API        |     |  * packages/  (pulled cache)   | |
-|  |  - Fleet Mgmt heartbeat  |     |                                | |
-|  |    (AgentService.Connect)|     |  Mesh Transport (Iroh QUIC)    | |
-|  +--------------------------+     +-----------+------------------+ |
-|                                                |                    |
-+------------------------------------------------+--------------------+
-                                                 |
-                                        Iroh QUIC / BLE / relay
-                                                 |
-                                        Other peat-sidecar instances
+```mermaid
+graph LR
+    subgraph pod["Kubernetes Pod"]
+        agent["uds-remote-agent<br/>Connect RPC :8080"]
+        watcher["peat-sidecar<br/>Agent Watcher"]
+        crdt["CRDT Store<br/>platforms/ · deployments/ · packages/"]
+        mesh["Iroh QUIC<br/>Mesh Transport"]
+    end
+    watcher -- "polls /status,<br/>ListPackages" --> agent
+    watcher --> crdt --> mesh
+    mesh -. "QUIC / BLE / relay" .-> others["Other<br/>peat-sidecars"]
 ```
 
 ## UDS Remote Agent: Server AND Client
@@ -273,10 +261,8 @@ state flow inbound to the local agent?
 
 Fleet-wide queries go to the sidecar. The agent stays unaware.
 
-```
-CLI --> sidecar :50051  →  fleet-wide view
-CLI --> agent :8080     →  local-only view
-```
+- `CLI` → `sidecar :50051` → fleet-wide view
+- `CLI` → `agent :8080` → local-only view
 
 **Option B: Sidecar feeds Agent Manager on the hub (planned)**
 

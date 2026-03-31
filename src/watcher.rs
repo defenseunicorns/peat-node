@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::node::SidecarNode;
 
@@ -56,8 +56,7 @@ pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
         }
 
         // Poll pulled packages
-        if let Err(e) = poll_pulled_packages(&client, &config.agent_addr, &agent_id, &node).await
-        {
+        if let Err(e) = poll_pulled_packages(&client, &config.agent_addr, &agent_id, &node).await {
             debug!("poll ListPulledPackages failed: {e}");
         }
     }
@@ -75,6 +74,7 @@ struct AgentStatus {
     k8s_node_status: Option<String>,
     zarf_version: Option<String>,
     run_mode: Option<String>,
+    #[allow(dead_code)]
     system_time: Option<i64>,
 }
 
@@ -245,11 +245,7 @@ async fn poll_pulled_packages(
                 let arch = tag.arch.as_deref().unwrap_or("unknown");
                 let doc_key = format!("{agent_id}:{reference}-{arch}");
 
-                let pull_status = tag
-                    .pull_info
-                    .as_ref()
-                    .and_then(|p| p.status)
-                    .unwrap_or(0);
+                let pull_status = tag.pull_info.as_ref().and_then(|p| p.status).unwrap_or(0);
 
                 let doc = serde_json::json!({
                     "agent_id": agent_id,

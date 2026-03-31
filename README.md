@@ -6,26 +6,19 @@ Peat mesh sidecar — a Rust binary that runs alongside applications in Kubernet
 
 ## How It Works
 
-```
-+--------------------------------------------------------------+
-|  Kubernetes Pod                                               |
-|                                                               |
-|  +--------------------+     +------------------------------+ |
-|  | Your Application    |     | peat-sidecar                 | |
-|  |                     |     |                              | |
-|  |  gRPC client    ----+-----+  gRPC API (:50051)          | |
-|  |  (any language)     |     |  21 RPCs: documents, peers,  | |
-|  |                     |     |  subscriptions, sync control | |
-|  +--------------------+     |                              | |
-|                              |  CRDT Store (Automerge)      | |
-|                              |  P2P Transport (Iroh QUIC)   | |
-|                              +-----------+------------------+ |
-+------------------------------------------+--------------------+
-                                           |
-                                  Iroh QUIC (relay or direct)
-                                           |
-                                  Other peat-sidecar instances
-                                  on other clusters
+```mermaid
+graph TB
+    subgraph pod["Kubernetes Pod"]
+        app["Your Application<br/>(any language)"]
+        subgraph sidecar["peat-sidecar"]
+            grpc["gRPC API :50051<br/>21 RPCs: documents, peers,<br/>subscriptions, sync control"]
+            crdt["CRDT Store<br/>(Automerge)"]
+            transport["P2P Transport<br/>(Iroh QUIC)"]
+            grpc --> crdt --> transport
+        end
+        app -- "gRPC client" --> grpc
+    end
+    transport -. "Iroh QUIC<br/>(relay or direct)" .-> other["Other peat-sidecar<br/>instances on<br/>other clusters"]
 ```
 
 Documents written on one cluster automatically sync to all connected peers via Automerge CRDT — no central server, works through network partitions, eventually consistent.
@@ -34,22 +27,22 @@ Documents written on one cluster automatically sync to all connected peers via A
 
 When deployed alongside [UDS Remote Agent](https://github.com/defenseunicorns/uds-remote-agent), the sidecar's agent watcher polls the agent's existing Connect RPC APIs and syncs fleet state across clusters:
 
+```mermaid
+graph TB
+    subgraph alpha["Edge Cluster Alpha"]
+        agentA["UDS Remote Agent :8080"]
+        sidecarA["peat-sidecar :50051<br/>Polls /status, ListPackages<br/>Writes to CRDT store"]
+        sidecarA -- "Connect RPC<br/>(same as CLI/UI)" --> agentA
+    end
+    subgraph bravo["Edge Cluster Bravo"]
+        agentB["UDS Remote Agent :8080"]
+        sidecarB["peat-sidecar :50051<br/>Polls /status, ListPackages<br/>Writes to CRDT store"]
+        sidecarB -- "Connect RPC<br/>(same as CLI/UI)" --> agentB
+    end
+    sidecarA <-- "Iroh QUIC<br/>CRDT sync" --> sidecarB
 ```
-+- Edge Cluster Alpha ----------------+     +- Edge Cluster Bravo ----------------+
-|                                      |     |                                      |
-|  UDS Remote Agent (:8080)            |     |  UDS Remote Agent (:8080)            |
-|       ^                              |     |       ^                              |
-|       | Connect RPC (same as CLI/UI) |     |       | Connect RPC (same as CLI/UI) |
-|       |                              |     |       |                              |
-|  peat-sidecar (:50051)              |     |  peat-sidecar (:50051)              |
-|  * Polls /status, ListPackages      |     |  * Polls /status, ListPackages      |
-|  * Writes to CRDT store             |     |  * Writes to CRDT store             |
-|  * Syncs via Iroh QUIC -------------+-----+--* Receives CRDT state              |
-|                                      |     |                                      |
-+--------------------------------------+     +--------------------------------------+
 
-Result: Query either sidecar → see fleet-wide agent state from both clusters
-```
+Query either sidecar to see fleet-wide agent state from both clusters.
 
 **Zero modifications to UDS Remote Agent required.** The watcher uses the same Connect RPC protocol (`connect.WithGRPC()` over HTTP/2) as the `uds-agent-cli` and web UI.
 
@@ -201,31 +194,19 @@ See [docs/DESIGN.md](docs/DESIGN.md) for:
 
 ## Project Structure
 
-```
-peat-sidecar/
-+-- proto/sidecar.proto          # gRPC service definition
-+-- src/
-|   +-- main.rs                  # CLI + server bootstrap
-|   +-- lib.rs                   # Module exports
-|   +-- node.rs                  # SidecarNode (Automerge + Iroh mesh stack)
-|   +-- service.rs               # gRPC service implementation
-|   +-- watcher.rs               # Agent watcher (Connect RPC poller)
-+-- chart/peat-sidecar/          # Helm chart
-|   +-- templates/
-|   |   +-- deployment.yaml      # Standalone deployment
-|   |   +-- service.yaml         # ClusterIP service
-|   |   +-- uds-package.yaml     # UDS Package CR (NetworkPolicies)
-|   |   +-- _helpers.tpl         # Injectable container/volume templates
-|   +-- values.yaml
-+-- bundle/uds-bundle.yaml       # UDS bundle
-+-- zarf.yaml                    # Zarf package config
-+-- Dockerfile                   # Multi-stage build
-+-- docs/DESIGN.md               # Architecture and integration design
-+-- test/go/                     # Go client + integration tests
-    +-- client.go                # Idiomatic Go client (Connect RPC)
-    +-- cmd/{smoketest,synctest,watchertest,query}/
-    +-- cluster/                 # Cross-cluster k3d e2e test
-```
+| Path | Description |
+|------|-------------|
+| `proto/sidecar.proto` | gRPC service definition |
+| `src/main.rs` | CLI + server bootstrap |
+| `src/node.rs` | SidecarNode (Automerge + Iroh mesh stack) |
+| `src/service.rs` | gRPC service implementation |
+| `src/watcher.rs` | Agent watcher (Connect RPC poller) |
+| `chart/peat-sidecar/` | Helm chart (deployment, service, UDS Package CR, injectable sidecar templates) |
+| `bundle/uds-bundle.yaml` | UDS bundle |
+| `zarf.yaml` | Zarf package config |
+| `Dockerfile` | Multi-stage build (debian:bookworm-slim) |
+| `docs/DESIGN.md` | Architecture and integration design |
+| `test/go/` | Go client library + integration tests (smoketest, synctest, watchertest, query, cluster e2e) |
 
 ## Related Projects
 
