@@ -1,8 +1,8 @@
-//! peat-sidecar — Peat mesh participant exposing a gRPC API.
+//! peat-sidecar — Peat mesh participant exposing a Connect RPC API.
 //!
 //! Designed to run as a Kubernetes sidecar container alongside Go applications
 //! (e.g., UDS Remote Agent). The sidecar bootstraps a full CRDT mesh node
-//! and exposes its capabilities over gRPC (Unix socket or TCP).
+//! and exposes its capabilities over Connect RPC / gRPC / gRPC-Web.
 //!
 //! Optionally watches a co-located UDS Remote Agent and syncs its state
 //! to the mesh for cross-cluster visibility.
@@ -12,16 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tonic::transport::Server;
+use connectrpc::Router;
 use tracing::{error, info};
 
 use peat_sidecar::node::{SidecarConfig, SidecarNode};
-use peat_sidecar::proto::peat_sidecar_server::PeatSidecarServer;
+use peat_sidecar::pb::PeatSidecarExt;
 use peat_sidecar::service::PeatSidecarService;
 use peat_sidecar::watcher;
 
 #[derive(Parser, Debug)]
-#[command(name = "peat-sidecar", about = "Peat mesh sidecar with gRPC API")]
+#[command(
+    name = "peat-sidecar",
+    about = "Peat mesh sidecar with Connect RPC API"
+)]
 struct Args {
     /// Listen address. Use "unix:///path/to/sock" for Unix socket or
     /// "tcp://0.0.0.0:50051" for TCP. Default: tcp://0.0.0.0:50051
@@ -53,7 +56,6 @@ struct Args {
     shared_key: String,
 
     /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
-    /// When set, all document payloads are encrypted before storage and decrypted on read.
     #[arg(long, env = "PEAT_SIDECAR_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
 
@@ -158,11 +160,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let service = PeatSidecarService::new(Arc::clone(&node));
+    // Build the Connect RPC service (handles Connect + gRPC + gRPC-Web)
+    let service = Arc::new(PeatSidecarService::new(Arc::clone(&node)));
+    let router = service.register(Router::new());
 
     // Parse listen address and start server
     if let Some(path) = args.listen.strip_prefix("unix://") {
-        // Unix domain socket
         let uds_path = PathBuf::from(path);
         if uds_path.exists() {
             tokio::fs::remove_file(&uds_path).await?;
@@ -173,24 +176,38 @@ async fn main() -> anyhow::Result<()> {
 
         info!(path = %uds_path.display(), "listening on Unix socket");
 
-        let uds = tokio::net::UnixListener::bind(&uds_path)?;
-        let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
+        let listener = tokio::net::UnixListener::bind(&uds_path)?;
+        let connect_service = connectrpc::ConnectRpcService::new(router);
 
-        Server::builder()
-            .add_service(PeatSidecarServer::new(service))
-            .serve_with_incoming(uds_stream)
-            .await?;
+        loop {
+            let (stream, _) = listener.accept().await?;
+            let svc = connect_service.clone();
+            tokio::spawn(async move {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(
+                    io,
+                    hyper::service::service_fn(move |req| {
+                        let mut s = svc.clone();
+                        async move { tower::Service::call(&mut s, req).await }
+                    }),
+                )
+                .await;
+            });
+        }
     } else {
         // TCP
         let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
         let addr: std::net::SocketAddr = addr_str.parse()?;
 
-        info!(%addr, "listening on TCP");
+        info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
 
-        Server::builder()
-            .add_service(PeatSidecarServer::new(service))
+        connectrpc::Server::new(router)
             .serve(addr)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     info!("peat-sidecar stopped");

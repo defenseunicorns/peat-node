@@ -1,19 +1,22 @@
-//! gRPC service implementation for PeatSidecar.
+//! Connect RPC service implementation for PeatSidecar.
 //!
-//! Each RPC method delegates to the underlying `SidecarNode`.
+//! Implements the generated `PeatSidecar` trait from connectrpc-build.
+//! Supports Connect, gRPC, and gRPC-Web protocols on a single port.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
+use buffa::OwnedView;
+use connectrpc::{ConnectError, Context};
+use futures::stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use tonic::{Request, Response, Status};
 use tracing::error;
 
 use crate::node::{ChangeType as NodeChangeType, SidecarNode};
-use crate::proto;
-use crate::proto::peat_sidecar_server::PeatSidecar;
+use crate::pb;
 
-/// gRPC service wrapping a SidecarNode.
+/// Connect RPC service wrapping a SidecarNode.
 pub struct PeatSidecarService {
     node: Arc<SidecarNode>,
 }
@@ -24,152 +27,178 @@ impl PeatSidecarService {
     }
 }
 
-fn internal(e: anyhow::Error) -> Status {
+fn internal(e: anyhow::Error) -> ConnectError {
     error!("{e:#}");
-    Status::internal(e.to_string())
+    ConnectError::internal(e.to_string())
 }
 
-#[tonic::async_trait]
-impl PeatSidecar for PeatSidecarService {
+impl pb::PeatSidecar for PeatSidecarService {
     // --- Lifecycle ---
 
     async fn get_status(
         &self,
-        _req: Request<proto::GetStatusRequest>,
-    ) -> Result<Response<proto::GetStatusResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetStatusRequestView<'static>>,
+    ) -> Result<(pb::GetStatusResponse, Context), ConnectError> {
         let phase = if self.node.is_sync_active() {
-            proto::NodePhase::Syncing as i32
+            pb::NodePhase::NODE_PHASE_SYNCING
         } else {
-            proto::NodePhase::Ready as i32
+            pb::NodePhase::NODE_PHASE_READY
         };
 
-        Ok(Response::new(proto::GetStatusResponse {
-            node_id: self.node.node_id().to_string(),
-            endpoint_addr: self.node.endpoint_addr(),
-            sync_active: self.node.is_sync_active(),
-            connected_peers: self.node.connected_peer_count(),
-            phase,
-        }))
+        Ok((
+            pb::GetStatusResponse {
+                node_id: self.node.node_id().to_string(),
+                endpoint_addr: self.node.endpoint_addr(),
+                sync_active: self.node.is_sync_active(),
+                connected_peers: self.node.connected_peer_count(),
+                phase: phase.into(),
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     // --- Peer Management ---
 
     async fn connect_peer(
         &self,
-        req: Request<proto::ConnectPeerRequest>,
-    ) -> Result<Response<proto::ConnectPeerResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::ConnectPeerRequestView<'static>>,
+    ) -> Result<(pb::ConnectPeerResponse, Context), ConnectError> {
         self.node
-            .connect_peer(&inner.endpoint_id)
+            .connect_peer(request.endpoint_id)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::ConnectPeerResponse {}))
+        Ok((pb::ConnectPeerResponse::default(), ctx))
     }
 
     async fn disconnect_peer(
         &self,
-        req: Request<proto::DisconnectPeerRequest>,
-    ) -> Result<Response<proto::DisconnectPeerResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::DisconnectPeerRequestView<'static>>,
+    ) -> Result<(pb::DisconnectPeerResponse, Context), ConnectError> {
         self.node
-            .disconnect_peer(&inner.endpoint_id)
+            .disconnect_peer(request.endpoint_id)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::DisconnectPeerResponse {}))
+        Ok((pb::DisconnectPeerResponse::default(), ctx))
     }
 
     async fn list_peers(
         &self,
-        _req: Request<proto::ListPeersRequest>,
-    ) -> Result<Response<proto::ListPeersResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::ListPeersRequestView<'static>>,
+    ) -> Result<(pb::ListPeersResponse, Context), ConnectError> {
         let peers = self
             .node
             .list_peers()
             .into_iter()
-            .map(|p| proto::PeerInfo {
+            .map(|p| pb::PeerInfo {
                 endpoint_id: p.endpoint_id,
                 addresses: p.addresses,
                 connected: p.connected,
+                ..Default::default()
             })
             .collect();
-        Ok(Response::new(proto::ListPeersResponse { peers }))
+        Ok((
+            pb::ListPeersResponse {
+                peers,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     // --- Generic Document CRUD ---
 
     async fn put_document(
         &self,
-        req: Request<proto::PutDocumentRequest>,
-    ) -> Result<Response<proto::PutDocumentResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::PutDocumentRequestView<'static>>,
+    ) -> Result<(pb::PutDocumentResponse, Context), ConnectError> {
         self.node
-            .put_document(&inner.collection, &inner.doc_id, &inner.json_data)
+            .put_document(request.collection, request.doc_id, request.json_data)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::PutDocumentResponse {}))
+        Ok((pb::PutDocumentResponse::default(), ctx))
     }
 
     async fn get_document(
         &self,
-        req: Request<proto::GetDocumentRequest>,
-    ) -> Result<Response<proto::GetDocumentResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::GetDocumentRequestView<'static>>,
+    ) -> Result<(pb::GetDocumentResponse, Context), ConnectError> {
         let json_data = self
             .node
-            .get_document(&inner.collection, &inner.doc_id)
+            .get_document(request.collection, request.doc_id)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::GetDocumentResponse { json_data }))
+        Ok((
+            pb::GetDocumentResponse {
+                json_data,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     async fn delete_document(
         &self,
-        req: Request<proto::DeleteDocumentRequest>,
-    ) -> Result<Response<proto::DeleteDocumentResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::DeleteDocumentRequestView<'static>>,
+    ) -> Result<(pb::DeleteDocumentResponse, Context), ConnectError> {
         self.node
-            .delete_document(&inner.collection, &inner.doc_id)
+            .delete_document(request.collection, request.doc_id)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::DeleteDocumentResponse {}))
+        Ok((pb::DeleteDocumentResponse::default(), ctx))
     }
 
     async fn list_documents(
         &self,
-        req: Request<proto::ListDocumentsRequest>,
-    ) -> Result<Response<proto::ListDocumentsResponse>, Status> {
-        let inner = req.into_inner();
+        ctx: Context,
+        request: OwnedView<pb::ListDocumentsRequestView<'static>>,
+    ) -> Result<(pb::ListDocumentsResponse, Context), ConnectError> {
         let doc_ids = self
             .node
-            .list_documents(&inner.collection)
+            .list_documents(request.collection)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::ListDocumentsResponse { doc_ids }))
+        Ok((
+            pb::ListDocumentsResponse {
+                doc_ids,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     // --- Typed Collections ---
 
     async fn put_platform(
         &self,
-        req: Request<proto::PutPlatformRequest>,
-    ) -> Result<Response<proto::PutPlatformResponse>, Status> {
+        ctx: Context,
+        request: OwnedView<pb::PutPlatformRequestView<'static>>,
+    ) -> Result<(pb::PutPlatformResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
         let platform = req
-            .into_inner()
             .platform
-            .ok_or_else(|| Status::invalid_argument("platform is required"))?;
+            .ok_or_else(|| ConnectError::invalid_argument("platform is required"))?;
         let json = serde_json::to_string(&platform_to_map(&platform))
-            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+            .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
         self.node
             .put_document("platforms", &platform.id, &json)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::PutPlatformResponse {}))
+        Ok((pb::PutPlatformResponse::default(), ctx))
     }
 
     async fn get_platforms(
         &self,
-        _req: Request<proto::GetPlatformsRequest>,
-    ) -> Result<Response<proto::GetPlatformsResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetPlatformsRequestView<'static>>,
+    ) -> Result<(pb::GetPlatformsResponse, Context), ConnectError> {
         let doc_ids = self
             .node
             .list_documents("platforms")
@@ -188,30 +217,38 @@ impl PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok(Response::new(proto::GetPlatformsResponse { platforms }))
+        Ok((
+            pb::GetPlatformsResponse {
+                platforms,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     async fn put_cell(
         &self,
-        req: Request<proto::PutCellRequest>,
-    ) -> Result<Response<proto::PutCellResponse>, Status> {
+        ctx: Context,
+        request: OwnedView<pb::PutCellRequestView<'static>>,
+    ) -> Result<(pb::PutCellResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
         let cell = req
-            .into_inner()
             .cell
-            .ok_or_else(|| Status::invalid_argument("cell is required"))?;
+            .ok_or_else(|| ConnectError::invalid_argument("cell is required"))?;
         let json = serde_json::to_string(&cell_to_map(&cell))
-            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+            .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
         self.node
             .put_document("cells", &cell.id, &json)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::PutCellResponse {}))
+        Ok((pb::PutCellResponse::default(), ctx))
     }
 
     async fn get_cells(
         &self,
-        _req: Request<proto::GetCellsRequest>,
-    ) -> Result<Response<proto::GetCellsResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetCellsRequestView<'static>>,
+    ) -> Result<(pb::GetCellsResponse, Context), ConnectError> {
         let doc_ids = self.node.list_documents("cells").await.map_err(internal)?;
         let mut cells = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
@@ -226,30 +263,38 @@ impl PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok(Response::new(proto::GetCellsResponse { cells }))
+        Ok((
+            pb::GetCellsResponse {
+                cells,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     async fn put_track(
         &self,
-        req: Request<proto::PutTrackRequest>,
-    ) -> Result<Response<proto::PutTrackResponse>, Status> {
+        ctx: Context,
+        request: OwnedView<pb::PutTrackRequestView<'static>>,
+    ) -> Result<(pb::PutTrackResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
         let track = req
-            .into_inner()
             .track
-            .ok_or_else(|| Status::invalid_argument("track is required"))?;
+            .ok_or_else(|| ConnectError::invalid_argument("track is required"))?;
         let json = serde_json::to_string(&track_to_map(&track))
-            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+            .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
         self.node
             .put_document("tracks", &track.id, &json)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::PutTrackResponse {}))
+        Ok((pb::PutTrackResponse::default(), ctx))
     }
 
     async fn get_tracks(
         &self,
-        _req: Request<proto::GetTracksRequest>,
-    ) -> Result<Response<proto::GetTracksResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetTracksRequestView<'static>>,
+    ) -> Result<(pb::GetTracksResponse, Context), ConnectError> {
         let doc_ids = self.node.list_documents("tracks").await.map_err(internal)?;
         let mut tracks = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
@@ -264,30 +309,38 @@ impl PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok(Response::new(proto::GetTracksResponse { tracks }))
+        Ok((
+            pb::GetTracksResponse {
+                tracks,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     async fn put_command(
         &self,
-        req: Request<proto::PutCommandRequest>,
-    ) -> Result<Response<proto::PutCommandResponse>, Status> {
+        ctx: Context,
+        request: OwnedView<pb::PutCommandRequestView<'static>>,
+    ) -> Result<(pb::PutCommandResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
         let command = req
-            .into_inner()
             .command
-            .ok_or_else(|| Status::invalid_argument("command is required"))?;
+            .ok_or_else(|| ConnectError::invalid_argument("command is required"))?;
         let json = serde_json::to_string(&command_to_map(&command))
-            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+            .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
         self.node
             .put_document("commands", &command.id, &json)
             .await
             .map_err(internal)?;
-        Ok(Response::new(proto::PutCommandResponse {}))
+        Ok((pb::PutCommandResponse::default(), ctx))
     }
 
     async fn get_commands(
         &self,
-        _req: Request<proto::GetCommandsRequest>,
-    ) -> Result<Response<proto::GetCommandsResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetCommandsRequestView<'static>>,
+    ) -> Result<(pb::GetCommandsResponse, Context), ConnectError> {
         let doc_ids = self
             .node
             .list_documents("commands")
@@ -306,92 +359,103 @@ impl PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok(Response::new(proto::GetCommandsResponse { commands }))
+        Ok((
+            pb::GetCommandsResponse {
+                commands,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 
     // --- Subscriptions ---
 
-    type SubscribeStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<proto::DocumentChange, Status>> + Send>,
-    >;
-
     async fn subscribe(
         &self,
-        req: Request<proto::SubscribeRequest>,
-    ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let filter_collections: Vec<String> = req.into_inner().collections;
+        ctx: Context,
+        request: OwnedView<pb::SubscribeRequestView<'static>>,
+    ) -> Result<
+        (
+            Pin<Box<dyn Stream<Item = Result<pb::DocumentChange, ConnectError>> + Send>>,
+            Context,
+        ),
+        ConnectError,
+    > {
+        let filter_collections: Vec<String> =
+            request.collections.iter().map(|s| s.to_string()).collect();
         let rx = self.node.subscribe();
 
-        let stream = BroadcastStream::new(rx).filter_map(move |result| {
-            match result {
-                Ok(event) => {
-                    // Apply collection filter
-                    if !filter_collections.is_empty()
-                        && !filter_collections.contains(&event.collection)
-                    {
-                        return None;
-                    }
-                    let change_type = match event.change_type {
-                        NodeChangeType::Upsert => proto::ChangeType::Upsert as i32,
-                        NodeChangeType::Delete => proto::ChangeType::Delete as i32,
-                    };
-                    Some(Ok(proto::DocumentChange {
-                        collection: event.collection,
-                        doc_id: event.doc_id,
-                        change_type,
-                        json_data: event.json_data,
-                    }))
+        let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(event) => {
+                if !filter_collections.is_empty() && !filter_collections.contains(&event.collection)
+                {
+                    return None;
                 }
-                Err(_) => None, // Lagged or closed — skip
+                let change_type = match event.change_type {
+                    NodeChangeType::Upsert => pb::ChangeType::CHANGE_TYPE_UPSERT,
+                    NodeChangeType::Delete => pb::ChangeType::CHANGE_TYPE_DELETE,
+                };
+                Some(Ok(pb::DocumentChange {
+                    collection: event.collection,
+                    doc_id: event.doc_id,
+                    change_type: change_type.into(),
+                    json_data: event.json_data,
+                    ..Default::default()
+                }))
             }
+            Err(_) => None,
         });
 
-        Ok(Response::new(Box::pin(stream)))
+        Ok((Box::pin(stream), ctx))
     }
 
     // --- Sync Control ---
 
     async fn start_sync(
         &self,
-        _req: Request<proto::StartSyncRequest>,
-    ) -> Result<Response<proto::StartSyncResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::StartSyncRequestView<'static>>,
+    ) -> Result<(pb::StartSyncResponse, Context), ConnectError> {
         self.node.start_sync().await.map_err(internal)?;
-        Ok(Response::new(proto::StartSyncResponse {}))
+        Ok((pb::StartSyncResponse::default(), ctx))
     }
 
     async fn stop_sync(
         &self,
-        _req: Request<proto::StopSyncRequest>,
-    ) -> Result<Response<proto::StopSyncResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::StopSyncRequestView<'static>>,
+    ) -> Result<(pb::StopSyncResponse, Context), ConnectError> {
         self.node.stop_sync().await.map_err(internal)?;
-        Ok(Response::new(proto::StopSyncResponse {}))
+        Ok((pb::StopSyncResponse::default(), ctx))
     }
 
     async fn get_sync_stats(
         &self,
-        _req: Request<proto::GetSyncStatsRequest>,
-    ) -> Result<Response<proto::GetSyncStatsResponse>, Status> {
+        ctx: Context,
+        _request: OwnedView<pb::GetSyncStatsRequestView<'static>>,
+    ) -> Result<(pb::GetSyncStatsResponse, Context), ConnectError> {
         let stats = self.node.sync_stats();
-        Ok(Response::new(proto::GetSyncStatsResponse {
-            sync_active: stats.sync_active,
-            connected_peers: stats.connected_peers,
-            bytes_sent: stats.bytes_sent,
-            bytes_received: stats.bytes_received,
-        }))
+        Ok((
+            pb::GetSyncStatsResponse {
+                sync_active: stats.sync_active,
+                connected_peers: stats.connected_peers,
+                bytes_sent: stats.bytes_sent,
+                bytes_received: stats.bytes_received,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 }
 
 // --- Proto ↔ JSON conversion helpers ---
-// These serialize proto messages to JSON maps for CRDT storage and back.
-// Using serde_json::Value as the intermediate representation keeps the
-// document store schema-agnostic.
 
-fn platform_to_map(p: &proto::Platform) -> serde_json::Value {
+fn platform_to_map(p: &pb::Platform) -> serde_json::Value {
     serde_json::json!({
         "id": p.id,
         "platform_type": p.platform_type,
         "name": p.name,
-        "status": p.status,
+        "status": p.status.to_i32(),
         "latitude": p.latitude,
         "longitude": p.longitude,
         "altitude_m": p.altitude_m,
@@ -402,13 +466,13 @@ fn platform_to_map(p: &proto::Platform) -> serde_json::Value {
     })
 }
 
-fn map_to_platform(id: &str, json: &str) -> anyhow::Result<proto::Platform> {
+fn map_to_platform(id: &str, json: &str) -> anyhow::Result<pb::Platform> {
     let v: serde_json::Value = serde_json::from_str(json)?;
-    Ok(proto::Platform {
+    Ok(pb::Platform {
         id: id.to_string(),
         platform_type: v["platform_type"].as_str().unwrap_or_default().to_string(),
         name: v["name"].as_str().unwrap_or_default().to_string(),
-        status: v["status"].as_i64().unwrap_or_default() as i32,
+        status: buffa::EnumValue::from(v["status"].as_i64().unwrap_or_default() as i32),
         latitude: v["latitude"].as_f64().unwrap_or_default(),
         longitude: v["longitude"].as_f64().unwrap_or_default(),
         altitude_m: v["altitude_m"].as_f64().unwrap_or_default(),
@@ -423,14 +487,15 @@ fn map_to_platform(id: &str, json: &str) -> anyhow::Result<proto::Platform> {
             .unwrap_or_default(),
         unit_id: v["unit_id"].as_str().map(|s| s.to_string()),
         callsign: v["callsign"].as_str().map(|s| s.to_string()),
+        ..Default::default()
     })
 }
 
-fn cell_to_map(c: &proto::Cell) -> serde_json::Value {
+fn cell_to_map(c: &pb::Cell) -> serde_json::Value {
     serde_json::json!({
         "id": c.id,
         "name": c.name,
-        "status": c.status,
+        "status": c.status.to_i32(),
         "platform_count": c.platform_count,
         "center_latitude": c.center_latitude,
         "center_longitude": c.center_longitude,
@@ -440,12 +505,12 @@ fn cell_to_map(c: &proto::Cell) -> serde_json::Value {
     })
 }
 
-fn map_to_cell(id: &str, json: &str) -> anyhow::Result<proto::Cell> {
+fn map_to_cell(id: &str, json: &str) -> anyhow::Result<pb::Cell> {
     let v: serde_json::Value = serde_json::from_str(json)?;
-    Ok(proto::Cell {
+    Ok(pb::Cell {
         id: id.to_string(),
         name: v["name"].as_str().unwrap_or_default().to_string(),
-        status: v["status"].as_i64().unwrap_or_default() as i32,
+        status: buffa::EnumValue::from(v["status"].as_i64().unwrap_or_default() as i32),
         platform_count: v["platform_count"].as_u64().unwrap_or_default() as u32,
         center_latitude: v["center_latitude"].as_f64().unwrap_or_default(),
         center_longitude: v["center_longitude"].as_f64().unwrap_or_default(),
@@ -459,10 +524,11 @@ fn map_to_cell(id: &str, json: &str) -> anyhow::Result<proto::Cell> {
             .unwrap_or_default(),
         formation_id: v["formation_id"].as_str().map(|s| s.to_string()),
         leader_id: v["leader_id"].as_str().map(|s| s.to_string()),
+        ..Default::default()
     })
 }
 
-fn track_to_map(t: &proto::Track) -> serde_json::Value {
+fn track_to_map(t: &pb::Track) -> serde_json::Value {
     serde_json::json!({
         "id": t.id,
         "source_platform": t.source_platform,
@@ -476,13 +542,13 @@ fn track_to_map(t: &proto::Track) -> serde_json::Value {
         "speed_mps": t.speed_mps,
         "classification": t.classification,
         "confidence": t.confidence,
-        "category": t.category,
+        "category": t.category.to_i32(),
     })
 }
 
-fn map_to_track(id: &str, json: &str) -> anyhow::Result<proto::Track> {
+fn map_to_track(id: &str, json: &str) -> anyhow::Result<pb::Track> {
     let v: serde_json::Value = serde_json::from_str(json)?;
-    Ok(proto::Track {
+    Ok(pb::Track {
         id: id.to_string(),
         source_platform: v["source_platform"]
             .as_str()
@@ -498,31 +564,33 @@ fn map_to_track(id: &str, json: &str) -> anyhow::Result<proto::Track> {
         speed_mps: v["speed_mps"].as_f64(),
         classification: v["classification"].as_str().unwrap_or_default().to_string(),
         confidence: v["confidence"].as_f64().unwrap_or_default(),
-        category: v["category"].as_i64().unwrap_or_default() as i32,
+        category: buffa::EnumValue::from(v["category"].as_i64().unwrap_or_default() as i32),
+        ..Default::default()
     })
 }
 
-fn command_to_map(c: &proto::Command) -> serde_json::Value {
+fn command_to_map(c: &pb::Command) -> serde_json::Value {
     serde_json::json!({
         "id": c.id,
         "target_id": c.target_id,
         "command_type": c.command_type,
-        "status": c.status,
+        "status": c.status.to_i32(),
         "created_at": c.created_at,
         "expires_at": c.expires_at,
         "payload_json": c.payload_json,
     })
 }
 
-fn map_to_command(id: &str, json: &str) -> anyhow::Result<proto::Command> {
+fn map_to_command(id: &str, json: &str) -> anyhow::Result<pb::Command> {
     let v: serde_json::Value = serde_json::from_str(json)?;
-    Ok(proto::Command {
+    Ok(pb::Command {
         id: id.to_string(),
         target_id: v["target_id"].as_str().unwrap_or_default().to_string(),
         command_type: v["command_type"].as_str().unwrap_or_default().to_string(),
-        status: v["status"].as_i64().unwrap_or_default() as i32,
+        status: buffa::EnumValue::from(v["status"].as_i64().unwrap_or_default() as i32),
         created_at: v["created_at"].as_i64().unwrap_or_default(),
         expires_at: v["expires_at"].as_i64().unwrap_or_default(),
         payload_json: v["payload_json"].as_str().unwrap_or_default().to_string(),
+        ..Default::default()
     })
 }
