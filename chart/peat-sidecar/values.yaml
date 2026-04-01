@@ -20,6 +20,14 @@ appId: "peat-default"
 # -- Base64-encoded 32-byte shared key for formation authentication
 sharedKey: ""
 
+# -- Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
+# When set, all document payloads are encrypted before storage.
+# Can reference a K8s secret via encryptionKeySecret instead of a literal value.
+encryptionKey: ""
+encryptionKeySecret:
+  name: ""
+  key: ""
+
 # -- Peer endpoint IDs to connect to on startup (comma-separated or list)
 peers: []
 
@@ -27,9 +35,15 @@ peers: []
 autoSync: true
 
 # -- Agent watcher: poll a co-located service (e.g. UDS Remote Agent)
-# Set agentAddr to enable. Example: http://localhost:8080
+# Set agentAddr to enable. Example: http://localhost:8080 or https://localhost:8080
 agentAddr: ""
 agentPollInterval: 10
+
+# -- Agent watcher mTLS: provide a Kubernetes Secret containing tls.crt, tls.key, and ca.crt
+# The secret is mounted at /etc/peat-sidecar/agent-tls/
+agentTls:
+  enabled: false
+  secretName: ""
 
 # -- Persistent storage for Automerge CRDT state and Iroh blobs
 persistence:

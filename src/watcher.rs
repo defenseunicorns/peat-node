@@ -4,6 +4,7 @@
 //! Uses JSON encoding (Connect RPC supports it natively) to avoid vendoring the agent's
 //! proto definitions into Rust.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,26 +13,79 @@ use tracing::{debug, info, warn};
 
 use crate::node::SidecarNode;
 
+/// TLS configuration for mutual TLS to the agent.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Path to PEM-encoded client certificate.
+    pub cert: Option<PathBuf>,
+    /// Path to PEM-encoded client private key.
+    pub key: Option<PathBuf>,
+    /// Path to PEM-encoded CA certificate for server verification.
+    pub ca_cert: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    /// Returns true if at least cert and key are provided.
+    pub fn is_enabled(&self) -> bool {
+        self.cert.is_some() && self.key.is_some()
+    }
+}
+
 /// Configuration for the agent watcher.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
-    /// Agent address, e.g. "http://localhost:8080"
+    /// Agent address, e.g. "http://localhost:8080" or "https://localhost:8080"
     pub agent_addr: String,
     /// Poll interval.
     pub poll_interval: Duration,
     /// Node ID used as the agent identifier in CRDT collections.
     pub node_id: String,
-    // TODO: mTLS cert/key/ca for production
+    /// Optional mTLS configuration for agent communication.
+    pub tls: TlsConfig,
+}
+
+/// Build the HTTP client, optionally with mTLS.
+fn build_client(tls: &TlsConfig) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+
+    if tls.is_enabled() {
+        // Read client identity (cert + key)
+        let cert_path = tls.cert.as_ref().unwrap();
+        let key_path = tls.key.as_ref().unwrap();
+
+        let cert_pem = std::fs::read(cert_path)
+            .unwrap_or_else(|e| panic!("failed to read TLS cert {}: {e}", cert_path.display()));
+        let key_pem = std::fs::read(key_path)
+            .unwrap_or_else(|e| panic!("failed to read TLS key {}: {e}", key_path.display()));
+
+        let mut identity_pem = cert_pem;
+        identity_pem.extend_from_slice(&key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .expect("failed to parse TLS identity from cert+key PEM");
+        builder = builder.identity(identity);
+
+        // Add custom CA if provided
+        if let Some(ca_path) = &tls.ca_cert {
+            let ca_pem = std::fs::read(ca_path)
+                .unwrap_or_else(|e| panic!("failed to read TLS CA {}: {e}", ca_path.display()));
+            let ca = reqwest::Certificate::from_pem(&ca_pem)
+                .expect("failed to parse CA certificate PEM");
+            builder = builder.add_root_certificate(ca);
+        }
+
+        info!("agent watcher using mTLS");
+    } else {
+        // h2c: HTTP/2 without TLS (same as agent's insecure mode)
+        builder = builder.http2_prior_knowledge();
+    }
+
+    builder.build().expect("failed to create HTTP client")
 }
 
 /// Run the agent watcher loop. Polls the local UDS Remote Agent and writes
 /// state to the sidecar node's CRDT store.
 pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
-    let client = reqwest::Client::builder()
-        .http2_prior_knowledge() // h2c: HTTP/2 without TLS (same as agent's insecure mode)
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("failed to create HTTP client");
+    let client = build_client(&config.tls);
 
     let mut interval = tokio::time::interval(config.poll_interval);
     let agent_id = config.node_id.clone();
