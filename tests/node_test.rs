@@ -1,6 +1,6 @@
 //! Integration tests for SidecarNode — CRDT document operations.
 
-use peat_sidecar::node::{SidecarConfig, SidecarNode};
+use peat_node::node::{SidecarConfig, SidecarNode};
 
 async fn test_node(dir: &std::path::Path) -> SidecarNode {
     test_node_with_encryption(dir, None).await
@@ -223,7 +223,7 @@ async fn encrypted_subscribe_decrypts_events() {
 
 #[tokio::test]
 async fn encrypted_data_is_opaque_in_store() {
-    use peat_sidecar::crypto::StoreCipher;
+    use peat_node::crypto::StoreCipher;
 
     let cipher = StoreCipher::from_base64_key(&test_encryption_key()).unwrap();
 
@@ -249,7 +249,7 @@ async fn encrypted_data_is_opaque_in_store() {
 #[tokio::test]
 async fn wrong_encryption_key_fails_to_decrypt() {
     use base64::Engine;
-    use peat_sidecar::crypto::StoreCipher;
+    use peat_node::crypto::StoreCipher;
 
     let cipher1 = StoreCipher::from_base64_key(&test_encryption_key()).unwrap();
     let encrypted = cipher1.encrypt(r#"{"secret":"data"}"#).unwrap();

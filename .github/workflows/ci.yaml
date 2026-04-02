@@ -79,4 +79,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - run: helm lint chart/peat-sidecar/
+      - run: helm lint chart/peat-node/

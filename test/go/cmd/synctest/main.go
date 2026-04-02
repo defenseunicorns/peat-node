@@ -1,4 +1,4 @@
-// Tier 1 integration test: two peat-sidecar nodes, CRDT sync via Iroh relay.
+// Tier 1 integration test: two peat-node nodes, CRDT sync via Iroh relay.
 //
 // 1. Starts two sidecar processes (node-a on :50061, node-b on :50062)
 // 2. Exchanges endpoint IDs and connects them as peers
@@ -9,7 +9,7 @@
 //
 // Usage:
 //
-//	PEAT_SIDECAR_BIN=/path/to/peat-sidecar go run ./cmd/synctest/
+//	PEAT_NODE_BIN=/path/to/peat-node go run ./cmd/synctest/
 package main
 
 import (
@@ -20,8 +20,8 @@ import (
 	"path/filepath"
 	"time"
 
-	peat "github.com/defenseunicorns/peat-sidecar/test/go"
-	sidecarv1 "github.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1"
+	peat "github.com/defenseunicorns/peat-node/test/go"
+	sidecarv1 "github.com/defenseunicorns/peat-node/test/go/gen/peat/sidecar/v1"
 )
 
 func main() {
@@ -36,19 +36,19 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	bin := os.Getenv("PEAT_SIDECAR_BIN")
+	bin := os.Getenv("PEAT_NODE_BIN")
 	if bin == "" {
-		bin = "peat-sidecar"
+		bin = "peat-node"
 	}
 
 	// Resolve binary path
 	if _, err := exec.LookPath(bin); err != nil {
-		// Try relative to peat-sidecar build dir
-		candidate := filepath.Join("..", "..", "..", "peat-sidecar", "target", "release", "peat-sidecar")
+		// Try relative to peat-node build dir
+		candidate := filepath.Join("..", "..", "..", "peat-node", "target", "release", "peat-node")
 		if _, err2 := os.Stat(candidate); err2 == nil {
 			bin = candidate
 		} else {
-			return fmt.Errorf("peat-sidecar binary not found (set PEAT_SIDECAR_BIN): %w", err)
+			return fmt.Errorf("peat-node binary not found (set PEAT_NODE_BIN): %w", err)
 		}
 	}
 
@@ -266,7 +266,7 @@ func startSidecar(ctx context.Context, bin string, opts sidecarOpts) (*sidecarPr
 		"--node-id", opts.nodeID,
 		"--auto-sync",
 	)
-	cmd.Env = append(os.Environ(), "RUST_LOG=peat_sidecar=info,peat_mesh=info")
+	cmd.Env = append(os.Environ(), "RUST_LOG=peat_node=info,peat_mesh=info")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

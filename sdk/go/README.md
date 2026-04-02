@@ -1,19 +1,19 @@
-# peat-sidecar Go SDK
+# peat-node Go SDK
 
-Go client library for integrating with peat-sidecar's Connect RPC API.
+Go client library for integrating with peat-node's Connect RPC API.
 
 ## Install
 
 ```bash
-go get github.com/defenseunicorns/peat-sidecar/sdk/go@latest
+go get github.com/defenseunicorns/peat-node/sdk/go@latest
 ```
 
 ## Usage
 
 ```go
-import peat "github.com/defenseunicorns/peat-sidecar/sdk/go"
+import peat "github.com/defenseunicorns/peat-node/sdk/go"
 
-// Connect to the co-located sidecar
+// Connect to the co-located node
 client, err := peat.Connect("http://localhost:50051")
 // or Unix socket:
 client, err := peat.Connect("unix:///var/run/peat.sock")

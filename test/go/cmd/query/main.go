@@ -1,4 +1,4 @@
-// Quick query tool: shows all data in a peat-sidecar's CRDT store.
+// Quick query tool: shows all data in a peat-node's CRDT store.
 package main
 
 import (
@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 
-	peat "github.com/defenseunicorns/peat-sidecar/test/go"
+	peat "github.com/defenseunicorns/peat-node/test/go"
 )
 
 func main() {
 	target := "http://localhost:32551"
-	if env := os.Getenv("PEAT_SIDECAR_ADDR"); env != "" {
+	if env := os.Getenv("PEAT_NODE_ADDR"); env != "" {
 		target = env
 	}
 	client, err := peat.Connect(target)

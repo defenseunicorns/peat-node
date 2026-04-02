@@ -1,8 +1,8 @@
-# peat-sidecar Helm chart values
+# peat-node Helm chart values
 
 # -- Container image
 image:
-  repository: ghcr.io/defenseunicorns/peat-sidecar
+  repository: ghcr.io/defenseunicorns/peat-node
   tag: latest
   pullPolicy: IfNotPresent
 
@@ -40,7 +40,7 @@ agentAddr: ""
 agentPollInterval: 10
 
 # -- Agent watcher mTLS: provide a Kubernetes Secret containing tls.crt, tls.key, and ca.crt
-# The secret is mounted at /etc/peat-sidecar/agent-tls/
+# The secret is mounted at /etc/peat-node/agent-tls/
 agentTls:
   enabled: false
   secretName: ""

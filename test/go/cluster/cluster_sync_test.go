@@ -1,9 +1,9 @@
 // Cross-cluster sync test: verifies that two UDS Remote Agent deployments
-// with peat-sidecar sidecars can synchronize state via CRDT mesh.
+// with peat-node sidecars can synchronize state via CRDT mesh.
 //
 // Requires:
-//   - ALPHA_PEAT_ADDR: gRPC address of peat-sidecar on cluster alpha (e.g. http://localhost:32551)
-//   - BRAVO_PEAT_ADDR: gRPC address of peat-sidecar on cluster bravo (e.g. http://localhost:33551)
+//   - ALPHA_PEAT_ADDR: gRPC address of peat-node on cluster alpha (e.g. http://localhost:32551)
+//   - BRAVO_PEAT_ADDR: gRPC address of peat-node on cluster bravo (e.g. http://localhost:33551)
 package cluster
 
 import (
@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	peat "github.com/defenseunicorns/peat-sidecar/test/go"
-	sidecarv1 "github.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1"
+	peat "github.com/defenseunicorns/peat-node/test/go"
+	sidecarv1 "github.com/defenseunicorns/peat-node/test/go/gen/peat/sidecar/v1"
 )
 
 func requiredEnv(t *testing.T, key string) string {

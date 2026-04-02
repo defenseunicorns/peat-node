@@ -1,5 +1,5 @@
 apiVersion: v2
-name: peat-sidecar
+name: peat-node
 description: Peat mesh sidecar — gRPC API for co-located applications
 type: application
 version: 0.1.0

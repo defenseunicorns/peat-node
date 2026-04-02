@@ -1,14 +1,14 @@
-// Functional test: UDS Remote Agent + peat-sidecar watcher + CRDT sync.
+// Functional test: UDS Remote Agent + peat-node watcher + CRDT sync.
 //
 // 1. Starts a real UDS Remote Agent (insecure mode, no k8s required)
-// 2. Starts two peat-sidecar instances — node-a watches the agent, node-b is a peer
+// 2. Starts two peat-node instances — node-a watches the agent, node-b is a peer
 // 3. Waits for the watcher to poll agent state and write it to the CRDT store
 // 4. Verifies agent state synced from node-a to node-b
 //
 // Usage:
 //
 //	UDS_AGENT_BIN=/tmp/uds-remote-agent \
-//	PEAT_SIDECAR_BIN=../../peat-sidecar/target/release/peat-sidecar \
+//	PEAT_NODE_BIN=../../peat-node/target/release/peat-node \
 //	go run ./cmd/watchertest/
 package main
 
@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
-	peat "github.com/defenseunicorns/peat-sidecar/test/go"
+	peat "github.com/defenseunicorns/peat-node/test/go"
 )
 
 func main() {
@@ -36,14 +36,14 @@ func run() error {
 	defer cancel()
 
 	agentBin := envOr("UDS_AGENT_BIN", "/tmp/uds-remote-agent")
-	sidecarBin := envOr("PEAT_SIDECAR_BIN",
-		filepath.Join("..", "..", "..", "peat-sidecar", "target", "release", "peat-sidecar"))
+	sidecarBin := envOr("PEAT_NODE_BIN",
+		filepath.Join("..", "..", "..", "peat-node", "target", "release", "peat-node"))
 
 	if _, err := os.Stat(agentBin); err != nil {
 		return fmt.Errorf("agent binary not found at %s (set UDS_AGENT_BIN)", agentBin)
 	}
 	if _, err := os.Stat(sidecarBin); err != nil {
-		return fmt.Errorf("sidecar binary not found at %s (set PEAT_SIDECAR_BIN)", sidecarBin)
+		return fmt.Errorf("sidecar binary not found at %s (set PEAT_NODE_BIN)", sidecarBin)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "peat-watchertest-*")
@@ -69,8 +69,8 @@ func run() error {
 	// Give agent time to start
 	time.Sleep(3 * time.Second)
 
-	// 2. Start peat-sidecar node-a (watches the agent)
-	fmt.Println("--- Starting peat-sidecar node-a on :50061 (watching agent) ---")
+	// 2. Start peat-node node-a (watches the agent)
+	fmt.Println("--- Starting peat-node node-a on :50061 (watching agent) ---")
 	nodeA, err := startProcess(ctx, sidecarBin, []string{
 		"--listen", "tcp://127.0.0.1:50061",
 		"--data-dir", filepath.Join(tmpDir, "node-a"),
@@ -78,20 +78,20 @@ func run() error {
 		"--agent-addr", "http://127.0.0.1:9080",
 		"--agent-poll-interval", "3",
 		"--auto-sync",
-	}, []string{"RUST_LOG=peat_sidecar=info,peat_mesh=info"})
+	}, []string{"RUST_LOG=peat_node=info,peat_mesh=info"})
 	if err != nil {
 		return fmt.Errorf("start node-a: %w", err)
 	}
 	defer nodeA.stop()
 
-	// 3. Start peat-sidecar node-b (peer, no agent)
-	fmt.Println("--- Starting peat-sidecar node-b on :50062 (peer only) ---")
+	// 3. Start peat-node node-b (peer, no agent)
+	fmt.Println("--- Starting peat-node node-b on :50062 (peer only) ---")
 	nodeB, err := startProcess(ctx, sidecarBin, []string{
 		"--listen", "tcp://127.0.0.1:50062",
 		"--data-dir", filepath.Join(tmpDir, "node-b"),
 		"--node-id", "node-b",
 		"--auto-sync",
-	}, []string{"RUST_LOG=peat_sidecar=info,peat_mesh=info"})
+	}, []string{"RUST_LOG=peat_node=info,peat_mesh=info"})
 	if err != nil {
 		return fmt.Errorf("start node-b: %w", err)
 	}
@@ -196,7 +196,7 @@ func run() error {
 
 	fmt.Println("\n--- Summary ---")
 	fmt.Println("1. UDS Remote Agent running (insecure, no k8s)")
-	fmt.Println("2. peat-sidecar node-a watched agent via Connect RPC")
+	fmt.Println("2. peat-node node-a watched agent via Connect RPC")
 	fmt.Println("3. Agent status written to CRDT 'platforms' collection")
 	fmt.Println("4. node-a peered with node-b via Iroh QUIC")
 	fmt.Println("5. Agent state synced from node-a to node-b via CRDT")

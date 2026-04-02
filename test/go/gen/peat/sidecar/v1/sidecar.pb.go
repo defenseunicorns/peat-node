@@ -2858,7 +2858,7 @@ const file_peat_sidecar_v1_sidecar_proto_rawDesc = "" +
 	"\tSubscribe\x12!.peat.sidecar.v1.SubscribeRequest\x1a\x1f.peat.sidecar.v1.DocumentChange0\x01\x12R\n" +
 	"\tStartSync\x12!.peat.sidecar.v1.StartSyncRequest\x1a\".peat.sidecar.v1.StartSyncResponse\x12O\n" +
 	"\bStopSync\x12 .peat.sidecar.v1.StopSyncRequest\x1a!.peat.sidecar.v1.StopSyncResponse\x12[\n" +
-	"\fGetSyncStats\x12$.peat.sidecar.v1.GetSyncStatsRequest\x1a%.peat.sidecar.v1.GetSyncStatsResponseBOZMgithub.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1;sidecarv1b\x06proto3"
+	"\fGetSyncStats\x12$.peat.sidecar.v1.GetSyncStatsRequest\x1a%.peat.sidecar.v1.GetSyncStatsResponseBLZJgithub.com/defenseunicorns/peat-node/test/go/gen/peat/sidecar/v1;sidecarv1b\x06proto3"
 
 var (
 	file_peat_sidecar_v1_sidecar_proto_rawDescOnce sync.Once

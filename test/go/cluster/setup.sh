@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Cluster-to-cluster Peat sync test with UDS Remote Agent.
 #
-# Creates two k3d clusters, deploys UDS Remote Agent + peat-sidecar to each,
+# Creates two k3d clusters, deploys UDS Remote Agent + peat-node to each,
 # then runs the cross-cluster sync test.
 #
 # Prerequisites: k3d, docker, kubectl, go
@@ -17,9 +17,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PEAT_SIDECAR_DIR="${SCRIPT_DIR}/../../../peat-sidecar"
+PEAT_NODE_DIR="${SCRIPT_DIR}/../../../peat-node"
 UDS_AGENT_DIR="${SCRIPT_DIR}/../../../uds-remote-agent"
-PEAT_SIDECAR_IMAGE="peat-sidecar:dev"
+PEAT_NODE_IMAGE="peat-node:dev"
 
 # Cluster names and ports
 ALPHA_CLUSTER="peat-alpha"
@@ -36,12 +36,12 @@ DEPLOYMENT="uds-remote-agent-deployment"
 
 log() { echo "==> $*"; }
 
-ensure_peat_sidecar_image() {
-    if ! docker image inspect "${PEAT_SIDECAR_IMAGE}" &>/dev/null; then
-        log "Building peat-sidecar container image..."
-        docker build -t "${PEAT_SIDECAR_IMAGE}" "${PEAT_SIDECAR_DIR}"
+ensure_peat_node_image() {
+    if ! docker image inspect "${PEAT_NODE_IMAGE}" &>/dev/null; then
+        log "Building peat-node container image..."
+        docker build -t "${PEAT_NODE_IMAGE}" "${PEAT_NODE_DIR}"
     else
-        log "peat-sidecar image already exists"
+        log "peat-node image already exists"
     fi
 }
 
@@ -60,11 +60,11 @@ create_clusters() {
         -p "${BRAVO_PEAT_PORT}:${BRAVO_PEAT_PORT}@server:*" \
         --wait
 
-    # Load peat-sidecar image into both clusters
-    ensure_peat_sidecar_image
-    log "Loading peat-sidecar image into clusters..."
-    k3d image import "${PEAT_SIDECAR_IMAGE}" -c "${ALPHA_CLUSTER}"
-    k3d image import "${PEAT_SIDECAR_IMAGE}" -c "${BRAVO_CLUSTER}"
+    # Load peat-node image into both clusters
+    ensure_peat_node_image
+    log "Loading peat-node image into clusters..."
+    k3d image import "${PEAT_NODE_IMAGE}" -c "${ALPHA_CLUSTER}"
+    k3d image import "${PEAT_NODE_IMAGE}" -c "${BRAVO_CLUSTER}"
 }
 
 cleanup_clusters() {
@@ -132,26 +132,26 @@ EOF
         return 1
     fi
 
-    # Patch the deployment to add peat-sidecar as a sidecar container
-    log "Patching deployment with peat-sidecar..."
+    # Patch the deployment to add peat-node as a sidecar container
+    log "Patching deployment with peat-node..."
     kubectl -n "${NAMESPACE}" patch deployment "${DEPLOYMENT}" --type=json -p="[
         {
             \"op\": \"add\",
             \"path\": \"/spec/template/spec/containers/-\",
             \"value\": {
-                \"name\": \"peat-sidecar\",
-                \"image\": \"${PEAT_SIDECAR_IMAGE}\",
+                \"name\": \"peat-node\",
+                \"image\": \"${PEAT_NODE_IMAGE}\",
                 \"imagePullPolicy\": \"Never\",
                 \"env\": [
-                    {\"name\": \"PEAT_SIDECAR_LISTEN\", \"value\": \"tcp://0.0.0.0:50051\"},
-                    {\"name\": \"PEAT_SIDECAR_DATA_DIR\", \"value\": \"/data/peat-sidecar\"},
-                    {\"name\": \"PEAT_SIDECAR_NODE_ID\", \"value\": \"${peat_node_id}\"},
-                    {\"name\": \"PEAT_SIDECAR_AUTO_SYNC\", \"value\": \"true\"},
-                    {\"name\": \"RUST_LOG\", \"value\": \"peat_sidecar=info,peat_mesh=info\"}
+                    {\"name\": \"PEAT_NODE_LISTEN\", \"value\": \"tcp://0.0.0.0:50051\"},
+                    {\"name\": \"PEAT_NODE_DATA_DIR\", \"value\": \"/data/peat-node\"},
+                    {\"name\": \"PEAT_NODE_NODE_ID\", \"value\": \"${peat_node_id}\"},
+                    {\"name\": \"PEAT_NODE_AUTO_SYNC\", \"value\": \"true\"},
+                    {\"name\": \"RUST_LOG\", \"value\": \"peat_node=info,peat_mesh=info\"}
                 ],
                 \"ports\": [{\"containerPort\": 50051, \"protocol\": \"TCP\"}],
                 \"volumeMounts\": [
-                    {\"name\": \"peat-data\", \"mountPath\": \"/data/peat-sidecar\"}
+                    {\"name\": \"peat-data\", \"mountPath\": \"/data/peat-node\"}
                 ],
                 \"livenessProbe\": {
                     \"tcpSocket\": {\"port\": 50051},
@@ -176,12 +176,12 @@ EOF
         }
     ]"
 
-    # Add NodePort service for peat-sidecar
+    # Add NodePort service for peat-node
     kubectl apply -n "${NAMESPACE}" -f - <<EOF
 apiVersion: v1
 kind: Service
 metadata:
-  name: peat-sidecar
+  name: peat-node
 spec:
   type: NodePort
   selector:

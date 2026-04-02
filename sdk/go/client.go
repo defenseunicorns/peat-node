@@ -1,6 +1,6 @@
-// Package peat provides an idiomatic Go client for the peat-sidecar Connect RPC API.
+// Package peat provides an idiomatic Go client for the peat-node Connect RPC API.
 //
-// The client communicates with a co-located peat-sidecar process over Unix
+// The client communicates with a co-located peat-node process over Unix
 // socket or TCP using the Connect protocol (HTTP+proto). The sidecar is a
 // full CRDT mesh participant; this client provides a thin, pure-Go wrapper
 // with channels for subscriptions and context for cancellation.
@@ -20,17 +20,17 @@ import (
 	"strings"
 
 	"connectrpc.com/connect"
-	sidecarv1 "github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1"
-	"github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1/sidecarv1connect"
+	sidecarv1 "github.com/defenseunicorns/peat-node/sdk/go/gen/peat/sidecar/v1"
+	"github.com/defenseunicorns/peat-node/sdk/go/gen/peat/sidecar/v1/sidecarv1connect"
 	"golang.org/x/net/http2"
 )
 
-// Client connects to a peat-sidecar instance over Unix socket or TCP.
+// Client connects to a peat-node instance over Unix socket or TCP.
 type Client struct {
 	sidecar sidecarv1connect.PeatSidecarClient
 }
 
-// Connect creates a new Client connected to the peat-sidecar at the given
+// Connect creates a new Client connected to the peat-node at the given
 // address. Use "unix:///var/run/peat.sock" for Unix sockets or
 // "http://localhost:50051" for TCP.
 func Connect(target string) (*Client, error) {
