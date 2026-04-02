@@ -1,0 +1,345 @@
+// Peat Sidecar gRPC Service
+// Exposes peat-protocol/peat-mesh as a gRPC API for co-located applications.
+//
+// Copyright 2026 Defense Unicorns
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package peat.sidecar.v1;
+
+option go_package = "github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1;sidecarv1";
+
+// PeatSidecar exposes Peat mesh participation to co-located applications
+// over gRPC (Unix socket or TCP). The sidecar is a full CRDT mesh participant;
+// client applications interact with it to read/write shared state.
+service PeatSidecar {
+  // --- Lifecycle ---
+
+  // GetStatus returns the current state of the sidecar node.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+
+  // --- Peer Management ---
+
+  // ConnectPeer establishes an authenticated connection to a mesh peer.
+  rpc ConnectPeer(ConnectPeerRequest) returns (ConnectPeerResponse);
+
+  // DisconnectPeer drops the connection to a peer.
+  rpc DisconnectPeer(DisconnectPeerRequest) returns (DisconnectPeerResponse);
+
+  // ListPeers returns currently connected peers.
+  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+
+  // --- Generic Document CRUD ---
+  // Documents are JSON blobs stored in named collections, synced via CRDT.
+
+  // PutDocument creates or updates a document in a collection.
+  rpc PutDocument(PutDocumentRequest) returns (PutDocumentResponse);
+
+  // GetDocument retrieves a document by collection and ID.
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+
+  // DeleteDocument removes a document from a collection.
+  rpc DeleteDocument(DeleteDocumentRequest) returns (DeleteDocumentResponse);
+
+  // ListDocuments lists all document IDs in a collection.
+  rpc ListDocuments(ListDocumentsRequest) returns (ListDocumentsResponse);
+
+  // --- Typed Collections ---
+  // Convenience RPCs for common Peat domain objects.
+
+  rpc PutPlatform(PutPlatformRequest) returns (PutPlatformResponse);
+  rpc GetPlatforms(GetPlatformsRequest) returns (GetPlatformsResponse);
+
+  rpc PutCell(PutCellRequest) returns (PutCellResponse);
+  rpc GetCells(GetCellsRequest) returns (GetCellsResponse);
+
+  rpc PutTrack(PutTrackRequest) returns (PutTrackResponse);
+  rpc GetTracks(GetTracksRequest) returns (GetTracksResponse);
+
+  rpc PutCommand(PutCommandRequest) returns (PutCommandResponse);
+  rpc GetCommands(GetCommandsRequest) returns (GetCommandsResponse);
+
+  // --- Subscriptions ---
+
+  // Subscribe streams document changes across all or filtered collections.
+  rpc Subscribe(SubscribeRequest) returns (stream DocumentChange);
+
+  // --- Sync Control ---
+
+  // StartSync begins CRDT synchronization with connected peers.
+  rpc StartSync(StartSyncRequest) returns (StartSyncResponse);
+
+  // StopSync pauses synchronization.
+  rpc StopSync(StopSyncRequest) returns (StopSyncResponse);
+
+  // GetSyncStats returns current synchronization statistics.
+  rpc GetSyncStats(GetSyncStatsRequest) returns (GetSyncStatsResponse);
+}
+
+// --- Lifecycle Messages ---
+
+message GetStatusRequest {}
+
+message GetStatusResponse {
+  string node_id = 1;
+  string endpoint_addr = 2;
+  bool sync_active = 3;
+  uint32 connected_peers = 4;
+  NodePhase phase = 5;
+}
+
+enum NodePhase {
+  NODE_PHASE_UNSPECIFIED = 0;
+  NODE_PHASE_INITIALIZING = 1;
+  NODE_PHASE_READY = 2;
+  NODE_PHASE_SYNCING = 3;
+  NODE_PHASE_SHUTTING_DOWN = 4;
+}
+
+// --- Peer Management Messages ---
+
+message ConnectPeerRequest {
+  // Hex-encoded Iroh endpoint ID.
+  string endpoint_id = 1;
+  // Optional direct addresses (host:port).
+  repeated string addresses = 2;
+  // Optional relay URL.
+  string relay_url = 3;
+}
+
+message ConnectPeerResponse {}
+
+message DisconnectPeerRequest {
+  string endpoint_id = 1;
+}
+
+message DisconnectPeerResponse {}
+
+message ListPeersRequest {}
+
+message ListPeersResponse {
+  repeated PeerInfo peers = 1;
+}
+
+message PeerInfo {
+  string endpoint_id = 1;
+  repeated string addresses = 2;
+  bool connected = 3;
+}
+
+// --- Generic Document Messages ---
+
+message PutDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+  // JSON-encoded document content.
+  string json_data = 3;
+}
+
+message PutDocumentResponse {}
+
+message GetDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+}
+
+message GetDocumentResponse {
+  // Empty if not found.
+  optional string json_data = 1;
+}
+
+message DeleteDocumentRequest {
+  string collection = 1;
+  string doc_id = 2;
+}
+
+message DeleteDocumentResponse {}
+
+message ListDocumentsRequest {
+  string collection = 1;
+}
+
+message ListDocumentsResponse {
+  repeated string doc_ids = 1;
+}
+
+// --- Typed Collection Messages ---
+
+// Platform represents a mesh participant's state.
+message Platform {
+  string id = 1;
+  string platform_type = 2;
+  string name = 3;
+  PlatformStatus status = 4;
+  double latitude = 5;
+  double longitude = 6;
+  double altitude_m = 7;
+  double readiness = 8;
+  repeated string capabilities = 9;
+  optional string unit_id = 10;
+  optional string callsign = 11;
+}
+
+enum PlatformStatus {
+  PLATFORM_STATUS_UNSPECIFIED = 0;
+  PLATFORM_STATUS_READY = 1;
+  PLATFORM_STATUS_BUSY = 2;
+  PLATFORM_STATUS_DEGRADED = 3;
+  PLATFORM_STATUS_OFFLINE = 4;
+}
+
+message PutPlatformRequest {
+  Platform platform = 1;
+}
+
+message PutPlatformResponse {}
+
+message GetPlatformsRequest {}
+
+message GetPlatformsResponse {
+  repeated Platform platforms = 1;
+}
+
+// Cell represents a formation of platforms.
+message Cell {
+  string id = 1;
+  string name = 2;
+  CellStatus status = 3;
+  uint32 platform_count = 4;
+  double center_latitude = 5;
+  double center_longitude = 6;
+  repeated string capabilities = 7;
+  optional string formation_id = 8;
+  optional string leader_id = 9;
+}
+
+enum CellStatus {
+  CELL_STATUS_UNSPECIFIED = 0;
+  CELL_STATUS_ACTIVE = 1;
+  CELL_STATUS_INACTIVE = 2;
+  CELL_STATUS_OFFLINE = 3;
+}
+
+message PutCellRequest {
+  Cell cell = 1;
+}
+
+message PutCellResponse {}
+
+message GetCellsRequest {}
+
+message GetCellsResponse {
+  repeated Cell cells = 1;
+}
+
+// Track represents an ISR track.
+message Track {
+  string id = 1;
+  string source_platform = 2;
+  optional string cell_id = 3;
+  optional string formation_id = 4;
+  double latitude = 5;
+  double longitude = 6;
+  optional double altitude_m = 7;
+  optional double cep_m = 8;
+  optional double heading_deg = 9;
+  optional double speed_mps = 10;
+  string classification = 11;
+  double confidence = 12;
+  TrackCategory category = 13;
+}
+
+enum TrackCategory {
+  TRACK_CATEGORY_UNSPECIFIED = 0;
+  TRACK_CATEGORY_PERSON = 1;
+  TRACK_CATEGORY_VEHICLE = 2;
+  TRACK_CATEGORY_GROUND = 3;
+  TRACK_CATEGORY_AIR = 4;
+  TRACK_CATEGORY_UNKNOWN = 5;
+}
+
+message PutTrackRequest {
+  Track track = 1;
+}
+
+message PutTrackResponse {}
+
+message GetTracksRequest {}
+
+message GetTracksResponse {
+  repeated Track tracks = 1;
+}
+
+// Command represents a C2 command.
+message Command {
+  string id = 1;
+  string target_id = 2;
+  string command_type = 3;
+  CommandStatus status = 4;
+  int64 created_at = 5;
+  int64 expires_at = 6;
+  // JSON-encoded command payload.
+  string payload_json = 7;
+}
+
+enum CommandStatus {
+  COMMAND_STATUS_UNSPECIFIED = 0;
+  COMMAND_STATUS_PENDING = 1;
+  COMMAND_STATUS_EXECUTING = 2;
+  COMMAND_STATUS_COMPLETED = 3;
+  COMMAND_STATUS_FAILED = 4;
+  COMMAND_STATUS_CANCELLED = 5;
+}
+
+message PutCommandRequest {
+  Command command = 1;
+}
+
+message PutCommandResponse {}
+
+message GetCommandsRequest {}
+
+message GetCommandsResponse {
+  repeated Command commands = 1;
+}
+
+// --- Subscription Messages ---
+
+message SubscribeRequest {
+  // If empty, subscribe to all collections.
+  repeated string collections = 1;
+}
+
+message DocumentChange {
+  string collection = 1;
+  string doc_id = 2;
+  ChangeType change_type = 3;
+  // JSON content (present for upserts, absent for deletes).
+  optional string json_data = 4;
+}
+
+enum ChangeType {
+  CHANGE_TYPE_UNSPECIFIED = 0;
+  CHANGE_TYPE_UPSERT = 1;
+  CHANGE_TYPE_DELETE = 2;
+}
+
+// --- Sync Control Messages ---
+
+message StartSyncRequest {}
+
+message StartSyncResponse {}
+
+message StopSyncRequest {}
+
+message StopSyncResponse {}
+
+message GetSyncStatsRequest {}
+
+message GetSyncStatsResponse {
+  bool sync_active = 1;
+  uint32 connected_peers = 2;
+  uint64 bytes_sent = 3;
+  uint64 bytes_received = 4;
+}

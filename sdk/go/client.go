@@ -20,8 +20,8 @@ import (
 	"strings"
 
 	"connectrpc.com/connect"
-	sidecarv1 "github.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1"
-	"github.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1/sidecarv1connect"
+	sidecarv1 "github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1"
+	"github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1/sidecarv1connect"
 	"golang.org/x/net/http2"
 )
 
