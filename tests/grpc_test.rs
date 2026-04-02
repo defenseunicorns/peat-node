@@ -1,23 +1,23 @@
-//! End-to-end functional test: boots a full gRPC server and exercises
-//! the API through a tonic client, validating both plaintext and encrypted modes.
+//! End-to-end functional tests: boots a full Connect RPC server and exercises
+//! the API through HTTP/JSON (Connect protocol), validating both plaintext
+//! and encrypted modes.
+//!
+//! Uses plain reqwest as the client — this tests the actual Connect protocol
+//! (HTTP + JSON) rather than depending on a specific RPC client library.
 
+use std::sync::Arc;
 use std::time::Duration;
-use tonic::transport::Channel;
 
 use peat_sidecar::node::{SidecarConfig, SidecarNode};
-use peat_sidecar::proto::peat_sidecar_client::PeatSidecarClient;
-use peat_sidecar::proto::peat_sidecar_server::PeatSidecarServer;
-use peat_sidecar::proto::{
-    DeleteDocumentRequest, GetDocumentRequest, GetStatusRequest, GetSyncStatsRequest,
-    ListDocumentsRequest, PutDocumentRequest,
-};
+use peat_sidecar::pb::PeatSidecarExt;
 use peat_sidecar::service::PeatSidecarService;
 
-async fn boot_grpc_server(port: u16, encryption_key: Option<String>) -> PeatSidecarClient<Channel> {
+/// Boot a Connect RPC server on the given port and return a reqwest client + base URL.
+async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Client, String) {
     let dir = tempfile::tempdir().unwrap();
-    let node = std::sync::Arc::new(
+    let node = Arc::new(
         SidecarNode::new(SidecarConfig {
-            node_id: format!("grpc-test-{port}"),
+            node_id: format!("test-{port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),
             data_dir: dir.keep(),
@@ -28,180 +28,234 @@ async fn boot_grpc_server(port: u16, encryption_key: Option<String>) -> PeatSide
         .unwrap(),
     );
 
-    let service = PeatSidecarService::new(node);
+    let service = Arc::new(PeatSidecarService::new(node));
+    let router = service.register(connectrpc::Router::new());
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(PeatSidecarServer::new(service))
-            .serve(addr)
-            .await
-            .unwrap();
+        connectrpc::Server::new(router).serve(addr).await.unwrap();
     });
 
-    // Wait for server to be ready
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))
-        .unwrap()
-        .connect()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    (client, format!("http://127.0.0.1:{port}"))
+}
+
+/// Call a Connect RPC unary method with JSON encoding.
+async fn call(
+    client: &reqwest::Client,
+    base: &str,
+    method: &str,
+    body: serde_json::Value,
+) -> serde_json::Value {
+    let url = format!("{base}/peat.sidecar.v1.PeatSidecar/{method}");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
         .await
         .unwrap();
 
-    PeatSidecarClient::new(channel)
+    assert!(
+        resp.status().is_success(),
+        "{method} returned {}",
+        resp.status()
+    );
+    resp.json().await.unwrap()
 }
 
 #[tokio::test]
-async fn grpc_full_crud_plaintext() {
-    let mut client = boot_grpc_server(50071, None).await;
+async fn connect_protocol_full_crud_plaintext() {
+    let (client, base) = boot_server(50081, None).await;
 
-    // Status
-    let status = client
-        .get_status(GetStatusRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(status.node_id, "grpc-test-50071");
-    assert!(!status.endpoint_addr.is_empty());
+    // GetStatus
+    let status = call(&client, &base, "GetStatus", serde_json::json!({})).await;
+    assert_eq!(status["nodeId"], "test-50081");
+    assert!(!status["endpointAddr"].as_str().unwrap().is_empty());
 
-    // Put
-    client
-        .put_document(PutDocumentRequest {
-            collection: "test".into(),
-            doc_id: "doc-1".into(),
-            json_data: r#"{"hello":"world"}"#.into(),
-        })
-        .await
-        .unwrap();
+    // PutDocument
+    call(
+        &client,
+        &base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "test",
+            "docId": "doc-1",
+            "jsonData": r#"{"hello":"world"}"#
+        }),
+    )
+    .await;
 
-    // Get
-    let doc = client
-        .get_document(GetDocumentRequest {
-            collection: "test".into(),
-            doc_id: "doc-1".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(doc.json_data.as_deref(), Some(r#"{"hello":"world"}"#));
+    // GetDocument
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "test", "docId": "doc-1"}),
+    )
+    .await;
+    assert_eq!(doc["jsonData"], r#"{"hello":"world"}"#);
 
-    // List
-    let list = client
-        .list_documents(ListDocumentsRequest {
-            collection: "test".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.doc_ids, vec!["doc-1"]);
+    // ListDocuments
+    let list = call(
+        &client,
+        &base,
+        "ListDocuments",
+        serde_json::json!({"collection": "test"}),
+    )
+    .await;
+    assert_eq!(list["docIds"], serde_json::json!(["doc-1"]));
 
-    // Delete
-    client
-        .delete_document(DeleteDocumentRequest {
-            collection: "test".into(),
-            doc_id: "doc-1".into(),
-        })
-        .await
-        .unwrap();
+    // DeleteDocument
+    call(
+        &client,
+        &base,
+        "DeleteDocument",
+        serde_json::json!({"collection": "test", "docId": "doc-1"}),
+    )
+    .await;
 
-    let doc = client
-        .get_document(GetDocumentRequest {
-            collection: "test".into(),
-            doc_id: "doc-1".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(doc.json_data, None);
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "test", "docId": "doc-1"}),
+    )
+    .await;
+    assert!(doc.get("jsonData").is_none() || doc["jsonData"].is_null());
 
-    // Sync stats
-    let stats = client
-        .get_sync_stats(GetSyncStatsRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(stats.connected_peers, 0);
+    // GetSyncStats
+    let stats = call(&client, &base, "GetSyncStats", serde_json::json!({})).await;
+    assert_eq!(stats.get("connectedPeers"), None); // 0 is omitted by proto3 JSON
+
+    // PutPlatform (typed collection)
+    call(
+        &client,
+        &base,
+        "PutPlatform",
+        serde_json::json!({
+            "platform": {
+                "id": "plat-1",
+                "platformType": "uds-remote-agent",
+                "name": "test-agent",
+                "status": "PLATFORM_STATUS_READY",
+                "latitude": 38.89,
+                "longitude": -77.03,
+                "capabilities": ["deploy", "monitor"]
+            }
+        }),
+    )
+    .await;
+
+    // GetPlatforms
+    let platforms = call(&client, &base, "GetPlatforms", serde_json::json!({})).await;
+    let plats = platforms["platforms"].as_array().unwrap();
+    assert_eq!(plats.len(), 1);
+    assert_eq!(plats[0]["id"], "plat-1");
+    assert_eq!(plats[0]["name"], "test-agent");
 }
 
 #[tokio::test]
-async fn grpc_full_crud_encrypted() {
+async fn connect_protocol_full_crud_encrypted() {
     use base64::Engine;
     let key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
-    let mut client = boot_grpc_server(50072, Some(key)).await;
+    let (client, base) = boot_server(50082, Some(key)).await;
 
-    // Put encrypted
-    client
-        .put_document(PutDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-            json_data: r#"{"classified":"top-secret"}"#.into(),
-        })
-        .await
-        .unwrap();
+    // PutDocument (encrypted at rest)
+    call(
+        &client,
+        &base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "secure",
+            "docId": "secret-1",
+            "jsonData": r#"{"classified":"top-secret"}"#
+        }),
+    )
+    .await;
 
-    // Get decrypts transparently
-    let doc = client
-        .get_document(GetDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        doc.json_data.as_deref(),
-        Some(r#"{"classified":"top-secret"}"#)
-    );
+    // GetDocument (decrypted transparently)
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "secure", "docId": "secret-1"}),
+    )
+    .await;
+    assert_eq!(doc["jsonData"], r#"{"classified":"top-secret"}"#);
 
     // Overwrite
-    client
-        .put_document(PutDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-            json_data: r#"{"classified":"updated"}"#.into(),
-        })
-        .await
-        .unwrap();
+    call(
+        &client,
+        &base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "secure",
+            "docId": "secret-1",
+            "jsonData": r#"{"classified":"updated"}"#
+        }),
+    )
+    .await;
 
-    let doc = client
-        .get_document(GetDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(
-        doc.json_data.as_deref(),
-        Some(r#"{"classified":"updated"}"#)
-    );
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "secure", "docId": "secret-1"}),
+    )
+    .await;
+    assert_eq!(doc["jsonData"], r#"{"classified":"updated"}"#);
 
-    // List still works
-    let list = client
-        .list_documents(ListDocumentsRequest {
-            collection: "secure".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(list.doc_ids, vec!["secret-1"]);
+    // List
+    let list = call(
+        &client,
+        &base,
+        "ListDocuments",
+        serde_json::json!({"collection": "secure"}),
+    )
+    .await;
+    assert_eq!(list["docIds"], serde_json::json!(["secret-1"]));
 
     // Delete
-    client
-        .delete_document(DeleteDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-        })
-        .await
-        .unwrap();
+    call(
+        &client,
+        &base,
+        "DeleteDocument",
+        serde_json::json!({"collection": "secure", "docId": "secret-1"}),
+    )
+    .await;
 
-    let doc = client
-        .get_document(GetDocumentRequest {
-            collection: "secure".into(),
-            doc_id: "secret-1".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(doc.json_data, None);
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "secure", "docId": "secret-1"}),
+    )
+    .await;
+    assert!(doc.get("jsonData").is_none() || doc["jsonData"].is_null());
+}
+
+#[tokio::test]
+async fn connect_protocol_peer_and_sync_ops() {
+    let (client, base) = boot_server(50083, None).await;
+
+    // ListPeers (should be empty)
+    let peers = call(&client, &base, "ListPeers", serde_json::json!({})).await;
+    assert!(peers.get("peers").is_none() || peers["peers"].as_array().unwrap().is_empty());
+
+    // StartSync / StopSync
+    call(&client, &base, "StartSync", serde_json::json!({})).await;
+    let stats = call(&client, &base, "GetSyncStats", serde_json::json!({})).await;
+    assert_eq!(stats["syncActive"], true);
+
+    call(&client, &base, "StopSync", serde_json::json!({})).await;
+    let stats = call(&client, &base, "GetSyncStats", serde_json::json!({})).await;
+    // syncActive=false is omitted by proto3 JSON (default value)
+    assert!(stats.get("syncActive").is_none() || stats["syncActive"] == false);
 }
