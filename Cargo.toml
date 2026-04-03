@@ -13,10 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer)
-peat-mesh = { version = "0.6", features = ["automerge-backend"] }
-
-# Automerge CRDT
-automerge = "0.7"
+peat-mesh = { version = "0.8", features = ["automerge-backend"] }
 
 # P2P networking
 iroh = "0.97"
