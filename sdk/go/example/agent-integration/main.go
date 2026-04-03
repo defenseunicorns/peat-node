@@ -1,4 +1,4 @@
-// Example: How UDS Remote Agent integrates with peat-sidecar.
+// Example: How UDS Remote Agent integrates with peat-node.
 //
 // This demonstrates the three integration patterns:
 //  1. Agent pushes heartbeats to sidecar (replaces watcher polling)
@@ -19,19 +19,19 @@ import (
 	"os/signal"
 	"time"
 
-	peat "github.com/defenseunicorns/peat-sidecar/sdk/go"
+	peat "github.com/defenseunicorns/peat-node/sdk/go"
 )
 
 func main() {
-	addr := flag.String("addr", envOrDefault("PEAT_SIDECAR_ADDR", "http://localhost:50051"), "peat-sidecar address")
-	agentID := flag.String("agent-id", envOrDefault("PEAT_SIDECAR_NODE_ID", "example-agent"), "agent identifier")
+	addr := flag.String("addr", envOrDefault("PEAT_NODE_ADDR", "http://localhost:50051"), "peat-node address")
+	agentID := flag.String("agent-id", envOrDefault("PEAT_NODE_NODE_ID", "example-agent"), "agent identifier")
 	interval := flag.Duration("interval", 10*time.Second, "heartbeat interval")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Connect to the co-located peat-sidecar
+	// Connect to the co-located peat-node
 	client, err := peat.Connect(*addr)
 	if err != nil {
 		log.Fatalf("connect to sidecar: %v", err)

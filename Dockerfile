@@ -1,6 +1,6 @@
-# Multi-stage build for peat-sidecar
+# Multi-stage build for peat-node
 #
-# Build: docker build -t peat-sidecar:latest .
+# Build: docker build -t peat-node:latest .
 
 FROM rust:1.93-bookworm AS builder
 
@@ -29,13 +29,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates tini curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/peat-sidecar /usr/local/bin/peat-sidecar
+COPY --from=builder /build/target/release/peat-node /usr/local/bin/peat-node
 
 # Data directory for Automerge CRDT state and Iroh blobs
-VOLUME /data/peat-sidecar
+VOLUME /data/peat-node
 
 # gRPC API (TCP mode)
 EXPOSE 50051/tcp
 
 ENTRYPOINT ["tini", "--"]
-CMD ["peat-sidecar", "--data-dir=/data/peat-sidecar"]
+CMD ["peat-node", "--data-dir=/data/peat-node"]

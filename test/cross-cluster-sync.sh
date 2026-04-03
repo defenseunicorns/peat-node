@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Cross-cluster CRDT sync test for peat-sidecar.
+# Cross-cluster CRDT sync test for peat-node.
 #
-# Creates two k3d clusters, deploys a peat-sidecar to each, connects them
+# Creates two k3d clusters, deploys a peat-node to each, connects them
 # via Iroh relay, writes data on one side, and verifies it syncs to the other.
 #
 # Uses kubectl exec + curl (Connect protocol / HTTP+JSON) — no Go toolchain needed.
@@ -24,7 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="${SCRIPT_DIR}/.."
-IMAGE="peat-sidecar:dev"
+IMAGE="peat-node:dev"
 
 ALPHA="peat-sync-alpha"
 BRAVO="peat-sync-bravo"
@@ -82,13 +82,13 @@ kind: Pod
 metadata:
   name: sidecar
   labels:
-    app: peat-sidecar
+    app: peat-node
 spec:
   containers:
   - name: sidecar
     image: ${IMAGE}
     imagePullPolicy: Never
-    args: ["peat-sidecar", "--node-id=${node_id}", "--listen=tcp://0.0.0.0:50051", "--auto-sync"]
+    args: ["peat-node", "--node-id=${node_id}", "--listen=tcp://0.0.0.0:50051", "--auto-sync"]
     ports:
     - containerPort: 50051
 EOF

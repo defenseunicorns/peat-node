@@ -1,4 +1,4 @@
-// Smoke test: connects to peat-sidecar, does a round-trip put/get, verifies.
+// Smoke test: connects to peat-node, does a round-trip put/get, verifies.
 package main
 
 import (
@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	peat "github.com/defenseunicorns/peat-sidecar/test/go"
-	sidecarv1 "github.com/defenseunicorns/peat-sidecar/test/go/gen/peat/sidecar/v1"
+	peat "github.com/defenseunicorns/peat-node/test/go"
+	sidecarv1 "github.com/defenseunicorns/peat-node/test/go/gen/peat/sidecar/v1"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 	defer cancel()
 
 	target := "http://127.0.0.1:50051"
-	if env := os.Getenv("PEAT_SIDECAR_ADDR"); env != "" {
+	if env := os.Getenv("PEAT_NODE_ADDR"); env != "" {
 		target = env
 	}
 

@@ -1,4 +1,4 @@
-module github.com/defenseunicorns/peat-sidecar/test/go
+module github.com/defenseunicorns/peat-node/test/go
 
 go 1.26.1
 

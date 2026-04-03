@@ -8,7 +8,7 @@ syntax = "proto3";
 
 package peat.sidecar.v1;
 
-option go_package = "github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1;sidecarv1";
+option go_package = "github.com/defenseunicorns/peat-node/sdk/go/gen/peat/sidecar/v1;sidecarv1";
 
 // PeatSidecar exposes Peat mesh participation to co-located applications
 // over gRPC (Unix socket or TCP). The sidecar is a full CRDT mesh participant;

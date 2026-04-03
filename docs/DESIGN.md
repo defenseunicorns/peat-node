@@ -1,8 +1,8 @@
-# peat-sidecar Design
+# peat-node Design
 
 ## Overview
 
-peat-sidecar is a general-purpose Rust binary that runs as a Kubernetes
+peat-node is a general-purpose Rust binary that runs as a Kubernetes
 sidecar, participates as a full CRDT mesh node via peat-mesh (Automerge +
 Iroh QUIC), and exposes a gRPC API for co-located applications.
 
@@ -62,7 +62,7 @@ the DDIL-resilient transport layer underneath it.**
 graph TB
     subgraph hub["Fleet Command Hub"]
         hubapi["API Server + Agent Manager + Postgres"]
-        hubsidecar["peat-sidecar<br/>(consumes fleet state from CRDT)"]
+        hubsidecar["peat-node<br/>(consumes fleet state from CRDT)"]
     end
     hubsidecar <-. "CRDT sync" .-> e1sidecar
     hubsidecar <-.-> e2sidecar
@@ -72,17 +72,17 @@ graph TB
     e1sidecar <-.-> e3sidecar
     subgraph e1["Edge Cluster 1"]
         e1agent["Remote Agent"]
-        e1sidecar["peat-sidecar"]
+        e1sidecar["peat-node"]
         e1sidecar --> e1agent
     end
     subgraph e2["Edge Cluster 2"]
         e2agent["Remote Agent"]
-        e2sidecar["peat-sidecar"]
+        e2sidecar["peat-node"]
         e2sidecar --> e2agent
     end
     subgraph e3["Edge Cluster 3"]
         e3agent["Remote Agent"]
-        e3sidecar["peat-sidecar"]
+        e3sidecar["peat-node"]
         e3sidecar --> e3agent
     end
 ```
@@ -104,7 +104,7 @@ What Peat adds:
 
 ### Integration Model
 
-The peat-sidecar **carries the same data** as the Fleet Management
+The peat-node **carries the same data** as the Fleet Management
 heartbeat. The `AgentMessage` proto defines:
 
 ```protobuf
@@ -127,12 +127,12 @@ map directly to the heartbeat fields:
 | `version` | `platforms/{agent-id}.version` | `GET /status` |
 | `labels` | `platforms/{agent-id}.labels` | Agent settings |
 
-The Fleet Command Hub runs its own peat-sidecar. It reads the CRDT
+The Fleet Command Hub runs its own peat-node. It reads the CRDT
 mesh state and either:
 - **(Option E)** Feeds it directly into the Agent Manager as if it
   were a heartbeat — the hub doesn't need to distinguish between
   "received via direct RPC" and "received via CRDT mesh"
-- **(Option F)** The API Server queries the hub's peat-sidecar
+- **(Option F)** The API Server queries the hub's peat-node
   directly for fleet state, bypassing the Agent Manager for reads
 
 ### Connected vs DDIL Operation
@@ -148,7 +148,7 @@ mesh state and either:
 
 The Fleet Management TDD describes a UDS Android tablet as an
 "enrollment authority" for provisioning edge clusters. The same
-tablet could run peat-sidecar and serve as a **mobile mesh bridge**:
+tablet could run peat-node and serve as a **mobile mesh bridge**:
 
 ```mermaid
 graph LR
@@ -156,14 +156,14 @@ graph LR
         a["Edge Cluster A"]
         b["Edge Cluster B"]
         c["Edge Cluster C"]
-        tablet["Tablet<br/>(peat-sidecar)"]
+        tablet["Tablet<br/>(peat-node)"]
         a <-- "BLE" --> tablet
         b <-- "BLE" --> tablet
         c <-- "BLE" --> tablet
     end
     tablet -. "sneakernet" .-> hubsidecar
     subgraph connected["Connected Environment"]
-        hubsidecar["Hub Cluster<br/>(peat-sidecar)"]
+        hubsidecar["Hub Cluster<br/>(peat-node)"]
     end
 ```
 
@@ -179,13 +179,13 @@ state flows without any real-time network connectivity.
 graph LR
     subgraph pod["Kubernetes Pod"]
         agent["uds-remote-agent<br/>Connect RPC :8080"]
-        watcher["peat-sidecar<br/>Agent Watcher"]
+        watcher["peat-node<br/>Agent Watcher"]
         crdt["CRDT Store<br/>platforms/ · deployments/ · packages/"]
         mesh["Iroh QUIC<br/>Mesh Transport"]
     end
     watcher -- "polls /status,<br/>ListPackages" --> agent
     watcher --> crdt --> mesh
-    mesh -. "QUIC / BLE / relay" .-> others["Other<br/>peat-sidecars"]
+    mesh -. "QUIC / BLE / relay" .-> others["Other<br/>peat-nodes"]
 ```
 
 ## UDS Remote Agent: Server AND Client
@@ -208,15 +208,15 @@ The reusable client SDK (`pkg/client/api.go`) is used by:
 | `uds-agent-cli` (Go CLI) | Connect RPC / HTTP/2 | mTLS |
 | Web UI (Svelte) | Connect RPC / HTTP/2 | mTLS (.p12) |
 | E2E tests | Connect RPC / HTTP/2 | mTLS (test certs) |
-| **peat-sidecar watcher** | Connect RPC / HTTP/2 | mTLS or insecure |
+| **peat-node watcher** | Connect RPC / HTTP/2 | mTLS or insecure |
 
 The CLI supports 1-to-1 (`--server` pointing at one agent) and 1-to-many
 (pointing at different agents). This means the CLI could also point at a
-peat-sidecar fleet endpoint for fleet-wide queries using the same protocol.
+peat-node fleet endpoint for fleet-wide queries using the same protocol.
 
 ## Agent Watcher Design
 
-The peat-sidecar agent watcher connects to the local agent using the
+The peat-node agent watcher connects to the local agent using the
 **same Connect RPC protocol** as the CLI and UI. It is just another client.
 
 ### Connection
@@ -266,13 +266,13 @@ Fleet-wide queries go to the sidecar. The agent stays unaware.
 
 **Option B: Sidecar feeds Agent Manager on the hub (planned)**
 
-The hub's peat-sidecar reads CRDT mesh state and feeds it into the
+The hub's peat-node reads CRDT mesh state and feeds it into the
 Agent Manager as synthetic heartbeats. The Agent Manager doesn't
 need to know the data came from CRDT vs. direct RPC. Postgres gets
 the same fleet-wide data either way.
 
 This aligns with the Fleet Management TDD: the Agent Manager already
-expects `AgentMessage` payloads. The peat-sidecar on the hub simply
+expects `AgentMessage` payloads. The peat-node on the hub simply
 constructs these from CRDT state.
 
 **Option C: Agent FleetService (future)**
@@ -282,7 +282,7 @@ See `defenseunicorns/uds-remote-agent#533`.
 
 **Option D: Sidecar implements agent APIs**
 
-peat-sidecar serves `zarfapi.v1.ZarfAPIService.ListPackages` but
+peat-node serves `zarfapi.v1.ZarfAPIService.ListPackages` but
 returns fleet-wide aggregated data from the CRDT mesh. The existing
 CLI works without modification — just point `--server` at the sidecar.
 
@@ -291,7 +291,7 @@ CLI works without modification — just point `--server` at the sidecar.
 **Start with A. Implement B when Fleet Command Hub ships.**
 
 Option B is the natural integration: the hub already has an Agent Manager
-that receives heartbeats and writes to Postgres. Adding a peat-sidecar
+that receives heartbeats and writes to Postgres. Adding a peat-node
 to the hub that feeds CRDT state into the same pipeline requires no
 architectural changes to Fleet Management — just a new input source for
 the Agent Manager.
@@ -302,14 +302,14 @@ the Agent Manager.
 
 ```yaml
 containers:
-  - name: peat-sidecar
-    image: ghcr.io/defenseunicorns/peat-sidecar:latest
+  - name: peat-node
+    image: ghcr.io/defenseunicorns/peat-node:latest
     env:
-      - name: PEAT_SIDECAR_LISTEN
+      - name: PEAT_NODE_LISTEN
         value: "tcp://0.0.0.0:50051"
-      - name: PEAT_SIDECAR_AGENT_ADDR
+      - name: PEAT_NODE_AGENT_ADDR
         value: "http://localhost:8080"
-      - name: PEAT_SIDECAR_AUTO_SYNC
+      - name: PEAT_NODE_AUTO_SYNC
         value: "true"
     ports:
       - containerPort: 50051
@@ -319,12 +319,12 @@ containers:
 
 ```yaml
 containers:
-  - name: peat-sidecar
-    image: ghcr.io/defenseunicorns/peat-sidecar:latest
+  - name: peat-node
+    image: ghcr.io/defenseunicorns/peat-node:latest
     env:
-      - name: PEAT_SIDECAR_LISTEN
+      - name: PEAT_NODE_LISTEN
         value: "tcp://0.0.0.0:50051"
-      - name: PEAT_SIDECAR_AUTO_SYNC
+      - name: PEAT_NODE_AUTO_SYNC
         value: "true"
       # No --agent-addr: hub sidecar doesn't watch a local agent,
       # it receives state from the mesh and feeds the Agent Manager
@@ -332,7 +332,7 @@ containers:
 
 ## Precedent
 
-| Aspect | peat-registry mesh mode | peat-sidecar |
+| Aspect | peat-registry mesh mode | peat-node |
 |--------|------------------------|--------------|
 | Local service | OCI registry (HTTP :5000) | UDS Remote Agent (Connect RPC :8080) |
 | Watches local service | Enumerates registry digests | Polls agent APIs |
@@ -354,7 +354,7 @@ containers:
 
 | Issue | Repo | Description |
 |-------|------|-------------|
-| [#747](https://github.com/defenseunicorns/peat/issues/747) | peat | peat-sidecar umbrella |
+| [#747](https://github.com/defenseunicorns/peat/issues/747) | peat | peat-node umbrella |
 | [#748](https://github.com/defenseunicorns/peat/issues/748) | peat | Agent watcher (poll UDS Remote Agent) |
 | [#750](https://github.com/defenseunicorns/peat/issues/750) | peat | Cluster-to-cluster integration test |
 | [#751](https://github.com/defenseunicorns/peat/issues/751) | peat | Fleet state propagation design |

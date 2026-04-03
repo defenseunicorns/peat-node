@@ -1,7 +1,7 @@
 # Cluster-to-Cluster Peat Sync Test
 
 Tests cross-cluster CRDT synchronization between two UDS Remote Agent
-deployments via peat-sidecar.
+deployments via peat-node.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ deployments via peat-sidecar.
 │  │  │ uds-remote-agent (:8080)      │  │ │
 │  │  └───────────────────────────────┘  │ │
 │  │  ┌───────────────────────────────┐  │ │
-│  │  │ peat-sidecar (:50051)         │  │ │
+│  │  │ peat-node (:50051)         │  │ │
 │  │  └───────────────────────────────┘  │ │
 │  └─────────────────────────────────────┘ │
 │  NodePorts: 32582 (agent), 32551 (peat)  │
@@ -29,7 +29,7 @@ deployments via peat-sidecar.
 │  │  │ uds-remote-agent (:8080)      │  │ │
 │  │  └───────────────────────────────┘  │ │
 │  │  ┌───────────────────────────────┐  │ │
-│  │  │ peat-sidecar (:50051)         │  │ │
+│  │  │ peat-node (:50051)         │  │ │
 │  │  └───────────────────────────────┘  │ │
 │  └─────────────────────────────────────┘ │
 │  NodePorts: 33582 (agent), 33551 (peat)  │
@@ -42,13 +42,13 @@ deployments via peat-sidecar.
 - Docker
 - Zarf CLI (or `uds` wrapper)
 - Go 1.25+
-- peat-sidecar container image (built from `../../peat-sidecar/`)
+- peat-node container image (built from `../../peat-node/`)
 
 ## Usage
 
 ```bash
-# Build peat-sidecar image
-cd ../../../peat-sidecar && docker build -t peat-sidecar:dev .
+# Build peat-node image
+cd ../../../peat-node && docker build -t peat-node:dev .
 
 # Run the full test (creates clusters, deploys, tests, cleans up)
 ./setup.sh

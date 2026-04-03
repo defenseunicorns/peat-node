@@ -1,16 +1,16 @@
 kind: UDSBundle
 metadata:
-  name: peat-sidecar
-  description: UDS bundle for deploying peat-sidecar with UDS Operator integration
+  name: peat-node
+  description: UDS bundle for deploying peat-node with UDS Operator integration
   version: 0.1.0
 
 packages:
-  - name: peat-sidecar
+  - name: peat-node
     path: ..
     ref: 0.1.0
     overrides:
-      peat-sidecar:
-        peat-sidecar:
+      peat-node:
+        peat-node:
           values:
             - path: package.enabled
               value: true

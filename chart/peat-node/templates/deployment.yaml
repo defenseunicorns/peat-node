@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "peat-node.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "peat-node.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "peat-node.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "peat-node.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        {{- include "peat-node.container" . | nindent 8 }}
+      volumes:
+        {{- include "peat-node.volumes" . | nindent 8 }}

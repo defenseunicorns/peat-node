@@ -1,8 +1,8 @@
-//! peat-sidecar — Peat mesh participant exposing a Connect RPC API.
+//! peat-node — Local CRDT mesh node exposing a Connect RPC API.
 //!
-//! Designed to run as a Kubernetes sidecar container alongside Go applications
-//! (e.g., UDS Remote Agent). The sidecar bootstraps a full CRDT mesh node
-//! and exposes its capabilities over Connect RPC / gRPC / gRPC-Web.
+//! Runs as a standalone binary, Kubernetes sidecar, or systemd service alongside
+//! applications (e.g., UDS Remote Agent). Participates in a P2P CRDT mesh and
+//! exposes it over Connect RPC / gRPC / gRPC-Web.
 //!
 //! Optionally watches a co-located UDS Remote Agent and syncs its state
 //! to the mesh for cross-cluster visibility.
@@ -15,79 +15,68 @@ use clap::Parser;
 use connectrpc::Router;
 use tracing::{error, info};
 
-use peat_sidecar::node::{SidecarConfig, SidecarNode};
-use peat_sidecar::pb::PeatSidecarExt;
-use peat_sidecar::service::PeatSidecarService;
-use peat_sidecar::watcher;
+use peat_node::node::{SidecarConfig, SidecarNode};
+use peat_node::pb::PeatSidecarExt;
+use peat_node::service::PeatSidecarService;
+use peat_node::watcher;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "peat-sidecar",
-    about = "Peat mesh sidecar with Connect RPC API"
-)]
+#[command(name = "peat-node", about = "Peat CRDT mesh node with Connect RPC API")]
 struct Args {
     /// Listen address. Use "unix:///path/to/sock" for Unix socket or
     /// "tcp://0.0.0.0:50051" for TCP. Default: tcp://0.0.0.0:50051
-    #[arg(
-        long,
-        env = "PEAT_SIDECAR_LISTEN",
-        default_value = "tcp://0.0.0.0:50051"
-    )]
+    #[arg(long, env = "PEAT_NODE_LISTEN", default_value = "tcp://0.0.0.0:50051")]
     listen: String,
 
     /// Persistent data directory.
-    #[arg(
-        long,
-        env = "PEAT_SIDECAR_DATA_DIR",
-        default_value = "/data/peat-sidecar"
-    )]
+    #[arg(long, env = "PEAT_NODE_DATA_DIR", default_value = "/data/peat-node")]
     data_dir: PathBuf,
 
     /// Node identifier. Defaults to a random UUID.
-    #[arg(long, env = "PEAT_SIDECAR_NODE_ID")]
+    #[arg(long, env = "PEAT_NODE_NODE_ID")]
     node_id: Option<String>,
 
     /// Formation/application identifier for group authentication.
-    #[arg(long, env = "PEAT_SIDECAR_APP_ID", default_value = "peat-default")]
+    #[arg(long, env = "PEAT_NODE_APP_ID", default_value = "peat-default")]
     app_id: String,
 
     /// Base64-encoded 32-byte shared key for formation authentication.
-    #[arg(long, env = "PEAT_SIDECAR_SHARED_KEY", default_value = "")]
+    #[arg(long, env = "PEAT_NODE_SHARED_KEY", default_value = "")]
     shared_key: String,
 
     /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
-    #[arg(long, env = "PEAT_SIDECAR_ENCRYPTION_KEY")]
+    #[arg(long, env = "PEAT_NODE_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
 
     /// Peer endpoint IDs to connect to on startup.
-    #[arg(long, env = "PEAT_SIDECAR_PEERS", value_delimiter = ',')]
+    #[arg(long, env = "PEAT_NODE_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
 
     /// Auto-start sync on boot.
-    #[arg(long, env = "PEAT_SIDECAR_AUTO_SYNC", default_value = "true")]
+    #[arg(long, env = "PEAT_NODE_AUTO_SYNC", default_value = "true")]
     auto_sync: bool,
 
     // --- Agent Watcher ---
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
     /// Example: http://localhost:8080
-    #[arg(long, env = "PEAT_SIDECAR_AGENT_ADDR")]
+    #[arg(long, env = "PEAT_NODE_AGENT_ADDR")]
     agent_addr: Option<String>,
 
     /// Agent poll interval in seconds.
-    #[arg(long, env = "PEAT_SIDECAR_AGENT_POLL_INTERVAL", default_value = "10")]
+    #[arg(long, env = "PEAT_NODE_AGENT_POLL_INTERVAL", default_value = "10")]
     agent_poll_interval: u64,
 
     // --- Agent Watcher TLS ---
     /// Path to PEM-encoded client certificate for mTLS to the agent.
-    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_CERT")]
+    #[arg(long, env = "PEAT_NODE_AGENT_TLS_CERT")]
     agent_tls_cert: Option<PathBuf>,
 
     /// Path to PEM-encoded client private key for mTLS to the agent.
-    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_KEY")]
+    #[arg(long, env = "PEAT_NODE_AGENT_TLS_KEY")]
     agent_tls_key: Option<PathBuf>,
 
     /// Path to PEM-encoded CA certificate for verifying the agent's server certificate.
-    #[arg(long, env = "PEAT_SIDECAR_AGENT_TLS_CA")]
+    #[arg(long, env = "PEAT_NODE_AGENT_TLS_CA")]
     agent_tls_ca: Option<PathBuf>,
 }
 
@@ -96,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "peat_sidecar=info,peat_mesh=info".into()),
+                .unwrap_or_else(|_| "peat_node=info,peat_mesh=info".into()),
         )
         .init();
 
@@ -110,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         listen = %args.listen,
         data_dir = %args.data_dir.display(),
         agent_addr = ?args.agent_addr,
-        "starting peat-sidecar"
+        "starting peat-node"
     );
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
@@ -210,6 +199,6 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    info!("peat-sidecar stopped");
+    info!("peat-node stopped");
     Ok(())
 }

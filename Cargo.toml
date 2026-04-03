@@ -1,14 +1,14 @@
 [package]
-name = "peat-sidecar"
+name = "peat-node"
 version = "0.1.0"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/defenseunicorns/peat-sidecar"
-description = "Peat mesh sidecar — exposes peat-protocol as a gRPC API for co-located applications"
+repository = "https://github.com/defenseunicorns/peat-node"
+description = "Peat mesh node — exposes peat-protocol as a gRPC API for co-located applications"
 
 [[bin]]
-name = "peat-sidecar"
+name = "peat-node"
 path = "src/main.rs"
 
 [dependencies]

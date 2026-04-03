@@ -14,7 +14,7 @@ import (
 	connect "connectrpc.com/connect"
 	context "context"
 	errors "errors"
-	v1 "github.com/defenseunicorns/peat-sidecar/sdk/go/gen/peat/sidecar/v1"
+	v1 "github.com/defenseunicorns/peat-node/sdk/go/gen/peat/sidecar/v1"
 	http "net/http"
 	strings "strings"
 )

@@ -1,90 +1,90 @@
 {{/*
 Standard name helpers
 */}}
-{{- define "peat-sidecar.name" -}}
-peat-sidecar
+{{- define "peat-node.name" -}}
+peat-node
 {{- end -}}
 
-{{- define "peat-sidecar.fullname" -}}
-{{ .Release.Name }}-peat-sidecar
+{{- define "peat-node.fullname" -}}
+{{ .Release.Name }}-peat-node
 {{- end -}}
 
-{{- define "peat-sidecar.labels" -}}
-app.kubernetes.io/name: peat-sidecar
+{{- define "peat-node.labels" -}}
+app.kubernetes.io/name: peat-node
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
-{{- define "peat-sidecar.selectorLabels" -}}
-app.kubernetes.io/name: peat-sidecar
+{{- define "peat-node.selectorLabels" -}}
+app.kubernetes.io/name: peat-node
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{/*
-peat-sidecar container spec — inject this into any pod as an additional container.
+peat-node container spec — inject this into any pod as an additional container.
 
 Usage in a parent chart:
   containers:
     - name: my-app
       ...
-    {{- include "peat-sidecar.container" .Subcharts.peat-sidecar | nindent 4 }}
+    {{- include "peat-node.container" .Subcharts.peat-node | nindent 4 }}
 */}}
 
-{{- define "peat-sidecar.container" -}}
-- name: peat-sidecar
+{{- define "peat-node.container" -}}
+- name: peat-node
   image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
   imagePullPolicy: {{ .Values.image.pullPolicy }}
   env:
-    - name: PEAT_SIDECAR_LISTEN
+    - name: PEAT_NODE_LISTEN
       value: {{ .Values.listen | quote }}
-    - name: PEAT_SIDECAR_DATA_DIR
-      value: /data/peat-sidecar
+    - name: PEAT_NODE_DATA_DIR
+      value: /data/peat-node
     {{- if .Values.nodeId }}
-    - name: PEAT_SIDECAR_NODE_ID
+    - name: PEAT_NODE_NODE_ID
       value: {{ .Values.nodeId | quote }}
     {{- end }}
-    - name: PEAT_SIDECAR_APP_ID
+    - name: PEAT_NODE_APP_ID
       value: {{ .Values.appId | quote }}
     {{- if .Values.sharedKey }}
-    - name: PEAT_SIDECAR_SHARED_KEY
+    - name: PEAT_NODE_SHARED_KEY
       value: {{ .Values.sharedKey | quote }}
     {{- end }}
     {{- if .Values.encryptionKey }}
-    - name: PEAT_SIDECAR_ENCRYPTION_KEY
+    - name: PEAT_NODE_ENCRYPTION_KEY
       value: {{ .Values.encryptionKey | quote }}
     {{- else if and .Values.encryptionKeySecret.name .Values.encryptionKeySecret.key }}
-    - name: PEAT_SIDECAR_ENCRYPTION_KEY
+    - name: PEAT_NODE_ENCRYPTION_KEY
       valueFrom:
         secretKeyRef:
           name: {{ .Values.encryptionKeySecret.name }}
           key: {{ .Values.encryptionKeySecret.key }}
     {{- end }}
     {{- if .Values.peers }}
-    - name: PEAT_SIDECAR_PEERS
+    - name: PEAT_NODE_PEERS
       value: {{ join "," .Values.peers | quote }}
     {{- end }}
     {{- if .Values.autoSync }}
-    - name: PEAT_SIDECAR_AUTO_SYNC
+    - name: PEAT_NODE_AUTO_SYNC
       value: "true"
     {{- end }}
     {{- if .Values.agentAddr }}
-    - name: PEAT_SIDECAR_AGENT_ADDR
+    - name: PEAT_NODE_AGENT_ADDR
       value: {{ .Values.agentAddr | quote }}
-    - name: PEAT_SIDECAR_AGENT_POLL_INTERVAL
+    - name: PEAT_NODE_AGENT_POLL_INTERVAL
       value: {{ .Values.agentPollInterval | quote }}
     {{- if .Values.agentTls.enabled }}
-    - name: PEAT_SIDECAR_AGENT_TLS_CERT
-      value: /etc/peat-sidecar/agent-tls/tls.crt
-    - name: PEAT_SIDECAR_AGENT_TLS_KEY
-      value: /etc/peat-sidecar/agent-tls/tls.key
-    - name: PEAT_SIDECAR_AGENT_TLS_CA
-      value: /etc/peat-sidecar/agent-tls/ca.crt
+    - name: PEAT_NODE_AGENT_TLS_CERT
+      value: /etc/peat-node/agent-tls/tls.crt
+    - name: PEAT_NODE_AGENT_TLS_KEY
+      value: /etc/peat-node/agent-tls/tls.key
+    - name: PEAT_NODE_AGENT_TLS_CA
+      value: /etc/peat-node/agent-tls/ca.crt
     {{- end }}
     {{- end }}
     {{- if .Values.verbose }}
     - name: RUST_LOG
-      value: "peat_sidecar=debug,peat_mesh=debug"
+      value: "peat_node=debug,peat_mesh=debug"
     {{- end }}
   ports:
     {{- if hasPrefix "tcp://" .Values.listen }}
@@ -115,40 +115,40 @@ Usage in a parent chart:
   resources:
     {{- toYaml .Values.resources | nindent 4 }}
   volumeMounts:
-    - name: peat-sidecar-data
-      mountPath: /data/peat-sidecar
+    - name: peat-node-data
+      mountPath: /data/peat-node
     {{- if hasPrefix "unix://" .Values.listen }}
-    - name: peat-sidecar-socket
+    - name: peat-node-socket
       mountPath: {{ dir (trimPrefix "unix://" .Values.listen) }}
     {{- end }}
     {{- if and .Values.agentTls.enabled .Values.agentTls.secretName }}
-    - name: peat-sidecar-agent-tls
-      mountPath: /etc/peat-sidecar/agent-tls
+    - name: peat-node-agent-tls
+      mountPath: /etc/peat-node/agent-tls
       readOnly: true
     {{- end }}
 {{- end -}}
 
 {{/*
-peat-sidecar volumes — add these to the pod spec.
+peat-node volumes — add these to the pod spec.
 
 Usage:
   volumes:
-    {{- include "peat-sidecar.volumes" .Subcharts.peat-sidecar | nindent 4 }}
+    {{- include "peat-node.volumes" .Subcharts.peat-node | nindent 4 }}
 */}}
-{{- define "peat-sidecar.volumes" -}}
-- name: peat-sidecar-data
+{{- define "peat-node.volumes" -}}
+- name: peat-node-data
   {{- if .Values.persistence.enabled }}
   persistentVolumeClaim:
-    claimName: {{ include "peat-sidecar.fullname" . }}-data
+    claimName: {{ include "peat-node.fullname" . }}-data
   {{- else }}
   emptyDir: {}
   {{- end }}
 {{- if hasPrefix "unix://" .Values.listen }}
-- name: peat-sidecar-socket
+- name: peat-node-socket
   emptyDir: {}
 {{- end }}
 {{- if and .Values.agentTls.enabled .Values.agentTls.secretName }}
-- name: peat-sidecar-agent-tls
+- name: peat-node-agent-tls
   secret:
     secretName: {{ .Values.agentTls.secretName }}
 {{- end }}

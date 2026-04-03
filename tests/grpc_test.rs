@@ -8,9 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use peat_sidecar::node::{SidecarConfig, SidecarNode};
-use peat_sidecar::pb::PeatSidecarExt;
-use peat_sidecar::service::PeatSidecarService;
+use peat_node::node::{SidecarConfig, SidecarNode};
+use peat_node::pb::PeatSidecarExt;
+use peat_node::service::PeatSidecarService;
 
 /// Boot a Connect RPC server on the given port and return a reqwest client + base URL.
 async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Client, String) {

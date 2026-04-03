@@ -3111,7 +3111,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "peat-sidecar"
+name = "peat-node"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
