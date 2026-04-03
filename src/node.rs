@@ -96,7 +96,7 @@ impl SidecarNode {
         ));
 
         // 6. Create sync protocol handler (accepts incoming CRDT sync connections)
-        let handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone(), formation_key);
+        let handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone(), formation_key.clone());
 
         // 7. Create networked blob store with sync protocol registered
         let blob_store = NetworkedIrohBlobStore::from_endpoint_with_protocols(
@@ -274,11 +274,32 @@ impl SidecarNode {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
-        let peer_addr = iroh::EndpointAddr::from_parts(peer_id, vec![]);
 
-        // Connect via the endpoint
-        let endpoint = self.sync_transport.endpoint();
-        let connection = endpoint.connect(peer_addr, CAP_AUTOMERGE_ALPN).await?;
+        // Wait for relay URL to be available, then register peer for discovery
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let our_addr = self.blob_store.endpoint().addr();
+            if our_addr.relay_urls().next().is_some() {
+                let mut peer_addr = iroh::EndpointAddr::new(peer_id);
+                for relay_url in our_addr.relay_urls() {
+                    peer_addr = peer_addr.with_relay_url(relay_url.clone());
+                }
+                self.blob_store
+                    .memory_lookup()
+                    .add_endpoint_info(peer_addr);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!("no relay URL available after 10s"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Connect and authenticate via formation key handshake
+        let connection = self
+            .sync_transport
+            .connect_and_authenticate(peer_id)
+            .await?;
 
         // Register the connection for CRDT sync
         self.sync_transport
@@ -292,6 +313,11 @@ impl SidecarNode {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
+        // Close the QUIC connection (causes the background sync task to exit)
+        if let Some(conn) = self.sync_transport.get_connection(&peer_id) {
+            conn.close(0u32.into(), b"disconnect requested");
+        }
+        self.sync_transport.remove_connection(&peer_id);
         self.coordinator.clear_peer_sync_state(peer_id);
         info!(peer = endpoint_id_str, "disconnected from peer");
         Ok(())
