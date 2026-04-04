@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use automerge::transaction::Transactable;
-use automerge::ReadDoc;
+use peat_mesh::security::FormationKey;
+use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{
     AutomergeStore, AutomergeSyncCoordinator, MeshSyncTransport, NetworkedIrohBlobStore,
     SyncProtocolHandler, SyncTransport, CAP_AUTOMERGE_ALPN,
@@ -82,19 +82,30 @@ impl SidecarNode {
             "iroh endpoint bound"
         );
 
-        // 3. Create sync transport wrapping the Iroh endpoint
-        let sync_transport = Arc::new(MeshSyncTransport::new(endpoint.clone()));
+        // 3. Derive formation key from shared secret for peer authentication
+        let formation_key = FormationKey::from_base64(&config.app_id, &config.shared_key)
+            .map_err(|e| anyhow::anyhow!("invalid formation key: {e}"))?;
 
-        // 4. Create sync coordinator
+        // 4. Create sync transport wrapping the Iroh endpoint
+        let sync_transport = Arc::new(MeshSyncTransport::new(
+            endpoint.clone(),
+            formation_key.clone(),
+        ));
+
+        // 5. Create sync coordinator
         let coordinator = Arc::new(AutomergeSyncCoordinator::new(
             Arc::clone(&store),
             sync_transport.clone(),
         ));
 
-        // 5. Create sync protocol handler (accepts incoming CRDT sync connections)
-        let handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone());
+        // 6. Create sync protocol handler (accepts incoming CRDT sync connections)
+        let handler = SyncProtocolHandler::new(
+            sync_transport.clone(),
+            coordinator.clone(),
+            formation_key.clone(),
+        );
 
-        // 6. Create networked blob store with sync protocol registered
+        // 7. Create networked blob store with sync protocol registered
         let blob_store = NetworkedIrohBlobStore::from_endpoint_with_protocols(
             iroh_dir,
             endpoint,
@@ -180,7 +191,10 @@ impl SidecarNode {
                     if let Some((collection, doc_id)) = key.split_once(':') {
                         // Try to read the current value to include in the change event
                         let raw = match store.get(&key) {
-                            Ok(Some(doc)) => extract_json_from_automerge(&doc),
+                            Ok(Some(doc)) => automerge_to_json(&doc)
+                                .get("value")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
                             _ => None,
                         };
                         // Decrypt if encrypted
@@ -267,11 +281,30 @@ impl SidecarNode {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
-        let peer_addr = iroh::EndpointAddr::from_parts(peer_id, vec![]);
 
-        // Connect via the endpoint
-        let endpoint = self.sync_transport.endpoint();
-        let connection = endpoint.connect(peer_addr, CAP_AUTOMERGE_ALPN).await?;
+        // Wait for relay URL to be available, then register peer for discovery
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let our_addr = self.blob_store.endpoint().addr();
+            if our_addr.relay_urls().next().is_some() {
+                let mut peer_addr = iroh::EndpointAddr::new(peer_id);
+                for relay_url in our_addr.relay_urls() {
+                    peer_addr = peer_addr.with_relay_url(relay_url.clone());
+                }
+                self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!("no relay URL available after 10s"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Connect and authenticate via formation key handshake
+        let connection = self
+            .sync_transport
+            .connect_and_authenticate(peer_id)
+            .await?;
 
         // Register the connection for CRDT sync
         self.sync_transport
@@ -285,6 +318,11 @@ impl SidecarNode {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
+        // Close the QUIC connection (causes the background sync task to exit)
+        if let Some(conn) = self.sync_transport.get_connection(&peer_id) {
+            conn.close(0u32.into(), b"disconnect requested");
+        }
+        self.sync_transport.remove_connection(&peer_id);
         self.coordinator.clear_peer_sync_state(peer_id);
         info!(peer = endpoint_id_str, "disconnected from peer");
         Ok(())
@@ -325,13 +363,9 @@ impl SidecarNode {
         };
 
         // Create or update an Automerge document with the (possibly encrypted) value
-        let mut doc = match self.store.get(&key)? {
-            Some(existing) => existing,
-            None => automerge::Automerge::new(),
-        };
-        let mut tx = doc.transaction();
-        tx.put(automerge::ROOT, "value", store_value.as_str())?;
-        tx.commit();
+        let json_value = serde_json::json!({ "value": store_value });
+        let existing = self.store.get(&key)?;
+        let doc = json_to_automerge(&json_value, existing.as_ref())?;
 
         self.store.put(&key, &doc)?;
 
@@ -353,7 +387,13 @@ impl SidecarNode {
     ) -> anyhow::Result<Option<String>> {
         let key = format!("{collection}:{doc_id}");
         match self.store.get(&key)? {
-            Some(doc) => Ok(self.maybe_decrypt(extract_json_from_automerge(&doc))?),
+            Some(doc) => {
+                let value = automerge_to_json(&doc)
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                Ok(self.maybe_decrypt(value)?)
+            }
             None => Ok(None),
         }
     }
@@ -402,17 +442,6 @@ impl SidecarNode {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.blob_store.shutdown().await?;
         Ok(())
-    }
-}
-
-/// Extract the JSON string stored in an Automerge document.
-fn extract_json_from_automerge(doc: &automerge::Automerge) -> Option<String> {
-    match doc.get(automerge::ROOT, "value") {
-        Ok(Some((automerge::Value::Scalar(s), _))) => match s.as_ref() {
-            automerge::ScalarValue::Str(s) => Some(s.to_string()),
-            _ => None,
-        },
-        _ => None,
     }
 }
 
