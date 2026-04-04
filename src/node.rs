@@ -87,7 +87,10 @@ impl SidecarNode {
             .map_err(|e| anyhow::anyhow!("invalid formation key: {e}"))?;
 
         // 4. Create sync transport wrapping the Iroh endpoint
-        let sync_transport = Arc::new(MeshSyncTransport::new(endpoint.clone(), formation_key.clone()));
+        let sync_transport = Arc::new(MeshSyncTransport::new(
+            endpoint.clone(),
+            formation_key.clone(),
+        ));
 
         // 5. Create sync coordinator
         let coordinator = Arc::new(AutomergeSyncCoordinator::new(
@@ -96,7 +99,11 @@ impl SidecarNode {
         ));
 
         // 6. Create sync protocol handler (accepts incoming CRDT sync connections)
-        let handler = SyncProtocolHandler::new(sync_transport.clone(), coordinator.clone(), formation_key.clone());
+        let handler = SyncProtocolHandler::new(
+            sync_transport.clone(),
+            coordinator.clone(),
+            formation_key.clone(),
+        );
 
         // 7. Create networked blob store with sync protocol registered
         let blob_store = NetworkedIrohBlobStore::from_endpoint_with_protocols(
@@ -284,9 +291,7 @@ impl SidecarNode {
                 for relay_url in our_addr.relay_urls() {
                     peer_addr = peer_addr.with_relay_url(relay_url.clone());
                 }
-                self.blob_store
-                    .memory_lookup()
-                    .add_endpoint_info(peer_addr);
+                self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
