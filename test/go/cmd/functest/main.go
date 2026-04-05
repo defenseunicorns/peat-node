@@ -889,14 +889,16 @@ func testPeerDisconnect(ctx context.Context, clientA, clientB *peat.Client) erro
 	if err := clientB.DisconnectPeer(ctx, statusA.EndpointAddr); err != nil {
 		return fmt.Errorf("disconnect: %w", err)
 	}
-	// Give a moment for state to update
-	time.Sleep(500 * time.Millisecond)
-	peers, err := clientB.ListPeers(ctx)
+	// Poll until the peer list is empty (connection close propagates async)
+	err = pollUntil(ctx, 500*time.Millisecond, 10*time.Second, func() (bool, error) {
+		peers, err := clientB.ListPeers(ctx)
+		if err != nil {
+			return false, err
+		}
+		return len(peers) == 0, nil
+	})
 	if err != nil {
-		return fmt.Errorf("list peers: %w", err)
-	}
-	if len(peers) != 0 {
-		return fmt.Errorf("expected 0 peers after disconnect, got %d", len(peers))
+		return fmt.Errorf("peers not cleared after disconnect: %w", err)
 	}
 	return nil
 }
