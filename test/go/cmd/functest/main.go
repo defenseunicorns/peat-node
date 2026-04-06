@@ -889,8 +889,6 @@ func testPeerDisconnect(ctx context.Context, clientA, clientB *peat.Client) erro
 	if err := clientB.DisconnectPeer(ctx, statusA.EndpointAddr); err != nil {
 		return fmt.Errorf("disconnect: %w", err)
 	}
-	// Give a moment for state to update
-	time.Sleep(500 * time.Millisecond)
 	peers, err := clientB.ListPeers(ctx)
 	if err != nil {
 		return fmt.Errorf("list peers: %w", err)

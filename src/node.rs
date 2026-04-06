@@ -324,6 +324,8 @@ impl SidecarNode {
         }
         self.sync_transport.remove_connection(&peer_id);
         self.coordinator.clear_peer_sync_state(peer_id);
+        // Yield to let background sync tasks observe the closed connection and clean up
+        tokio::task::yield_now().await;
         info!(peer = endpoint_id_str, "disconnected from peer");
         Ok(())
     }

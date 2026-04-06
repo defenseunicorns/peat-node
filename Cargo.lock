@@ -3041,9 +3041,9 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peat-mesh"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c4ea99466e60a8ec05aba21649ea9444dc5c295134507aeca6c39d7153c45a5"
+checksum = "e1094f45fbd841cb30b39638c43c3c8b69a8c8c70ba055ec24703e79bec02680"
 dependencies = [
  "anyhow",
  "async-trait",
