@@ -76,6 +76,10 @@ Query either sidecar to see fleet-wide agent state from both clusters.
 
 ## Quick Start
 
+The fastest way to see CRDT sync working is the two-node Docker Compose example at [`examples/compose/`](examples/compose/) — `docker compose up -d && ./bootstrap.sh && ./demo.sh` writes a document on node-a and verifies it lands on node-b. No build required; uses the published `ghcr.io/defenseunicorns/peat-node` image.
+
+To run a single node from source:
+
 ```bash
 # Build
 cargo build --release
@@ -94,6 +98,8 @@ cargo build --release
   --agent-poll-interval 10 \
   --auto-sync
 ```
+
+Every CLI flag has a `PEAT_NODE_*` environment variable equivalent — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full reference.
 
 ## gRPC API
 
