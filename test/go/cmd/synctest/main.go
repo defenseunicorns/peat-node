@@ -242,6 +242,35 @@ func run() error {
 		fmt.Printf("  - %s (%s) @ %.4f, %.4f\n", pl.Id, pl.Name, pl.Latitude, pl.Longitude)
 	}
 
+	// 8. Verify GetSyncStats reports real byte counters (issue #39).
+	// After bidirectional sync, both nodes should have non-zero bytes_sent
+	// AND bytes_received. A zero from either side means the wiring from
+	// AutomergeSyncCoordinator into SyncStats regressed.
+	fmt.Println("--- Verifying GetSyncStats byte counters ---")
+	statsA, err := clientA.SyncStats(ctx)
+	if err != nil {
+		return fmt.Errorf("sync stats node-a: %w", err)
+	}
+	statsB, err := clientB.SyncStats(ctx)
+	if err != nil {
+		return fmt.Errorf("sync stats node-b: %w", err)
+	}
+	fmt.Printf("  node-a: bytes_sent=%d bytes_received=%d\n", statsA.BytesSent, statsA.BytesReceived)
+	fmt.Printf("  node-b: bytes_sent=%d bytes_received=%d\n", statsB.BytesSent, statsB.BytesReceived)
+	if statsA.BytesSent == 0 {
+		return fmt.Errorf("node-a bytes_sent is 0 after sync — counter wiring regressed")
+	}
+	if statsA.BytesReceived == 0 {
+		return fmt.Errorf("node-a bytes_received is 0 after sync — counter wiring regressed")
+	}
+	if statsB.BytesSent == 0 {
+		return fmt.Errorf("node-b bytes_sent is 0 after sync — counter wiring regressed")
+	}
+	if statsB.BytesReceived == 0 {
+		return fmt.Errorf("node-b bytes_received is 0 after sync — counter wiring regressed")
+	}
+	fmt.Println("PASS: both nodes report non-zero bytes_sent and bytes_received")
+
 	return nil
 }
 

@@ -270,8 +270,8 @@ impl SidecarNode {
         SyncStats {
             sync_active: self.is_sync_active(),
             connected_peers: self.connected_peer_count(),
-            bytes_sent: 0,
-            bytes_received: 0,
+            bytes_sent: self.coordinator.total_bytes_sent(),
+            bytes_received: self.coordinator.total_bytes_received(),
         }
     }
 
