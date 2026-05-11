@@ -158,19 +158,22 @@ async fn two_node_direct_udp_sync() {
     assert!(peers_a >= 1, "node-a should see >= 1 peer, got {peers_a}");
     assert!(peers_b >= 1, "node-b should see >= 1 peer, got {peers_b}");
 
-    // Note on byte counters: AutomergeSyncCoordinator's `total_bytes_sent`
-    // / `total_bytes_received` increment on the snapshot/sync-message
-    // send-receive paths. With two SidecarNodes in the same process,
-    // observable sync evidently flows through an initial-reconciliation
-    // path that the in-process configuration short-circuits — the
-    // counters stay at zero even after docs converge end-to-end. The
-    // subprocess equivalent (the prior Go synctest) saw real ~8 KB
-    // exchanges. The wiring of those counters into `sync_stats` is pinned
-    // separately by `tests/node_test.rs::sync_stats_default_zero_on_fresh_node`
-    // (asserts coordinator-derived zero on a fresh node, guards against
-    // a regression to hardcoded zeros). Recovering the byte-traffic
-    // assertion under the new test surface is tracked in the test-coverage
-    // umbrella.
+    // Byte counter assertion deliberately omitted.
+    //
+    // `AutomergeSyncCoordinator::total_bytes_sent` / `total_bytes_received`
+    // increment on the snapshot/sync-message send-receive paths. With
+    // two SidecarNodes in the *same process*, observable sync flows
+    // through an initial-reconciliation path that the in-process
+    // configuration short-circuits — counters stay at zero even after
+    // docs converge end-to-end. The subprocess equivalent (the prior
+    // Go synctest) saw real ~8 KB exchanges.
+    //
+    // The companion fresh-node check in `tests/node_test.rs` is *not*
+    // a guard against hardcoded zeros (a `bytes_sent: 0` regression
+    // would satisfy it identically). Recovering the real-sync
+    // assertion needs a subprocess-driven test using
+    // `CARGO_BIN_EXE_peat-node` + `tokio::process` — tracked in #44
+    // as a release-blocker for the next tagged version.
 }
 
 async fn poll_for_document(
