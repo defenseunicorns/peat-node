@@ -1,8 +1,8 @@
 ---
 name: peat-node
-description: Per-repo skill for the Peat sidecar node — Rust binary that exposes peat-protocol over Connect/gRPC/gRPC-Web for co-located applications, plus a Go SDK and Helm/Zarf packaging.
-when_to_use: Editing files under peat-node/, reviewing peat-node PRs, debugging the sidecar API or DDIL fleet sync, editing proto/sidecar.proto, working on the Go SDK in sdk/go, or working on the Helm chart / Zarf packaging.
-verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, plus Go SDK regeneration when proto changes, the cross-cluster-sync.sh functional test for sync-path changes, and helm template for chart changes.
+description: Per-repo skill for the Peat sidecar node — Rust binary that exposes peat-protocol over Connect/gRPC/gRPC-Web for co-located applications, plus Helm/Zarf packaging.
+when_to_use: Editing files under peat-node/, reviewing peat-node PRs, debugging the sidecar API or DDIL fleet sync, editing proto/sidecar.proto, or working on the Helm chart / Zarf packaging.
+verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, the cross-cluster-sync.sh functional test for sync-path changes, and helm template for chart changes.
 ---
 
 # `peat-node` SKILL
@@ -10,34 +10,35 @@ verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, plus 
 `peat-node` is the **sidecar node** for the Peat ecosystem. It runs alongside a co-located application and exposes `peat-protocol` as a gRPC API (Connect + gRPC + gRPC-Web on a single port via ConnectRPC) so applications can read/write Peat documents and consume change events without embedding the mesh stack themselves. The repo ships:
 
 - A Rust binary (`src/main.rs`) implementing the sidecar.
-- The wire contract in `proto/sidecar.proto`, compiled via `connectrpc_build` (build.rs) for Rust and via `buf` for the Go SDK.
-- A Go SDK in `sdk/go/` (client, heartbeat, generated proto code) — this is the public surface for Go consumers.
+- The wire contract in `proto/sidecar.proto`, compiled via `connectrpc_build` (build.rs) for the in-tree server.
 - A Helm chart in `chart/peat-node/` and a Zarf manifest for Kubernetes deployment.
-- A cross-cluster functional test (`test/cross-cluster-sync.sh`) plus Go integration tests in `test/go`.
+- A cross-cluster functional test (`test/cross-cluster-sync.sh`) plus in-tree Rust integration tests (`tests/grpc_test.rs`, `tests/node_test.rs`, `tests/sync_test.rs`).
+
+Consumers in other languages talk to the sidecar directly over the Connect-RPC wire — no in-repo SDK. The `examples/compose/` quickstart shows the bash+curl+jq path. For typed clients, generate from `proto/sidecar.proto` in the consumer's own repo (or front it with `peat-gateway` per ADR-043).
 
 ## When this skill applies
 
 - Editing any file under `src/` (sidecar implementation, agent watcher, encryption-at-rest)
-- Editing `proto/sidecar.proto` — **the wire contract**; changes ripple to Rust server code, the Go SDK, and any external consumer
-- Editing `sdk/go/` (Go client, heartbeat, generated code)
+- Editing `proto/sidecar.proto` — **the wire contract**; changes ripple to the Rust server code and any external consumer that generates from it
 - Editing `chart/peat-node/` (Helm chart) or `zarf.yaml` (Zarf packaging)
-- Editing `test/cross-cluster-sync.sh` or `test/go/`
-- Bumping the pinned `peat-mesh` version (currently `=0.9.0-rc.1`)
+- Editing `test/cross-cluster-sync.sh` or the in-tree Rust integration tests
+- Bumping the pinned `peat-mesh` version (currently `=0.9.0-rc.7`)
 
 ## Scope
 
 **In scope:**
 - Sidecar API server (Connect / gRPC / gRPC-Web on single port)
-- Wire-contract proto and the Rust + Go code generated from it
+- Wire-contract proto and the Rust server generated from it
 - Agent watcher (Connect RPC JSON encoding)
 - Encryption at rest (`aes-gcm`)
 - Helm chart and Zarf packaging
-- Functional and integration tests
+- Rust integration tests + cross-cluster functional test
 
 **Out of scope (route elsewhere):**
 - Mesh transport / sync semantics → `peat-mesh/SKILL.md`
 - BLE transport → `peat-btle/SKILL.md`
 - OCI registry sync → `peat-registry/SKILL.md`
+- Typed-client SDKs in other languages → consumer's repo, or `peat-gateway` for protocol-bridge adapters (ADR-043)
 - Top-level shared types/traits — consider whether the change belongs in `peat/peat-protocol` or `peat/peat-schema`
 - Production cluster operations / GitOps configs that consume this chart — separate ops repos
 
@@ -45,8 +46,8 @@ verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, plus 
 
 1. **Orient.** Read `peat/SKILL.md` (ecosystem) if accessible. Read this file. Read `docs/DESIGN.md` if you're touching architectural surfaces. `git status`, `git log -10`.
 2. **Locate the spec.** Confirm the task has a GitHub issue with Context / Scope / Acceptance / Constraints / Dependencies. If not, stop and ask the user.
-3. **Plan.** Produce a 1–5 step plan. Cross-check against ecosystem hard invariants (transport agnosticism, dependency direction, async runtime is Tokio, no new languages — Go SDK is grandfathered) and the scope guards below. **Proto changes are contract changes**: if you're editing `proto/sidecar.proto`, plan how the Rust server, the Go SDK, and any external consumer will pick up the change.
-4. **Implement.** Branch from `main` per the trunk-based convention. Vertical slices, one concern per commit. For proto changes, regenerate Go bindings (`buf generate` from `sdk/go/`) and commit the generated code in the same PR.
+3. **Plan.** Produce a 1–5 step plan. Cross-check against ecosystem hard invariants (transport agnosticism, dependency direction, async runtime is Tokio, Rust only) and the scope guards below. **Proto changes are contract changes**: if you're editing `proto/sidecar.proto`, plan how the Rust server and any external consumer will pick up the change.
+4. **Implement.** Branch from `main` per the trunk-based convention. Vertical slices, one concern per commit.
 5. **Verify.** Run every command in the verification checklist below. Capture output.
 6. **Hand off.** Open PR against `main` referencing the issue. Single concern per PR — squash-merge applies.
 
@@ -56,10 +57,9 @@ A session in this repo is not done until each of these produces evidence:
 
 - [ ] `cargo fmt --check` exits 0
 - [ ] `cargo clippy -- -D warnings` exits 0
-- [ ] `cargo test` exits 0
-- [ ] If `proto/sidecar.proto` was touched: `cargo build` (re-runs proto compile via build.rs and confirms server code matches the new contract); regenerate the Go SDK (`cd sdk/go && buf generate`) and commit the regenerated `gen/` output in the same PR
-- [ ] If `sdk/go/` was touched: `cd sdk/go && go build ./...` (compile-compatibility check). Note: `sdk/go/` contains no `_test.go` files — it's a thin typed wrapper. Surface-tier coverage of the SDK lives in `test/go/cmd/synctest/`, exercised in CI by the `Sync Test (two-sidecar)` job.
-- [ ] If sync-path code or the chart changed: `./test/cross-cluster-sync.sh` (or the Go integration tests in `test/go/`)
+- [ ] `cargo test` exits 0 (this includes `tests/sync_test.rs`, the two-node in-process CRDT-sync test)
+- [ ] If `proto/sidecar.proto` was touched: `cargo build` (re-runs proto compile via build.rs and confirms server code matches the new contract); external consumers regenerate from the new proto on their side
+- [ ] If sync-path code or the chart changed: `./test/cross-cluster-sync.sh`
 - [ ] If `chart/` or `zarf.yaml` was touched: `helm template chart/peat-node` renders cleanly
 - [ ] If the change bumps `peat-mesh`: full integration suite, not just unit tests
 
@@ -71,20 +71,17 @@ A session in this repo is not done until each of these produces evidence:
 |---|---|
 | "This change is too small to need a test." | If it's worth changing, it's worth one assertion. Add the test. |
 | "I'll fix the clippy warning later." | The CI gate is `-D warnings`. There is no later. |
-| "I'll modify `proto/sidecar.proto` and regenerate the Go SDK in a follow-up." | The proto **is** the contract. Server code, Go SDK, and any consumer must match. Regenerate `sdk/go/gen/` and commit it in the same PR; otherwise downstream consumers break silently. |
-| "I'll add this new endpoint as a Rust-only handler — easier than touching proto." | Proto-first. New endpoints go in `sidecar.proto` first; Rust + Go follow. Consumers can't talk to a Rust-only endpoint. |
+| "I'll add this new endpoint as a Rust-only handler — easier than touching proto." | Proto-first. New endpoints go in `sidecar.proto` first; the Rust server follows. Consumers can't talk to a Rust-only endpoint. |
 | "I'll skip the cross-cluster sync test — `cargo test` passes." | DDIL fleet sync is the product. Cross-cluster test catches network-partition / re-convergence bugs unit tests don't. |
-| "Go SDK is just a client wrapper — I don't need to update it for a small server change." | The SDK is part of the public surface and ships with this repo. Server-side behavior changes that affect call semantics require SDK updates and Go integration test runs. |
-| "I'll bump `peat-mesh` to the latest RC." | The pin (`=0.9.0-rc.1`) is intentional. Bumps need full integration validation and possibly chart/Zarf updates. |
+| "I'll bump `peat-mesh` to the latest RC." | The pin (`=0.9.0-rc.7`) is intentional. Bumps need full integration validation and possibly chart/Zarf updates. |
 | "I'll inline the encryption-at-rest call without zeroization — it's only briefly in memory." | `aes-gcm` material lives in security-sensitive paths. Use the established zeroization patterns; don't introduce un-zeroized handling. |
-| "I'll add a fix in the generated Go code so we don't have to regenerate." | Generated code must stay generated. If `buf generate` doesn't produce the desired output, fix the proto or the buf config — not the generated file. |
+| "I'll add a Go/TS/Python SDK directly to this repo for a quick consumer integration." | No SDKs live in this repo. Typed clients generate from `proto/sidecar.proto` in the consumer's own repo, or front the sidecar with `peat-gateway` per ADR-043. |
 
 ## Scope guards
 
 - Touch only files the issue/user asked you to touch.
 - Do not edit other peat-* repos. Cross-repo work goes in a separate PR in that repo, linked through a tracking issue.
-- Do not hand-edit generated Go code under `sdk/go/gen/` — regenerate via `buf generate`.
-- Do not introduce a new language or runtime. The Go SDK is a grandfathered exception (sidecar consumers are commonly Go); new code goes in Rust.
+- Do not introduce a new language or runtime. peat-node is pure Rust.
 - Do not break wire-contract backwards compatibility silently. Proto changes that affect existing fields/methods require explicit versioning consideration.
 - Do not commit secrets, KMS material, or absolute paths in `chart/`, `zarf.yaml`, or test fixtures.
 - Do not configure git to bypass GPG signing or use `--no-verify` to skip pre-commit hooks.
@@ -99,14 +96,15 @@ Add an entry each time a session produces output that needed correction. One lin
 
 - Ecosystem invariants: `peat/SKILL.md` (sibling repo)
 - Architecture: `docs/DESIGN.md`
+- Configuration reference: `docs/CONFIGURATION.md`
 - Wire contract: `proto/sidecar.proto`
-- Go SDK: `sdk/go/` (with `buf.gen.yaml` and `buf.yaml` driving codegen)
 - Helm chart: `chart/peat-node/`
 - Zarf packaging: `zarf.yaml`
 - Cross-cluster functional test: `test/cross-cluster-sync.sh`
-- Go integration tests: `test/go/`
+- Rust integration tests: `tests/`
+- Compose quickstart: `examples/compose/`
 - Repo: https://github.com/defenseunicorns/peat-node
 
 ---
-*Last updated: 2026-05-05*
+*Last updated: 2026-05-11*
 *Maintained by: Kit Plummer, VP Data and Autonomy, Defense Unicorns*
