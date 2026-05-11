@@ -323,14 +323,21 @@ impl SidecarNode {
                 continue;
             }
             // Resolve via DNS if needed; `lookup_host` handles both "host:port"
-            // and "ip:port" forms.
-            let mut resolved = tokio::net::lookup_host(addr_str.as_str())
+            // and "ip:port" forms. Iterate every resolved address — round-robin
+            // DNS, dual-stack IPv4/IPv6, and Kubernetes headless services all
+            // produce multi-record responses, and dropping all but the first
+            // hides reachable paths from Iroh.
+            let resolved = tokio::net::lookup_host(addr_str.as_str())
                 .await
                 .map_err(|e| anyhow::anyhow!("resolve `{addr_str}`: {e}"))?;
-            let socket = resolved
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no addresses resolved for `{addr_str}`"))?;
-            peer_addr = peer_addr.with_ip_addr(socket);
+            let mut any_added = false;
+            for socket in resolved {
+                peer_addr = peer_addr.with_ip_addr(socket);
+                any_added = true;
+            }
+            if !any_added {
+                return Err(anyhow::anyhow!("no addresses resolved for `{addr_str}`"));
+            }
         }
 
         if has_relay {

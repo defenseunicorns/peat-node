@@ -48,7 +48,11 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
 
-    /// Peer endpoint IDs to connect to on startup.
+    /// Peers to connect to on startup, in `endpoint_id@host:port` form.
+    /// The `@host:port` suffix is required (the n0 public relay is no longer
+    /// used by default, so a bare endpoint ID has no way to locate the peer).
+    /// Multiple peers comma-separated.
+    /// Example: `aa11..@10.0.0.5:51071,bb22..@peer-b.svc:51071`
     #[arg(long, env = "PEAT_NODE_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
 
@@ -125,18 +129,24 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
-    // Initial peers via CLI/env are best-effort and require either a relay
-    // URL or out-of-band knowledge of the peer's direct address — neither of
-    // which the simple `--peer <endpoint_id>` flag carries. For real
-    // bootstrapping use the `ConnectPeer` RPC at runtime with explicit
-    // addresses. Kept here for backwards compatibility — will log an error
-    // explaining the requirement.
-    for peer_id in &args.peer {
-        if peer_id.is_empty() {
+    // Initial peers in `endpoint_id@host:port` form. Multiple `@`-separated
+    // addresses per peer are supported (`id@host1:port,host2:port`).
+    for peer_spec in &args.peer {
+        if peer_spec.is_empty() {
             continue;
         }
-        if let Err(e) = node.connect_peer(peer_id, &[], "").await {
-            error!(peer = peer_id, "failed to connect to peer: {e}");
+        let Some((endpoint_id, addrs)) = peer_spec.split_once('@') else {
+            error!(
+                peer = peer_spec,
+                "ignoring --peer: expected `endpoint_id@host:port` form (the n0 \
+                 public relay is no longer used; a bare endpoint ID has no way \
+                 to locate the peer)"
+            );
+            continue;
+        };
+        let addresses: Vec<String> = addrs.split(',').map(|s| s.to_string()).collect();
+        if let Err(e) = node.connect_peer(endpoint_id, &addresses, "").await {
+            error!(peer = peer_spec, "failed to connect to peer: {e}");
         }
     }
 
