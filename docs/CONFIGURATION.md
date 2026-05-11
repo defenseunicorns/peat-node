@@ -46,8 +46,12 @@ the watcher is not started.
 | `PEAT_NODE_AGENT_TLS_KEY` | `--agent-tls-key` | path | unset | PEM-encoded client private key for mTLS. |
 | `PEAT_NODE_AGENT_TLS_CA` | `--agent-tls-ca` | path | unset | PEM-encoded CA cert for verifying the agent's server certificate. |
 
-Setting any TLS env var without the cert+key pair causes a panic at startup —
-the watcher does not silently fall back to insecure. See `src/watcher.rs`.
+mTLS is engaged only when **both** `PEAT_NODE_AGENT_TLS_CERT` and
+`PEAT_NODE_AGENT_TLS_KEY` are set. Partial configurations — CA-only,
+cert-without-key, or key-without-cert — are silently treated as insecure
+h2c; the unmatched TLS env vars are ignored. If cert + key are both set
+but either PEM is malformed, startup panics. See
+`src/watcher.rs::build_client` ([#37](https://github.com/defenseunicorns/peat-node/issues/37) tracks hardening this to error on partial TLS config).
 
 ## Logging
 
