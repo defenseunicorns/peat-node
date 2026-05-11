@@ -111,6 +111,22 @@ async fn node_status() {
 }
 
 #[tokio::test]
+async fn sync_stats_default_zero_on_fresh_node() {
+    // Fresh single-node, no peers, no sync activity: counters must read
+    // exactly zero. Guards the default behavior against accidental
+    // pre-population, and pins the contract that bytes_sent / bytes_received
+    // come from the sync coordinator (not from synthetic / hardcoded values).
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+
+    let stats = node.sync_stats();
+    assert!(!stats.sync_active);
+    assert_eq!(stats.connected_peers, 0);
+    assert_eq!(stats.bytes_sent, 0);
+    assert_eq!(stats.bytes_received, 0);
+}
+
+#[tokio::test]
 async fn subscribe_receives_changes() {
     let dir = tempfile::tempdir().unwrap();
     let node = test_node(dir.path()).await;
