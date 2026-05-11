@@ -35,7 +35,7 @@ impl Drop for ChildGuard {
     }
 }
 
-async fn spawn_node(
+fn spawn_node(
     bin: &str,
     grpc_port: u16,
     iroh_port: u16,
@@ -55,7 +55,6 @@ async fn spawn_node(
         .env("RUST_LOG", "peat_node=warn,peat_mesh=warn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
         .spawn()
         .expect("spawn peat-node");
     ChildGuard(child)
@@ -88,8 +87,8 @@ async fn two_subprocess_sync_increments_byte_counters() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
-    let _node_a = spawn_node(bin, A_GRPC, A_IROH, "node-a", dir_a.path()).await;
-    let _node_b = spawn_node(bin, B_GRPC, B_IROH, "node-b", dir_b.path()).await;
+    let _node_a = spawn_node(bin, A_GRPC, A_IROH, "node-a", dir_a.path());
+    let _node_b = spawn_node(bin, B_GRPC, B_IROH, "node-b", dir_b.path());
 
     // Static settle, mirroring the previously-working Go synctest's
     // 2-second sleep after process spawn. An aggressive `wait_ready`
