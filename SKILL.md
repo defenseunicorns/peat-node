@@ -58,7 +58,7 @@ A session in this repo is not done until each of these produces evidence:
 - [ ] `cargo clippy -- -D warnings` exits 0
 - [ ] `cargo test` exits 0
 - [ ] If `proto/sidecar.proto` was touched: `cargo build` (re-runs proto compile via build.rs and confirms server code matches the new contract); regenerate the Go SDK (`cd sdk/go && buf generate`) and commit the regenerated `gen/` output in the same PR
-- [ ] If `sdk/go/` was touched: `cd sdk/go && go build ./...` and `go test ./...`
+- [ ] If `sdk/go/` was touched: `cd sdk/go && go build ./...` (compile-compatibility check). Note: `sdk/go/` contains no `_test.go` files — it's a thin typed wrapper. Surface-tier coverage of the SDK lives in `test/go/cmd/synctest/`, exercised in CI by the `Sync Test (two-sidecar)` job.
 - [ ] If sync-path code or the chart changed: `./test/cross-cluster-sync.sh` (or the Go integration tests in `test/go/`)
 - [ ] If `chart/` or `zarf.yaml` was touched: `helm template chart/peat-node` renders cleanly
 - [ ] If the change bumps `peat-mesh`: full integration suite, not just unit tests
