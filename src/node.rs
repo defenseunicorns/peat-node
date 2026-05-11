@@ -29,6 +29,10 @@ pub struct SidecarConfig {
     /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
     /// When set, all document payloads are encrypted before storage and decrypted on read.
     pub encryption_key: Option<String>,
+    /// UDP port to bind the Iroh endpoint on. `None` selects an ephemeral port.
+    /// Pin this for deployments where peers need a stable address (e.g. Docker Compose
+    /// or any case relying on direct peer-to-peer reachability instead of a relay).
+    pub iroh_udp_port: Option<u16>,
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -69,12 +73,23 @@ impl SidecarNode {
         // 1. Open Automerge CRDT store
         let store = Arc::new(AutomergeStore::open(&automerge_dir)?);
 
-        // 2. Build Iroh endpoint with memory lookup (ephemeral port, default relays)
+        // 2. Build Iroh endpoint with memory lookup.
+        //
+        // `presets::N0DisableRelay` configures the endpoint with n0's DNS/pkarr
+        // discovery but `RelayMode::Disabled`. Our subsequent `.address_lookup`
+        // overrides the n0 DNS publisher with the in-memory lookup used for
+        // explicit `ConnectPeer` peering. Net effect: no dependency on n0's
+        // public relay pool. Operators that need NAT traversal for production
+        // can opt back into a relay by passing a relay URL via the
+        // `ConnectPeer` RPC.
         let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
-        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-            .address_lookup(memory_lookup.clone())
-            .bind()
-            .await?;
+        let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
+            .address_lookup(memory_lookup.clone());
+        if let Some(port) = config.iroh_udp_port {
+            let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
+            builder = builder.bind_addr(bind_addr)?;
+        }
+        let endpoint = builder.bind().await?;
 
         info!(
             node_id = %config.node_id,
@@ -277,28 +292,62 @@ impl SidecarNode {
 
     // --- Peer Management ---
 
-    pub async fn connect_peer(&self, endpoint_id_str: &str) -> anyhow::Result<()> {
+    /// Connect to a peer by endpoint ID, using direct addresses and/or a relay URL.
+    ///
+    /// At least one of `addresses` or `relay_url` must be non-empty — without
+    /// any reachability hints there is no way to locate the peer. `addresses`
+    /// accepts `host:port` (the host is resolved via DNS) or `ip:port`.
+    pub async fn connect_peer(
+        &self,
+        endpoint_id_str: &str,
+        addresses: &[String],
+        relay_url: &str,
+    ) -> anyhow::Result<()> {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
 
-        // Wait for relay URL to be available, then register peer for discovery
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let our_addr = self.blob_store.endpoint().addr();
-            if our_addr.relay_urls().next().is_some() {
-                let mut peer_addr = iroh::EndpointAddr::new(peer_id);
-                for relay_url in our_addr.relay_urls() {
-                    peer_addr = peer_addr.with_relay_url(relay_url.clone());
-                }
-                self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(anyhow::anyhow!("no relay URL available after 10s"));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let has_addresses = addresses.iter().any(|a| !a.is_empty());
+        let has_relay = !relay_url.is_empty();
+        if !has_addresses && !has_relay {
+            return Err(anyhow::anyhow!(
+                "ConnectPeer requires at least one of `addresses` or `relay_url` — \
+                 the n0 public relay is no longer used by default"
+            ));
         }
+
+        let mut peer_addr = iroh::EndpointAddr::new(peer_id);
+
+        for addr_str in addresses {
+            if addr_str.is_empty() {
+                continue;
+            }
+            // Resolve via DNS if needed; `lookup_host` handles both "host:port"
+            // and "ip:port" forms. Iterate every resolved address — round-robin
+            // DNS, dual-stack IPv4/IPv6, and Kubernetes headless services all
+            // produce multi-record responses, and dropping all but the first
+            // hides reachable paths from Iroh.
+            let resolved = tokio::net::lookup_host(addr_str.as_str())
+                .await
+                .map_err(|e| anyhow::anyhow!("resolve `{addr_str}`: {e}"))?;
+            let mut any_added = false;
+            for socket in resolved {
+                peer_addr = peer_addr.with_ip_addr(socket);
+                any_added = true;
+            }
+            if !any_added {
+                return Err(anyhow::anyhow!("no addresses resolved for `{addr_str}`"));
+            }
+        }
+
+        if has_relay {
+            let relay: iroh::RelayUrl = relay_url
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid relay URL `{relay_url}`: {e}"))?;
+            peer_addr = peer_addr.with_relay_url(relay);
+        }
+
+        self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
 
         // Connect and authenticate via formation key handshake
         let connection = self

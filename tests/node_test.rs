@@ -17,6 +17,7 @@ async fn test_node_with_encryption(
         data_dir: dir.to_path_buf(),
         peers: vec![],
         encryption_key,
+        iroh_udp_port: None,
     })
     .await
     .expect("failed to create node")

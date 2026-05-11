@@ -72,9 +72,16 @@ func (c *Client) Status(ctx context.Context) (*sidecarv1.GetStatusResponse, erro
 // --- Peer Management ---
 
 // ConnectPeer establishes an authenticated connection to a mesh peer.
-func (c *Client) ConnectPeer(ctx context.Context, endpointID string) error {
+//
+// At least one of addresses or relayURL must be non-empty — the n0 public
+// relay is no longer used by default. `addresses` accepts "host:port" (DNS
+// is resolved on the server side) or "ip:port"; `relayURL` is optional and
+// passed through when explicit NAT-traversal via a relay is required.
+func (c *Client) ConnectPeer(ctx context.Context, endpointID string, addresses []string, relayURL string) error {
 	_, err := c.sidecar.ConnectPeer(ctx, connect.NewRequest(&sidecarv1.ConnectPeerRequest{
 		EndpointId: endpointID,
+		Addresses:  addresses,
+		RelayUrl:   relayURL,
 	}))
 	return err
 }

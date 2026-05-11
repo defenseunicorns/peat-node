@@ -23,6 +23,7 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
             data_dir: dir.keep(),
             peers: vec![],
             encryption_key,
+            iroh_udp_port: None,
         })
         .await
         .unwrap(),
@@ -258,4 +259,37 @@ async fn connect_protocol_peer_and_sync_ops() {
     let stats = call(&client, &base, "GetSyncStats", serde_json::json!({})).await;
     // syncActive=false is omitted by proto3 JSON (default value)
     assert!(stats.get("syncActive").is_none() || stats["syncActive"] == false);
+}
+
+#[tokio::test]
+async fn connect_peer_rejects_empty_addressing() {
+    // ConnectPeer with neither `addresses` nor `relay_url` must error
+    // explicitly — the previous behavior (silent 10-second wait for a
+    // relay URL, then opaque 500) was the original peer-reported bug.
+    let (client, base) = boot_server(50084, None).await;
+
+    // A real-enough endpoint id (32 bytes hex). We never actually try to
+    // connect; the empty-addressing check fails before the handshake.
+    let dummy_endpoint_id = "0".repeat(64);
+
+    let url = format!("{base}/peat.sidecar.v1.PeatSidecar/ConnectPeer");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({ "endpointId": dummy_endpoint_id }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        !resp.status().is_success(),
+        "expected ConnectPeer with no addresses + no relay_url to fail, got HTTP {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let message = body["message"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        message.contains("addresses") || message.contains("relay"),
+        "error message should mention addresses or relay_url, got: {body}"
+    );
 }

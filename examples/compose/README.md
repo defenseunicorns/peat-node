@@ -6,7 +6,7 @@ Runnable two-node mesh demonstrating CRDT sync between two peat-node sidecars on
 
 - Docker (or Docker Desktop) with `docker compose`
 - `curl` and `jq` on the host
-- Outbound HTTPS from containers (the nodes use Iroh's public n0 relay for NAT traversal)
+- No public-internet egress required. The two containers peer over direct UDP on the compose bridge network; Iroh's QUIC port is pinned per node and Docker's embedded DNS resolves `peat-node-a` / `peat-node-b` between them. (Works on macOS Docker Desktop with corporate proxies / air-gapped networks.)
 
 ## Run
 
@@ -15,6 +15,8 @@ docker compose up -d
 ./bootstrap.sh    # peer node-a <-> node-b
 ./demo.sh         # write on node-a, read on node-b, verify sync
 ```
+
+> If you're running this **before the next peat-node release ships**, the published `ghcr.io/defenseunicorns/peat-node:v0.1.0` image predates the relay-off-by-default change and will fail `ConnectPeer`. Edit `docker-compose.yml`, comment out the `image:` line, uncomment the `build:` block, and run `docker compose up -d --build` to build from the repo root. After the next release lands, the pinned image will Just Work.
 
 Expected output from `demo.sh`:
 

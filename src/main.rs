@@ -48,13 +48,28 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
 
-    /// Peer endpoint IDs to connect to on startup.
+    /// Peers to connect to on startup, in `endpoint_id@host:port` form.
+    /// The `@host:port` suffix is required (the n0 public relay is no longer
+    /// used by default, so a bare endpoint ID has no way to locate the peer).
+    /// One peer per entry; pass `--peer` repeatedly or comma-separate in
+    /// `PEAT_NODE_PEERS` to register multiple peers. For more than one
+    /// reachable address per peer, use the `ConnectPeer` RPC at runtime —
+    /// the comma in this flag separates peers, not addresses within a peer.
+    /// Example: `aa11..@10.0.0.5:51071,bb22..@peer-b.svc:51071`
     #[arg(long, env = "PEAT_NODE_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
 
     /// Auto-start sync on boot.
     #[arg(long, env = "PEAT_NODE_AUTO_SYNC", default_value = "true")]
     auto_sync: bool,
+
+    /// Bind the Iroh QUIC endpoint to a specific UDP port. Default: ephemeral.
+    /// Pin this for deployments where peers reach this node via a stable
+    /// host:port (e.g. Docker Compose, fleet-managed sidecars). The n0 public
+    /// relay is disabled by default — peers must be reachable directly or via
+    /// an explicit `--relay-url` passed to `ConnectPeer`.
+    #[arg(long, env = "PEAT_NODE_IROH_UDP_PORT")]
+    iroh_udp_port: Option<u16>,
 
     // --- Agent Watcher ---
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
@@ -112,17 +127,31 @@ async fn main() -> anyhow::Result<()> {
         data_dir: args.data_dir,
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
+        iroh_udp_port: args.iroh_udp_port,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
-    // Connect to initial peers
-    for peer_id in &args.peer {
-        if peer_id.is_empty() {
+    // Initial peers in `endpoint_id@host:port` form, one per entry. The
+    // outer `,` in `PEAT_NODE_PEERS` separates peers (handled by clap's
+    // `value_delimiter`); multiple addresses for one peer go through the
+    // `ConnectPeer` RPC at runtime.
+    for peer_spec in &args.peer {
+        if peer_spec.is_empty() {
             continue;
         }
-        if let Err(e) = node.connect_peer(peer_id).await {
-            error!(peer = peer_id, "failed to connect to peer: {e}");
+        let Some((endpoint_id, addr)) = peer_spec.split_once('@') else {
+            error!(
+                peer = peer_spec,
+                "ignoring --peer: expected `endpoint_id@host:port` form (the n0 \
+                 public relay is no longer used; a bare endpoint ID has no way \
+                 to locate the peer)"
+            );
+            continue;
+        };
+        let addresses = vec![addr.to_string()];
+        if let Err(e) = node.connect_peer(endpoint_id, &addresses, "").await {
+            error!(peer = peer_spec, "failed to connect to peer: {e}");
         }
     }
 

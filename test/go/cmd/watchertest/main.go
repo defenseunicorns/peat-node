@@ -69,8 +69,12 @@ func run() error {
 	// Give agent time to start
 	time.Sleep(3 * time.Second)
 
+	// Pin Iroh UDP ports for direct peering (no relay).
+	const nodeAIrohPort = 51261
+	const nodeBIrohPort = 51262
+
 	// 2. Start peat-node node-a (watches the agent)
-	fmt.Println("--- Starting peat-node node-a on :50061 (watching agent) ---")
+	fmt.Println("--- Starting peat-node node-a on :50061 (watching agent, iroh udp :51261) ---")
 	nodeA, err := startProcess(ctx, sidecarBin, []string{
 		"--listen", "tcp://127.0.0.1:50061",
 		"--data-dir", filepath.Join(tmpDir, "node-a"),
@@ -78,6 +82,7 @@ func run() error {
 		"--agent-addr", "http://127.0.0.1:9080",
 		"--agent-poll-interval", "3",
 		"--auto-sync",
+		"--iroh-udp-port", fmt.Sprintf("%d", nodeAIrohPort),
 	}, []string{"RUST_LOG=peat_node=info,peat_mesh=info"})
 	if err != nil {
 		return fmt.Errorf("start node-a: %w", err)
@@ -85,12 +90,13 @@ func run() error {
 	defer nodeA.stop()
 
 	// 3. Start peat-node node-b (peer, no agent)
-	fmt.Println("--- Starting peat-node node-b on :50062 (peer only) ---")
+	fmt.Println("--- Starting peat-node node-b on :50062 (peer only, iroh udp :51262) ---")
 	nodeB, err := startProcess(ctx, sidecarBin, []string{
 		"--listen", "tcp://127.0.0.1:50062",
 		"--data-dir", filepath.Join(tmpDir, "node-b"),
 		"--node-id", "node-b",
 		"--auto-sync",
+		"--iroh-udp-port", fmt.Sprintf("%d", nodeBIrohPort),
 	}, []string{"RUST_LOG=peat_node=info,peat_mesh=info"})
 	if err != nil {
 		return fmt.Errorf("start node-b: %w", err)
@@ -152,7 +158,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("node-a status: %w", err)
 	}
-	err = clientB.ConnectPeer(ctx, statusA.EndpointAddr)
+	nodeAAddr := fmt.Sprintf("127.0.0.1:%d", nodeAIrohPort)
+	err = clientB.ConnectPeer(ctx, statusA.EndpointAddr, []string{nodeAAddr}, "")
 	if err != nil {
 		return fmt.Errorf("connect peer: %w", err)
 	}

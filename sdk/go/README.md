@@ -81,10 +81,26 @@ for change := range changes {
 | Method | Description |
 |--------|-------------|
 | `Status(ctx)` | Node ID, endpoint, sync state |
-| `ConnectPeer(ctx, endpointID)` | Connect to a mesh peer |
+| `ConnectPeer(ctx, endpointID, addresses, relayURL)` | Connect to a mesh peer (see migration note) |
 | `ListPeers(ctx)` | Connected peers |
-| `StartSync(ctx)` / `StopSync(ctx)` | Sync lifecycle |
+| `StartSync(ctx) / StopSync(ctx)` | Sync lifecycle |
 
 ## Example
 
 See [`example/agent-integration/`](example/agent-integration/) for a runnable demo showing heartbeats, fleet queries, and command subscriptions.
+
+## Migration: `ConnectPeer` signature change (v0.2.0)
+
+`Client.ConnectPeer` previously took just `(ctx, endpointID)`. It now requires direct reachability information:
+
+```go
+// Before (v0.1.x):
+client.ConnectPeer(ctx, endpointID)
+
+// After (v0.2.0+):
+client.ConnectPeer(ctx, endpointID, []string{"peer.svc:51071"}, "")
+// or, with an explicit relay:
+client.ConnectPeer(ctx, endpointID, nil, "https://relay.example/")
+```
+
+At least one of `addresses` or `relayURL` must be non-empty. The n0 public relay is no longer used by default — pass an explicit `relayURL` if you need relay-assisted NAT traversal, or supply `host:port` addresses (DNS resolved server-side) for direct peering. See [`docs/CONFIGURATION.md`](../../docs/CONFIGURATION.md#peering) on the sidecar for the matching `PEAT_NODE_IROH_UDP_PORT` flag.

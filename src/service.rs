@@ -66,8 +66,9 @@ impl pb::PeatSidecar for PeatSidecarService {
         ctx: Context,
         request: OwnedView<pb::ConnectPeerRequestView<'static>>,
     ) -> Result<(pb::ConnectPeerResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
         self.node
-            .connect_peer(request.endpoint_id)
+            .connect_peer(&req.endpoint_id, &req.addresses, &req.relay_url)
             .await
             .map_err(internal)?;
         Ok((pb::ConnectPeerResponse::default(), ctx))
