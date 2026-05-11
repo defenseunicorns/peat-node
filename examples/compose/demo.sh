@@ -8,10 +8,22 @@ NODE_A_URL="${NODE_A_URL:-http://localhost:50061}"
 NODE_B_URL="${NODE_B_URL:-http://localhost:50062}"
 
 call() {
-  curl --silent --show-error --fail \
-    -X POST "${1}/peat.sidecar.v1.PeatSidecar/${2}" \
+  local url="${1}/peat.sidecar.v1.PeatSidecar/${2}"
+  local body
+  local code
+  body=$(curl --silent --show-error \
+    -w '\n%{http_code}' \
+    -X POST "$url" \
     -H 'Content-Type: application/json' \
-    -d "${3}"
+    -d "${3}")
+  code=$(printf '%s' "$body" | tail -n1)
+  body=$(printf '%s' "$body" | sed '$d')
+  if [ "$code" != "200" ]; then
+    echo "ERROR: $url returned HTTP $code" >&2
+    echo "  body: $body" >&2
+    return 1
+  fi
+  printf '%s' "$body"
 }
 
 COLLECTION=hello

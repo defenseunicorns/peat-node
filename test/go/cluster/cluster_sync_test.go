@@ -28,6 +28,10 @@ func requiredEnv(t *testing.T, key string) string {
 func TestCrossClusterSync(t *testing.T) {
 	alphaAddr := requiredEnv(t, "ALPHA_PEAT_ADDR")
 	bravoAddr := requiredEnv(t, "BRAVO_PEAT_ADDR")
+	// Direct Iroh UDP address (host:port) for the alpha sidecar — required
+	// now that the public relay is off by default. Operators deploying the
+	// cluster pair must pin alpha's --iroh-udp-port and expose it.
+	alphaIrohAddr := requiredEnv(t, "ALPHA_PEAT_IROH_ADDR")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -58,9 +62,9 @@ func TestCrossClusterSync(t *testing.T) {
 		t.Logf("bravo: node=%s endpoint=%s sync=%v peers=%d",
 			statusB.NodeId, statusB.EndpointAddr, statusB.SyncActive, statusB.ConnectedPeers)
 
-		// Connect bravo to alpha as a peer
-		t.Logf("connecting bravo → alpha (endpoint %s)", statusA.EndpointAddr)
-		if err := bravo.ConnectPeer(ctx, statusA.EndpointAddr); err != nil {
+		// Connect bravo to alpha as a peer via direct UDP address.
+		t.Logf("connecting bravo → alpha (endpoint %s via %s)", statusA.EndpointAddr, alphaIrohAddr)
+		if err := bravo.ConnectPeer(ctx, statusA.EndpointAddr, []string{alphaIrohAddr}, ""); err != nil {
 			t.Fatalf("connect peer: %v", err)
 		}
 

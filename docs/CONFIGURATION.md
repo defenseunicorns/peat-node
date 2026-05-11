@@ -23,8 +23,15 @@ if you add or rename a flag, update this file in the same PR.
 
 | Env var | Flag | Type | Default | Description |
 |---|---|---|---|---|
-| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Iroh endpoint IDs to attempt to connect to on startup. Same effect as calling `ConnectPeer` after launch for each entry. |
+| `PEAT_NODE_IROH_UDP_PORT` | `--iroh-udp-port` | u16 | unset (ephemeral) | Bind the Iroh QUIC endpoint to a specific UDP port. **Pin this** for any deployment where peers reach this node via a stable host:port — Docker Compose, fleet-managed sidecars, anywhere the n0 public relay isn't (and shouldn't be) in the picture. |
+| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Iroh endpoint IDs to attempt to connect to on startup. **Requires either reachable direct addresses or a relay URL** at the consumer-supplied level — `--peer <id>` alone has no way to locate the peer and will log an error. For real bootstrapping use `ConnectPeer` at runtime with explicit `addresses`. |
 | `PEAT_NODE_AUTO_SYNC` | `--auto-sync` | bool | `true` | If true, `StartSync` is invoked once startup completes. Set `false` to require an explicit `StartSync` RPC. |
+
+### Relay
+
+The n0 public relay pool (`*.relay.iroh.network`) is **disabled by default**. Two endpoints peer either via direct UDP addresses (passed through `ConnectPeer.addresses`) or via an explicit relay URL the caller provides through `ConnectPeer.relay_url`. There is no implicit public-internet dependency.
+
+Production deployments that need relay-assisted NAT traversal can run their own relay (or use a known one) and pass its URL on each `ConnectPeer` call. A future env var may pin a default relay URL — track [#41](https://github.com/defenseunicorns/peat-node/issues/41) for the design.
 
 ## Encryption at rest
 

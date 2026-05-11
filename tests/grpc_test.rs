@@ -23,6 +23,7 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
             data_dir: dir.keep(),
             peers: vec![],
             encryption_key,
+            iroh_udp_port: None,
         })
         .await
         .unwrap(),

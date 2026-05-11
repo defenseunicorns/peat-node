@@ -1,4 +1,6 @@
-// Tier 1 integration test: two peat-node nodes, CRDT sync via Iroh relay.
+// Tier 1 integration test: two peat-node nodes, CRDT sync via direct
+// Iroh QUIC (no relay). Each node pins its Iroh UDP port; the second
+// node peers to the first via 127.0.0.1:<port> through ConnectPeer.addresses.
 //
 // 1. Starts two sidecar processes (node-a on :50061, node-b on :50062)
 // 2. Exchanges endpoint IDs and connects them as peers
@@ -58,12 +60,18 @@ func run() error {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// Pin Iroh UDP ports so the second node can reach the first directly,
+	// without depending on the n0 public relay.
+	const nodeAIrohPort = 51161
+	const nodeBIrohPort = 51162
+
 	// Start node A
-	fmt.Println("--- Starting node-a on :50061 ---")
+	fmt.Println("--- Starting node-a on :50061 (iroh udp :51161) ---")
 	nodeA, err := startSidecar(ctx, bin, sidecarOpts{
-		port:    50061,
-		nodeID:  "node-a",
-		dataDir: filepath.Join(tmpDir, "node-a"),
+		port:        50061,
+		nodeID:      "node-a",
+		dataDir:     filepath.Join(tmpDir, "node-a"),
+		irohUDPPort: nodeAIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("start node-a: %w", err)
@@ -71,11 +79,12 @@ func run() error {
 	defer nodeA.stop()
 
 	// Start node B
-	fmt.Println("--- Starting node-b on :50062 ---")
+	fmt.Println("--- Starting node-b on :50062 (iroh udp :51162) ---")
 	nodeB, err := startSidecar(ctx, bin, sidecarOpts{
-		port:    50062,
-		nodeID:  "node-b",
-		dataDir: filepath.Join(tmpDir, "node-b"),
+		port:        50062,
+		nodeID:      "node-b",
+		dataDir:     filepath.Join(tmpDir, "node-b"),
+		irohUDPPort: nodeBIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("start node-b: %w", err)
@@ -108,13 +117,14 @@ func run() error {
 	}
 	fmt.Printf("PASS: node-b endpoint=%s\n", statusB.EndpointAddr)
 
-	// 2. Connect node-b to node-a as a peer
-	fmt.Println("--- Connecting peers ---")
-	err = clientB.ConnectPeer(ctx, statusA.EndpointAddr)
+	// 2. Connect node-b to node-a as a peer via direct address.
+	fmt.Println("--- Connecting peers (direct UDP, no relay) ---")
+	nodeAAddr := fmt.Sprintf("127.0.0.1:%d", nodeAIrohPort)
+	err = clientB.ConnectPeer(ctx, statusA.EndpointAddr, []string{nodeAAddr}, "")
 	if err != nil {
 		return fmt.Errorf("connect peer: %w", err)
 	}
-	fmt.Println("PASS: node-b connected to node-a")
+	fmt.Printf("PASS: node-b connected to node-a via %s\n", nodeAAddr)
 
 	// Give Iroh a moment to establish the connection
 	time.Sleep(2 * time.Second)
@@ -246,9 +256,10 @@ func run() error {
 }
 
 type sidecarOpts struct {
-	port    int
-	nodeID  string
-	dataDir string
+	port        int
+	nodeID      string
+	dataDir     string
+	irohUDPPort int
 }
 
 type sidecarProc struct {
@@ -260,12 +271,17 @@ func startSidecar(ctx context.Context, bin string, opts sidecarOpts) (*sidecarPr
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, bin,
+	args := []string{
 		"--listen", fmt.Sprintf("tcp://127.0.0.1:%d", opts.port),
 		"--data-dir", opts.dataDir,
 		"--node-id", opts.nodeID,
 		"--auto-sync",
-	)
+	}
+	if opts.irohUDPPort != 0 {
+		args = append(args, "--iroh-udp-port", fmt.Sprintf("%d", opts.irohUDPPort))
+	}
+
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = append(os.Environ(), "RUST_LOG=peat_node=info,peat_mesh=info")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

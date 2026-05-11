@@ -7,12 +7,18 @@
 #   docker compose down -v
 #
 # Both nodes share the same app_id + shared_key, so they're in the same
-# formation. They use Iroh's public n0 relay for NAT traversal — the
-# containers need outbound HTTPS for that.
+# formation. They peer over direct UDP between containers on the compose
+# bridge network — **no public internet required**. Each node pins its
+# Iroh QUIC UDP port; bootstrap.sh tells node-b to reach node-a at
+# `peat-node-a:51071` (Docker's embedded DNS resolves the service name).
 
 services:
   peat-node-a:
+    # Latest published release. For testing changes ahead of a release, comment
+    # this out and uncomment the `build:` block to build from the repo root.
     image: ghcr.io/defenseunicorns/peat-node:v0.1.0
+    # build:
+    #   context: ../..
     container_name: peat-node-a
     environment:
       # Bind to all interfaces so the host port mapping works.
@@ -24,6 +30,9 @@ services:
       # own for any non-demo use: `head -c 32 /dev/urandom | base64`
       PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       PEAT_NODE_AUTO_SYNC: "true"
+      # Pin Iroh's UDP port so node-b can reach us directly. n0 public
+      # relay is off by default in the binary.
+      PEAT_NODE_IROH_UDP_PORT: "51071"
       RUST_LOG: peat_node=info,peat_mesh=warn
     ports:
       - "50061:50051"
@@ -32,6 +41,8 @@ services:
 
   peat-node-b:
     image: ghcr.io/defenseunicorns/peat-node:v0.1.0
+    # build:
+    #   context: ../..
     container_name: peat-node-b
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
@@ -40,6 +51,7 @@ services:
       PEAT_NODE_APP_ID: compose-demo
       PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       PEAT_NODE_AUTO_SYNC: "true"
+      PEAT_NODE_IROH_UDP_PORT: "51072"
       RUST_LOG: peat_node=info,peat_mesh=warn
     ports:
       - "50062:50051"

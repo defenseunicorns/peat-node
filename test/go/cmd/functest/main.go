@@ -112,6 +112,8 @@ func run() error {
 
 	// ── Phase 3: Encryption at Rest ──────────────────────────────────
 	fmt.Println("\n═══ Phase 3: Encryption at Rest ═══")
+	const phase3EncIrohPort = 51173
+	const phase3PlainIrohPort = 51174
 	nodeEnc, clientEnc, err := startAndConnect(ctx, bin, nodeOpts{
 		listen:        "tcp://127.0.0.1:50073",
 		nodeID:        "node-enc",
@@ -119,6 +121,7 @@ func run() error {
 		appID:         "functest-alpha",
 		sharedKey:     sharedKeyAlpha,
 		encryptionKey: encryptionKey,
+		irohUDPPort:   phase3EncIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase3 start enc: %w", err)
@@ -126,23 +129,25 @@ func run() error {
 	defer nodeEnc.stop()
 
 	nodePlain, clientPlain, err := startAndConnect(ctx, bin, nodeOpts{
-		listen:    "tcp://127.0.0.1:50074",
-		nodeID:    "node-plain",
-		dataDir:   filepath.Join(tmpDir, "phase3-plain"),
-		appID:     "functest-alpha",
-		sharedKey: sharedKeyAlpha,
+		listen:      "tcp://127.0.0.1:50074",
+		nodeID:      "node-plain",
+		dataDir:     filepath.Join(tmpDir, "phase3-plain"),
+		appID:       "functest-alpha",
+		sharedKey:   sharedKeyAlpha,
+		irohUDPPort: phase3PlainIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase3 start plain: %w", err)
 	}
 	defer nodePlain.stop()
 
-	// Peer and sync them
+	// Peer and sync them via direct UDP addressing.
 	statusEnc, err := clientEnc.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("phase3 status enc: %w", err)
 	}
-	if err := clientPlain.ConnectPeer(ctx, statusEnc.EndpointAddr); err != nil {
+	encAddr := fmt.Sprintf("127.0.0.1:%d", phase3EncIrohPort)
+	if err := clientPlain.ConnectPeer(ctx, statusEnc.EndpointAddr, []string{encAddr}, ""); err != nil {
 		return fmt.Errorf("phase3 connect peer: %w", err)
 	}
 	time.Sleep(2 * time.Second)
@@ -165,12 +170,15 @@ func run() error {
 
 	// ── Phase 4: Peer Sync ───────────────────────────────────────────
 	fmt.Println("\n═══ Phase 4: Peer Sync ═══")
+	const phase4SAIrohPort = 51170
+	const phase4SBIrohPort = 51171
 	nodeSA, clientSA, err := startAndConnect(ctx, bin, nodeOpts{
-		listen:    "tcp://127.0.0.1:50070",
-		nodeID:    "node-sa",
-		dataDir:   filepath.Join(tmpDir, "phase4-sa"),
-		appID:     "functest-alpha",
-		sharedKey: sharedKeyAlpha,
+		listen:      "tcp://127.0.0.1:50070",
+		nodeID:      "node-sa",
+		dataDir:     filepath.Join(tmpDir, "phase4-sa"),
+		appID:       "functest-alpha",
+		sharedKey:   sharedKeyAlpha,
+		irohUDPPort: phase4SAIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase4 start sa: %w", err)
@@ -178,19 +186,21 @@ func run() error {
 	defer nodeSA.stop()
 
 	nodeSB, clientSB, err := startAndConnect(ctx, bin, nodeOpts{
-		listen:    "tcp://127.0.0.1:50071",
-		nodeID:    "node-sb",
-		dataDir:   filepath.Join(tmpDir, "phase4-sb"),
-		appID:     "functest-alpha",
-		sharedKey: sharedKeyAlpha,
+		listen:      "tcp://127.0.0.1:50071",
+		nodeID:      "node-sb",
+		dataDir:     filepath.Join(tmpDir, "phase4-sb"),
+		appID:       "functest-alpha",
+		sharedKey:   sharedKeyAlpha,
+		irohUDPPort: phase4SBIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase4 start sb: %w", err)
 	}
 	defer nodeSB.stop()
 
+	saAddr := fmt.Sprintf("127.0.0.1:%d", phase4SAIrohPort)
 	phase4 := []section{
-		{"peer/connect", func(ctx context.Context) error { return testPeerConnect(ctx, clientSA, clientSB) }},
+		{"peer/connect", func(ctx context.Context) error { return testPeerConnect(ctx, clientSA, clientSB, saAddr) }},
 		{"sync/a-to-b", func(ctx context.Context) error { return testSyncAtoB(ctx, clientSA, clientSB) }},
 		{"sync/b-to-a", func(ctx context.Context) error { return testSyncBtoA(ctx, clientSA, clientSB) }},
 		{"sync/stats", func(ctx context.Context) error { return testSyncStats(ctx, clientSA) }},
@@ -206,12 +216,15 @@ func run() error {
 
 	// ── Phase 5: Formation Isolation ─────────────────────────────────
 	fmt.Println("\n═══ Phase 5: Formation Isolation ═══")
+	const phase5FAIrohPort = 51175
+	const phase5FCIrohPort = 51176
 	nodeFA, clientFA, err := startAndConnect(ctx, bin, nodeOpts{
-		listen:    "tcp://127.0.0.1:50070",
-		nodeID:    "node-fa",
-		dataDir:   filepath.Join(tmpDir, "phase5-fa"),
-		appID:     "functest-alpha",
-		sharedKey: sharedKeyAlpha,
+		listen:      "tcp://127.0.0.1:50070",
+		nodeID:      "node-fa",
+		dataDir:     filepath.Join(tmpDir, "phase5-fa"),
+		appID:       "functest-alpha",
+		sharedKey:   sharedKeyAlpha,
+		irohUDPPort: phase5FAIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase5 start fa: %w", err)
@@ -219,20 +232,22 @@ func run() error {
 	defer nodeFA.stop()
 
 	nodeFC, clientFC, err := startAndConnect(ctx, bin, nodeOpts{
-		listen:    "tcp://127.0.0.1:50072",
-		nodeID:    "node-fc",
-		dataDir:   filepath.Join(tmpDir, "phase5-fc"),
-		appID:     "functest-bravo",
-		sharedKey: sharedKeyBravo,
+		listen:      "tcp://127.0.0.1:50072",
+		nodeID:      "node-fc",
+		dataDir:     filepath.Join(tmpDir, "phase5-fc"),
+		appID:       "functest-bravo",
+		sharedKey:   sharedKeyBravo,
+		irohUDPPort: phase5FCIrohPort,
 	})
 	if err != nil {
 		return fmt.Errorf("phase5 start fc: %w", err)
 	}
 	defer nodeFC.stop()
 
+	faAddr := fmt.Sprintf("127.0.0.1:%d", phase5FAIrohPort)
 	phase5 := []section{
 		{"formation/isolation", func(ctx context.Context) error {
-			return testFormationIsolation(ctx, clientFA, clientFC)
+			return testFormationIsolation(ctx, clientFA, clientFC, faAddr)
 		}},
 	}
 	if err := runSections(ctx, phase5); err != nil {
@@ -737,12 +752,12 @@ func testEncryptAtRest(ctx context.Context, encClient, plainClient *peat.Client)
 	return nil
 }
 
-func testPeerConnect(ctx context.Context, clientA, clientB *peat.Client) error {
+func testPeerConnect(ctx context.Context, clientA, clientB *peat.Client, aAddr string) error {
 	statusA, err := clientA.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("status a: %w", err)
 	}
-	if err := clientB.ConnectPeer(ctx, statusA.EndpointAddr); err != nil {
+	if err := clientB.ConnectPeer(ctx, statusA.EndpointAddr, []string{aAddr}, ""); err != nil {
 		return fmt.Errorf("connect peer: %w", err)
 	}
 	time.Sleep(2 * time.Second)
@@ -899,14 +914,14 @@ func testPeerDisconnect(ctx context.Context, clientA, clientB *peat.Client) erro
 	return nil
 }
 
-func testFormationIsolation(ctx context.Context, clientA, clientC *peat.Client) error {
+func testFormationIsolation(ctx context.Context, clientA, clientC *peat.Client, aAddr string) error {
 	statusA, err := clientA.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("status a: %w", err)
 	}
 
 	// Attempt to connect across formations — may succeed at transport level or fail
-	_ = clientC.ConnectPeer(ctx, statusA.EndpointAddr)
+	_ = clientC.ConnectPeer(ctx, statusA.EndpointAddr, []string{aAddr}, "")
 	time.Sleep(2 * time.Second)
 
 	_ = clientC.StartSync(ctx)
@@ -957,6 +972,7 @@ type nodeOpts struct {
 	appID         string
 	sharedKey     string
 	encryptionKey string
+	irohUDPPort   int
 }
 
 type nodeProc struct {
@@ -981,6 +997,9 @@ func startNode(ctx context.Context, bin string, opts nodeOpts) (*nodeProc, error
 	}
 	if opts.encryptionKey != "" {
 		args = append(args, "--encryption-key", opts.encryptionKey)
+	}
+	if opts.irohUDPPort != 0 {
+		args = append(args, "--iroh-udp-port", fmt.Sprintf("%d", opts.irohUDPPort))
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -1090,7 +1109,7 @@ func floatEq(a, b float64) bool {
 	return math.Abs(a-b) < 0.001
 }
 
-func strPtr(s string) *string  { return &s }
+func strPtr(s string) *string   { return &s }
 func f64Ptr(f float64) *float64 { return &f }
 
 func repeatByte(b byte, n int) []byte {

@@ -56,6 +56,14 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_AUTO_SYNC", default_value = "true")]
     auto_sync: bool,
 
+    /// Bind the Iroh QUIC endpoint to a specific UDP port. Default: ephemeral.
+    /// Pin this for deployments where peers reach this node via a stable
+    /// host:port (e.g. Docker Compose, fleet-managed sidecars). The n0 public
+    /// relay is disabled by default — peers must be reachable directly or via
+    /// an explicit `--relay-url` passed to `ConnectPeer`.
+    #[arg(long, env = "PEAT_NODE_IROH_UDP_PORT")]
+    iroh_udp_port: Option<u16>,
+
     // --- Agent Watcher ---
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
     /// Example: http://localhost:8080
@@ -112,16 +120,22 @@ async fn main() -> anyhow::Result<()> {
         data_dir: args.data_dir,
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
+        iroh_udp_port: args.iroh_udp_port,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
-    // Connect to initial peers
+    // Initial peers via CLI/env are best-effort and require either a relay
+    // URL or out-of-band knowledge of the peer's direct address — neither of
+    // which the simple `--peer <endpoint_id>` flag carries. For real
+    // bootstrapping use the `ConnectPeer` RPC at runtime with explicit
+    // addresses. Kept here for backwards compatibility — will log an error
+    // explaining the requirement.
     for peer_id in &args.peer {
         if peer_id.is_empty() {
             continue;
         }
-        if let Err(e) = node.connect_peer(peer_id).await {
+        if let Err(e) = node.connect_peer(peer_id, &[], "").await {
             error!(peer = peer_id, "failed to connect to peer: {e}");
         }
     }
