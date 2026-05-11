@@ -45,47 +45,81 @@ pub struct WatcherConfig {
 }
 
 /// Build the HTTP client, optionally with mTLS.
-fn build_client(tls: &TlsConfig) -> reqwest::Client {
+///
+/// Returns an explicit error rather than panicking on configuration
+/// problems (partial TLS config, missing files, malformed PEM). The
+/// previous panic-on-bad-PEM behavior masked a worse footgun: a
+/// CA-only or cert-only / key-only configuration would silently fall
+/// through to insecure h2c. That class of partial config is now an
+/// explicit error.
+pub(crate) fn build_client(tls: &TlsConfig) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
 
-    if tls.is_enabled() {
-        // Read client identity (cert + key)
-        let cert_path = tls.cert.as_ref().unwrap();
-        let key_path = tls.key.as_ref().unwrap();
+    let has_cert = tls.cert.is_some();
+    let has_key = tls.key.is_some();
+    let has_ca = tls.ca_cert.is_some();
 
-        let cert_pem = std::fs::read(cert_path)
-            .unwrap_or_else(|e| panic!("failed to read TLS cert {}: {e}", cert_path.display()));
-        let key_pem = std::fs::read(key_path)
-            .unwrap_or_else(|e| panic!("failed to read TLS key {}: {e}", key_path.display()));
-
-        let mut identity_pem = cert_pem;
-        identity_pem.extend_from_slice(&key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem)
-            .expect("failed to parse TLS identity from cert+key PEM");
-        builder = builder.identity(identity);
-
-        // Add custom CA if provided
-        if let Some(ca_path) = &tls.ca_cert {
-            let ca_pem = std::fs::read(ca_path)
-                .unwrap_or_else(|e| panic!("failed to read TLS CA {}: {e}", ca_path.display()));
-            let ca = reqwest::Certificate::from_pem(&ca_pem)
-                .expect("failed to parse CA certificate PEM");
-            builder = builder.add_root_certificate(ca);
+    match (has_cert, has_key, has_ca) {
+        // Coherent: nothing set → insecure h2c.
+        (false, false, false) => {
+            builder = builder.http2_prior_knowledge();
         }
+        // Coherent: cert + key (CA optional) → mTLS.
+        (true, true, _) => {
+            let cert_path = tls.cert.as_ref().unwrap();
+            let key_path = tls.key.as_ref().unwrap();
+            let cert_pem = std::fs::read(cert_path)
+                .map_err(|e| anyhow::anyhow!("read TLS cert {}: {e}", cert_path.display()))?;
+            let key_pem = std::fs::read(key_path)
+                .map_err(|e| anyhow::anyhow!("read TLS key {}: {e}", key_path.display()))?;
+            let mut identity_pem = cert_pem;
+            identity_pem.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&identity_pem)
+                .map_err(|e| anyhow::anyhow!("parse TLS identity from cert+key PEM: {e}"))?;
+            builder = builder.identity(identity);
 
-        info!("agent watcher using mTLS");
-    } else {
-        // h2c: HTTP/2 without TLS (same as agent's insecure mode)
-        builder = builder.http2_prior_knowledge();
+            if let Some(ca_path) = &tls.ca_cert {
+                let ca_pem = std::fs::read(ca_path)
+                    .map_err(|e| anyhow::anyhow!("read TLS CA {}: {e}", ca_path.display()))?;
+                let ca = reqwest::Certificate::from_pem(&ca_pem)
+                    .map_err(|e| anyhow::anyhow!("parse CA cert PEM: {e}"))?;
+                builder = builder.add_root_certificate(ca);
+            }
+
+            info!("agent watcher using mTLS");
+        }
+        // Incoherent: any other combination. Used to silently fall
+        // through to insecure; now an explicit error.
+        _ => {
+            anyhow::bail!(
+                "incoherent watcher TLS configuration — mTLS requires BOTH \
+                 PEAT_NODE_AGENT_TLS_CERT and PEAT_NODE_AGENT_TLS_KEY. \
+                 Setting only one of them, or setting PEAT_NODE_AGENT_TLS_CA \
+                 without the cert+key pair, is an error (cert={has_cert}, \
+                 key={has_key}, ca={has_ca})"
+            );
+        }
     }
 
-    builder.build().expect("failed to create HTTP client")
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("build reqwest client: {e}"))
 }
 
 /// Run the agent watcher loop. Polls the local UDS Remote Agent and writes
 /// state to the sidecar node's CRDT store.
+///
+/// Returns early (logging an error) if the watcher TLS configuration is
+/// incoherent — partial mTLS settings used to silently fall through to
+/// insecure h2c, which was a real footgun. Now caught at startup.
 pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
-    let client = build_client(&config.tls);
+    let client = match build_client(&config.tls) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("agent watcher disabled: {e:#}");
+            return;
+        }
+    };
 
     let mut interval = tokio::time::interval(config.poll_interval);
     let agent_id = config.node_id.clone();
@@ -321,4 +355,119 @@ async fn poll_pulled_packages(
 
     debug!(agent_id, count, "synced pulled packages to mesh");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pem_files_in_tempdir() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    #[test]
+    fn no_tls_is_coherent_and_builds_insecure() {
+        let tls = TlsConfig::default();
+        let client = build_client(&tls).expect("no-TLS config must build");
+        // reqwest::Client doesn't expose its config; the assertion is
+        // simply that the builder succeeded.
+        drop(client);
+    }
+
+    #[test]
+    fn cert_only_is_rejected() {
+        let (_dir, cert_path, _key_path) = pem_files_in_tempdir();
+        let tls = TlsConfig {
+            cert: Some(cert_path),
+            key: None,
+            ca_cert: None,
+        };
+        let err = build_client(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("incoherent watcher TLS configuration"),
+            "expected partial-config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn key_only_is_rejected() {
+        let (_dir, _cert_path, key_path) = pem_files_in_tempdir();
+        let tls = TlsConfig {
+            cert: None,
+            key: Some(key_path),
+            ca_cert: None,
+        };
+        let err = build_client(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("incoherent watcher TLS configuration"),
+            "expected partial-config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ca_only_is_rejected() {
+        let (_dir, cert_path, _key_path) = pem_files_in_tempdir();
+        let tls = TlsConfig {
+            cert: None,
+            key: None,
+            ca_cert: Some(cert_path),
+        };
+        let err = build_client(&tls).unwrap_err().to_string();
+        assert!(
+            err.contains("incoherent watcher TLS configuration"),
+            "expected partial-config error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cert_plus_key_builds_mtls_client() {
+        let (_dir, cert_path, key_path) = pem_files_in_tempdir();
+        let tls = TlsConfig {
+            cert: Some(cert_path),
+            key: Some(key_path),
+            ca_cert: None,
+        };
+        let _client = build_client(&tls).expect("cert+key must build an mTLS client");
+    }
+
+    #[test]
+    fn cert_plus_key_plus_ca_builds_mtls_client() {
+        let (_dir, cert_path, key_path) = pem_files_in_tempdir();
+        // Reuse the same self-signed cert as the CA — for the purposes
+        // of this test we just need a parseable PEM in the CA slot.
+        let ca_path = cert_path.clone();
+        let tls = TlsConfig {
+            cert: Some(cert_path),
+            key: Some(key_path),
+            ca_cert: Some(ca_path),
+        };
+        let _client = build_client(&tls).expect("cert+key+ca must build an mTLS client");
+    }
+
+    #[test]
+    fn malformed_pem_returns_error_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, b"NOT A PEM").unwrap();
+        std::fs::write(&key_path, b"NOT A PEM EITHER").unwrap();
+        let tls = TlsConfig {
+            cert: Some(cert_path),
+            key: Some(key_path),
+            ca_cert: None,
+        };
+        let err = build_client(&tls).unwrap_err();
+        assert!(
+            err.to_string().contains("TLS identity"),
+            "expected identity-parse error, got: {err}"
+        );
+    }
 }
