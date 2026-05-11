@@ -73,8 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-05-08
 
-## [0.1.0] - 2026-05-08
-
 Initial release of `peat-node`, the Peat mesh sidecar that exposes
 `peat-protocol` as a gRPC API for co-located applications. Ships as a
 single Rust binary, a multi-arch container image
