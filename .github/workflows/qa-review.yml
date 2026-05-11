@@ -81,21 +81,18 @@ jobs:
           2. Delta since last review:  git diff ${PREV_SHA}..${SHORT_SHA}
           3. PR metadata:  gh pr view ${PR_NUMBER}
           4. Review the delta against peat-node criteria:
-             - Wire contract: \`proto/sidecar.proto\` IS the contract. Any change to a message,
-               field number, enum value, or RPC MUST regenerate the Go SDK in \`sdk/go/gen/\` in
-               the same PR (\`buf generate\` from \`sdk/go/\`). A proto change without a corresponding
-               regenerated SDK diff is [BLOCKER]. Hand-edits to files under \`sdk/go/gen/\` or
-               \`test/go/gen/\` are [BLOCKER] — fix the proto or buf config, never the generated file.
-               Breaking changes to existing field numbers / wire-incompatible enum reorderings are
-               [BLOCKER] absent explicit versioning.
+             - Wire contract: \`proto/sidecar.proto\` IS the contract. The Rust server is
+               regenerated automatically by \`build.rs\` on every \`cargo build\`. Breaking changes to
+               existing field numbers / wire-incompatible enum reorderings are [BLOCKER] absent
+               explicit versioning. peat-node is pure Rust — external consumers regenerate their
+               own typed clients from \`proto/sidecar.proto\` in their own repos (or front the
+               sidecar with peat-gateway per ADR-043). No in-repo SDKs.
              - Connect RPC surface coverage: new or modified RPCs on \`PeatSidecar\` MUST include
-               (a) a Rust integration test in \`tests/grpc_test.rs\` exercising the Connect protocol
-               over HTTP+JSON, AND (b) a Go SDK exercise in \`sdk/go/\` or \`test/go/cmd/\`. The
-               surface tier consumers actually hit is the protocol layer, not the internal
-               \`SidecarNode\` methods. Internal-method tests in \`tests/node_test.rs\` verify the
-               algorithm; surface-tier tests verify the actual exposed API.
+               a Rust integration test in \`tests/grpc_test.rs\` exercising the Connect protocol
+               over HTTP+JSON. The surface tier consumers actually hit is the protocol layer, not
+               the internal \`SidecarNode\` methods. Internal-method tests in \`tests/node_test.rs\`
+               verify the algorithm; surface-tier tests verify the actual exposed API.
                  - New RPC without a \`grpc_test.rs\` integration test → [BLOCKER]
-                 - New RPC without a Go SDK exercise → [BLOCKER]
                  - Round-trippable change tested in only one direction (e.g. Put without Get/List
                    verification, Subscribe without an event-receipt assertion) → [WARNING]
              - Encryption at rest (\`src/crypto.rs\`): AES-256-GCM key handling lives in security-
@@ -105,8 +102,8 @@ jobs:
                [BLOCKER]. Format-version bumps must remain backward-compatible with on-disk data.
              - peat-mesh dependency pin: \`peat-mesh = "=X.Y.Z-rc.N"\` in \`Cargo.toml\` is
                intentional. Any bump REQUIRES evidence of full integration validation in the PR:
-               \`cargo build\` + \`cargo test\` + Go SDK round-trip + \`test/cross-cluster-sync.sh\`
-               (or \`test/go/cluster/cluster_sync_test.go\`) + \`helm template chart/peat-node\`.
+               \`cargo build\` + \`cargo test\` (which exercises the in-process two-node sync via
+               \`tests/sync_test.rs\`) + \`test/cross-cluster-sync.sh\` + \`helm template chart/peat-node\`.
                A pin bump without integration evidence is [BLOCKER]. New features added on the back
                of an unverified bump are [BLOCKER].
              - Helm / Zarf packaging: changes to \`chart/peat-node/\` or \`zarf.yaml\` MUST include
@@ -118,17 +115,18 @@ jobs:
                insecure-only test coverage on a change that touches both is [WARNING]. Removing
                the \`build_client\` panic-on-bad-PEM behavior without an explicit error path is
                [BLOCKER] — silent fallback to insecure on cert failure is unacceptable.
-             - Language / runtime: Rust everywhere except the Go SDK (grandfathered for sidecar
-               consumers). New language or runtime additions are [BLOCKER]. New \`async\` runtimes
-               (anything not Tokio) are [BLOCKER].
+             - Language / runtime: peat-node is pure Rust. New language or runtime additions
+               are [BLOCKER]. New \`async\` runtimes (anything not Tokio) are [BLOCKER]. Typed
+               clients for other-language consumers live in those consumers' own repos (or in
+               peat-gateway per ADR-043), not here.
              - Architectural reach: cross-repo direct imports (\`peat-btle\`, \`peat-registry\`,
                \`peat-gateway\`, etc.) are [BLOCKER] — peat-node depends on \`peat-mesh\` only.
                Adding mesh-transport / sync-engine logic in this repo (instead of upstreaming to
                \`peat-mesh\`) is [ARCH] — escalate, do NOT propose a fix.
              - Implementation idiom: flag code that fights the language rather than working with it
-               (Rust ignoring borrow checker via excessive clone/unwrap; Go SDK using \`interface{}\`
-               where typed protos exist). Tag [IDIOM]. NOT formatter/style nitpicking — \`cargo fmt\`
-               and \`gofmt\` handle that.
+               (Rust ignoring borrow checker via excessive clone/unwrap or unwrap-on-Result chains
+               where \`?\` would be idiomatic). Tag [IDIOM]. NOT formatter/style nitpicking — \`cargo
+               fmt\` handles that.
              - ADR conformance: peat-node's design lives in \`docs/DESIGN.md\` here and the broader
                ADRs in the sibling \`peat\` repo's \`docs/adr/\`. Flag deviations from documented
                sidecar responsibilities (DDIL resilience, transport agnosticism, formation
@@ -167,21 +165,18 @@ jobs:
           1. Run: gh pr diff ${PR_NUMBER}
           2. Run: gh pr view ${PR_NUMBER}
           3. Review the diff against these criteria:
-             - Wire contract: \`proto/sidecar.proto\` IS the contract. Any change to a message,
-               field number, enum value, or RPC MUST regenerate the Go SDK in \`sdk/go/gen/\` in
-               the same PR (\`buf generate\` from \`sdk/go/\`). A proto change without a corresponding
-               regenerated SDK diff is [BLOCKER]. Hand-edits to files under \`sdk/go/gen/\` or
-               \`test/go/gen/\` are [BLOCKER] — fix the proto or buf config, never the generated file.
-               Breaking changes to existing field numbers / wire-incompatible enum reorderings are
-               [BLOCKER] absent explicit versioning.
+             - Wire contract: \`proto/sidecar.proto\` IS the contract. The Rust server is
+               regenerated automatically by \`build.rs\` on every \`cargo build\`. Breaking changes to
+               existing field numbers / wire-incompatible enum reorderings are [BLOCKER] absent
+               explicit versioning. peat-node is pure Rust — external consumers regenerate their
+               own typed clients from \`proto/sidecar.proto\` in their own repos (or front the
+               sidecar with peat-gateway per ADR-043). No in-repo SDKs.
              - Connect RPC surface coverage: new or modified RPCs on \`PeatSidecar\` MUST include
-               (a) a Rust integration test in \`tests/grpc_test.rs\` exercising the Connect protocol
-               over HTTP+JSON, AND (b) a Go SDK exercise in \`sdk/go/\` or \`test/go/cmd/\`. The
-               surface tier consumers actually hit is the protocol layer, not the internal
-               \`SidecarNode\` methods. Internal-method tests in \`tests/node_test.rs\` verify the
-               algorithm; surface-tier tests verify the actual exposed API.
+               a Rust integration test in \`tests/grpc_test.rs\` exercising the Connect protocol
+               over HTTP+JSON. The surface tier consumers actually hit is the protocol layer, not
+               the internal \`SidecarNode\` methods. Internal-method tests in \`tests/node_test.rs\`
+               verify the algorithm; surface-tier tests verify the actual exposed API.
                  - New RPC without a \`grpc_test.rs\` integration test → [BLOCKER]
-                 - New RPC without a Go SDK exercise → [BLOCKER]
                  - Round-trippable change tested in only one direction (e.g. Put without Get/List
                    verification, Subscribe without an event-receipt assertion) → [WARNING]
              - Encryption at rest (\`src/crypto.rs\`): AES-256-GCM key handling lives in security-
@@ -191,8 +186,8 @@ jobs:
                [BLOCKER]. Format-version bumps must remain backward-compatible with on-disk data.
              - peat-mesh dependency pin: \`peat-mesh = "=X.Y.Z-rc.N"\` in \`Cargo.toml\` is
                intentional. Any bump REQUIRES evidence of full integration validation in the PR:
-               \`cargo build\` + \`cargo test\` + Go SDK round-trip + \`test/cross-cluster-sync.sh\`
-               (or \`test/go/cluster/cluster_sync_test.go\`) + \`helm template chart/peat-node\`.
+               \`cargo build\` + \`cargo test\` (which exercises the in-process two-node sync via
+               \`tests/sync_test.rs\`) + \`test/cross-cluster-sync.sh\` + \`helm template chart/peat-node\`.
                A pin bump without integration evidence is [BLOCKER]. New features added on the back
                of an unverified bump are [BLOCKER].
              - Helm / Zarf packaging: changes to \`chart/peat-node/\` or \`zarf.yaml\` MUST include
@@ -204,17 +199,18 @@ jobs:
                insecure-only test coverage on a change that touches both is [WARNING]. Removing
                the \`build_client\` panic-on-bad-PEM behavior without an explicit error path is
                [BLOCKER] — silent fallback to insecure on cert failure is unacceptable.
-             - Language / runtime: Rust everywhere except the Go SDK (grandfathered for sidecar
-               consumers). New language or runtime additions are [BLOCKER]. New \`async\` runtimes
-               (anything not Tokio) are [BLOCKER].
+             - Language / runtime: peat-node is pure Rust. New language or runtime additions
+               are [BLOCKER]. New \`async\` runtimes (anything not Tokio) are [BLOCKER]. Typed
+               clients for other-language consumers live in those consumers' own repos (or in
+               peat-gateway per ADR-043), not here.
              - Architectural reach: cross-repo direct imports (\`peat-btle\`, \`peat-registry\`,
                \`peat-gateway\`, etc.) are [BLOCKER] — peat-node depends on \`peat-mesh\` only.
                Adding mesh-transport / sync-engine logic in this repo (instead of upstreaming to
                \`peat-mesh\`) is [ARCH] — escalate, do NOT propose a fix.
              - Implementation idiom: flag code that fights the language rather than working with it
-               (Rust ignoring borrow checker via excessive clone/unwrap; Go SDK using \`interface{}\`
-               where typed protos exist). Tag [IDIOM]. NOT formatter/style nitpicking — \`cargo fmt\`
-               and \`gofmt\` handle that.
+               (Rust ignoring borrow checker via excessive clone/unwrap or unwrap-on-Result chains
+               where \`?\` would be idiomatic). Tag [IDIOM]. NOT formatter/style nitpicking — \`cargo
+               fmt\` handles that.
              - ADR conformance: peat-node's design lives in \`docs/DESIGN.md\` here and the broader
                ADRs in the sibling \`peat\` repo's \`docs/adr/\`. Flag deviations from documented
                sidecar responsibilities (DDIL resilience, transport agnosticism, formation

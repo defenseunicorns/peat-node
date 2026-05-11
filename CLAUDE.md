@@ -9,8 +9,8 @@ If `peat/SKILL.md` isn't accessible, say so before proceeding — most architect
 
 ## Quick orientation
 
-- **Repo role:** Peat mesh node — exposes `peat-protocol` as a gRPC API for co-located applications (sidecar pattern). Single Rust binary that runs alongside an application and provides DDIL-resilient fleet state sync over Connect / gRPC / gRPC-Web on a single port. Ships with a Helm chart (`chart/peat-node/`) and a Zarf manifest, plus a Go SDK (`sdk/go`) generated from the wire proto.
-- **Primary languages:** Rust (sidecar binary); Go (SDK and integration tests under `sdk/go` and `test/go`). Wire contract is `proto/sidecar.proto`, compiled via `connectrpc_build` for Rust and `buf` for Go.
+- **Repo role:** Peat mesh node — exposes `peat-protocol` as a gRPC API for co-located applications (sidecar pattern). Single Rust binary that runs alongside an application and provides DDIL-resilient fleet state sync over Connect / gRPC / gRPC-Web on a single port. Ships with a Helm chart (`chart/peat-node/`) and a Zarf manifest. Pure Rust — consumers in other languages talk to it directly over the Connect/gRPC wire.
+- **Primary language:** Rust. Wire contract is `proto/sidecar.proto`, compiled via `connectrpc_build` for the in-tree server.
 - **Cheap sanity check:** `cargo build`. Re-runs the proto compile if `proto/sidecar.proto` changed.
 
 ## Hard rule

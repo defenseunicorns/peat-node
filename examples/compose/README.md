@@ -67,7 +67,7 @@ See `proto/sidecar.proto` for the full RPC list. Common ones:
 | `ListPeers` | `{}` |
 | `GetSyncStats` | `{}` |
 
-For Go services there's a typed client at `sdk/go/` (see its [README](../../sdk/go/README.md)).
+For typed clients in other languages, generate from [`proto/sidecar.proto`](../../proto/sidecar.proto) in the consumer's own repo — peat-node is pure Rust and does not ship language-specific SDKs.
 
 For protocol bridges (NATS, MQTT, etc.), use [`peat-gateway`](https://github.com/defenseunicorns/peat-gateway) in front of peat-node rather than re-implementing the wire here — `peat-gateway` is the ADR-043 consumer-interface adapter and owns those concerns.
 

@@ -216,14 +216,18 @@ See [docs/DESIGN.md](docs/DESIGN.md) for:
 | `zarf.yaml` | Zarf package config |
 | `Dockerfile` | Multi-stage build (debian:bookworm-slim) |
 | `docs/DESIGN.md` | Architecture and integration design |
-| `test/go/` | Go client library + integration tests (smoketest, synctest, watchertest, query, cluster e2e) |
+| `docs/CONFIGURATION.md` | Env-var / flag reference |
+| `tests/` | Rust integration tests (CRUD, encryption, two-node sync) |
+| `test/cross-cluster-sync.sh` | Cross-cluster functional test |
+| `examples/compose/` | Runnable two-node Docker Compose quickstart |
 
 ## Related Projects
 
 | Project | Description |
 |---------|-------------|
 | [peat](https://github.com/defenseunicorns/peat) | Decentralized mesh protocol (Rust) |
-| [test/go/](test/go/) | Go client library + integration tests (in this repo) |
+| [peat-mesh](https://github.com/defenseunicorns/peat-mesh) | Mesh networking layer this binary embeds |
+| [peat-gateway](https://github.com/defenseunicorns/peat-gateway) | Protocol-bridge adapters (NATS, MQTT, etc.) per ADR-043 |
 | [uds-remote-agent](https://github.com/defenseunicorns/uds-remote-agent) | UDS Remote Agent (primary integration target) |
 | [peat-registry](https://github.com/defenseunicorns/peat-registry) | OCI registry sync (validates the sidecar pattern) |
 

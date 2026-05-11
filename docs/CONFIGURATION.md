@@ -73,3 +73,5 @@ Default: `peat_node=info,peat_mesh=info`.
 ## Examples
 
 A working two-node config is in [`examples/compose/docker-compose.yml`](../examples/compose/docker-compose.yml). The Helm chart at [`chart/peat-node/`](../chart/peat-node/) maps these env vars to chart values.
+
+For typed clients in other languages, generate from [`proto/sidecar.proto`](../proto/sidecar.proto) in your own repo. peat-node ships no language-specific SDKs — consumers hit the Connect-RPC wire directly, or use [`peat-gateway`](https://github.com/defenseunicorns/peat-gateway) for protocol-bridge adapters.
