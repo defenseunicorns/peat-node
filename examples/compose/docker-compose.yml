@@ -1,0 +1,51 @@
+# Two-node peat-node mesh, runnable end-to-end on a single Docker host.
+#
+# Quickstart:
+#   docker compose up -d
+#   ./bootstrap.sh   # peer the two nodes
+#   ./demo.sh        # write on node-a, read on node-b, verify CRDT sync
+#   docker compose down -v
+#
+# Both nodes share the same app_id + shared_key, so they're in the same
+# formation. They use Iroh's public n0 relay for NAT traversal — the
+# containers need outbound HTTPS for that.
+
+services:
+  peat-node-a:
+    image: ghcr.io/defenseunicorns/peat-node:v0.1.0
+    container_name: peat-node-a
+    environment:
+      # Bind to all interfaces so the host port mapping works.
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_NODE_ID: node-a
+      PEAT_NODE_APP_ID: compose-demo
+      # Demo formation key (32 zero bytes, base64-encoded). Generate your
+      # own for any non-demo use: `head -c 32 /dev/urandom | base64`
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_AUTO_SYNC: "true"
+      RUST_LOG: peat_node=info,peat_mesh=warn
+    ports:
+      - "50061:50051"
+    volumes:
+      - peat-node-a-data:/data/peat-node
+
+  peat-node-b:
+    image: ghcr.io/defenseunicorns/peat-node:v0.1.0
+    container_name: peat-node-b
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_NODE_ID: node-b
+      PEAT_NODE_APP_ID: compose-demo
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_AUTO_SYNC: "true"
+      RUST_LOG: peat_node=info,peat_mesh=warn
+    ports:
+      - "50062:50051"
+    volumes:
+      - peat-node-b-data:/data/peat-node
+
+volumes:
+  peat-node-a-data:
+  peat-node-b-data:
