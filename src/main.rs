@@ -51,7 +51,10 @@ struct Args {
     /// Peers to connect to on startup, in `endpoint_id@host:port` form.
     /// The `@host:port` suffix is required (the n0 public relay is no longer
     /// used by default, so a bare endpoint ID has no way to locate the peer).
-    /// Multiple peers comma-separated.
+    /// One peer per entry; pass `--peer` repeatedly or comma-separate in
+    /// `PEAT_NODE_PEERS` to register multiple peers. For more than one
+    /// reachable address per peer, use the `ConnectPeer` RPC at runtime —
+    /// the comma in this flag separates peers, not addresses within a peer.
     /// Example: `aa11..@10.0.0.5:51071,bb22..@peer-b.svc:51071`
     #[arg(long, env = "PEAT_NODE_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
@@ -129,13 +132,15 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
-    // Initial peers in `endpoint_id@host:port` form. Multiple `@`-separated
-    // addresses per peer are supported (`id@host1:port,host2:port`).
+    // Initial peers in `endpoint_id@host:port` form, one per entry. The
+    // outer `,` in `PEAT_NODE_PEERS` separates peers (handled by clap's
+    // `value_delimiter`); multiple addresses for one peer go through the
+    // `ConnectPeer` RPC at runtime.
     for peer_spec in &args.peer {
         if peer_spec.is_empty() {
             continue;
         }
-        let Some((endpoint_id, addrs)) = peer_spec.split_once('@') else {
+        let Some((endpoint_id, addr)) = peer_spec.split_once('@') else {
             error!(
                 peer = peer_spec,
                 "ignoring --peer: expected `endpoint_id@host:port` form (the n0 \
@@ -144,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
             );
             continue;
         };
-        let addresses: Vec<String> = addrs.split(',').map(|s| s.to_string()).collect();
+        let addresses = vec![addr.to_string()];
         if let Err(e) = node.connect_peer(endpoint_id, &addresses, "").await {
             error!(peer = peer_spec, "failed to connect to peer: {e}");
         }

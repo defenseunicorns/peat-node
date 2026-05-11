@@ -24,7 +24,7 @@ if you add or rename a flag, update this file in the same PR.
 | Env var | Flag | Type | Default | Description |
 |---|---|---|---|---|
 | `PEAT_NODE_IROH_UDP_PORT` | `--iroh-udp-port` | u16 | unset (ephemeral) | Bind the Iroh QUIC endpoint to a specific UDP port. **Pin this** for any deployment where peers reach this node via a stable host:port — Docker Compose, fleet-managed sidecars, anywhere the n0 public relay isn't (and shouldn't be) in the picture. |
-| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Peers in `endpoint_id@host:port` form. Multiple addresses per peer are accepted (`endpoint_id@host1:port,host2:port`). A bare endpoint ID is rejected (logged as an error and skipped) — the n0 public relay is no longer used by default, so the peer's reachable address must be supplied alongside its ID. For runtime peering use the `ConnectPeer` RPC. |
+| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Peers in `endpoint_id@host:port` form, one per entry. The comma separates peers, not addresses within a peer — for multiple reachable addresses for one peer, use the `ConnectPeer` RPC at runtime. A bare endpoint ID is rejected (logged as an error and skipped); the n0 public relay is no longer used by default, so the peer's reachable address must be supplied alongside its ID. |
 | `PEAT_NODE_AUTO_SYNC` | `--auto-sync` | bool | `true` | If true, `StartSync` is invoked once startup completes. Set `false` to require an explicit `StartSync` RPC. |
 
 ### Relay
