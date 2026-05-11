@@ -149,31 +149,43 @@ async fn two_node_direct_udp_sync() {
     let got_a = poll_for_document(&client_a, &base_a, "sync-test", "from-b", want_b).await;
     assert_eq!(got_a, want_b, "doc content mismatch on node-a after sync");
 
-    // Connection liveness — both nodes should see each other in
-    // GetSyncStats.connected_peers after the doc exchange has flowed.
+    // Connection liveness + byte counters. Proto3 JSON encodes `uint64`
+    // as a string to preserve precision past JSON's 53-bit mantissa, so
+    // a naive `as_u64()` returns None and silently degrades to zero —
+    // exactly the trap that made these counters look like they didn't
+    // increment in-process. Use `json_u64` instead. The wiring works
+    // fine; the bug was in how the test parsed the response.
     let stats_a = call(&client_a, &base_a, "GetSyncStats", serde_json::json!({})).await;
     let stats_b = call(&client_b, &base_b, "GetSyncStats", serde_json::json!({})).await;
-    let peers_a = stats_a["connectedPeers"].as_u64().unwrap_or(0);
-    let peers_b = stats_b["connectedPeers"].as_u64().unwrap_or(0);
+    let peers_a = json_u64(&stats_a["connectedPeers"]);
+    let peers_b = json_u64(&stats_b["connectedPeers"]);
     assert!(peers_a >= 1, "node-a should see >= 1 peer, got {peers_a}");
     assert!(peers_b >= 1, "node-b should see >= 1 peer, got {peers_b}");
 
-    // Byte counter assertion deliberately omitted.
-    //
-    // `AutomergeSyncCoordinator::total_bytes_sent` / `total_bytes_received`
-    // increment on the snapshot/sync-message send-receive paths. With
-    // two SidecarNodes in the *same process*, observable sync flows
-    // through an initial-reconciliation path that the in-process
-    // configuration short-circuits — counters stay at zero even after
-    // docs converge end-to-end. The subprocess equivalent (the prior
-    // Go synctest) saw real ~8 KB exchanges.
-    //
-    // The companion fresh-node check in `tests/node_test.rs` is *not*
-    // a guard against hardcoded zeros (a `bytes_sent: 0` regression
-    // would satisfy it identically). Recovering the real-sync
-    // assertion needs a subprocess-driven test using
-    // `CARGO_BIN_EXE_peat-node` + `tokio::process` — tracked in #44
-    // as a release-blocker for the next tagged version.
+    let bytes_sent_a = json_u64(&stats_a["bytesSent"]);
+    let bytes_received_a = json_u64(&stats_a["bytesReceived"]);
+    let bytes_sent_b = json_u64(&stats_b["bytesSent"]);
+    let bytes_received_b = json_u64(&stats_b["bytesReceived"]);
+    assert!(
+        bytes_sent_a > 0 && bytes_received_a > 0,
+        "node-a sync stats zero after sync: sent={bytes_sent_a} received={bytes_received_a}"
+    );
+    assert!(
+        bytes_sent_b > 0 && bytes_received_b > 0,
+        "node-b sync stats zero after sync: sent={bytes_sent_b} received={bytes_received_b}"
+    );
+}
+
+/// Proto3 JSON encodes `uint64` as a string. Handle both forms (some
+/// encoders emit small values as numbers).
+fn json_u64(v: &serde_json::Value) -> u64 {
+    if let Some(n) = v.as_u64() {
+        return n;
+    }
+    if let Some(s) = v.as_str() {
+        return s.parse().unwrap_or(0);
+    }
+    0
 }
 
 async fn poll_for_document(

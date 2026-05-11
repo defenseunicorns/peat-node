@@ -114,15 +114,10 @@ async fn node_status() {
 #[tokio::test]
 async fn sync_stats_default_zero_on_fresh_node() {
     // Fresh single-node, no peers, no sync activity: counters must read
-    // exactly zero.
-    //
-    // Honest scope: this test only asserts the *default* value on a node
-    // that has never sent or received any sync traffic. A hardcoded
-    // `bytes_sent: 0` regression would satisfy it identically to the
-    // real coordinator-derived value. The live guard — counters
-    // increment under real sync — was previously exercised by the Go
-    // `test/go/cmd/synctest` and is now a tracked coverage gap (#44)
-    // pending the subprocess-driven Rust replacement.
+    // exactly zero. Pins the default behavior; the live "counters
+    // increment under real sync" guard is in `tests/sync_test.rs`
+    // (in-process two-node) and `tests/sync_subprocess_test.rs`
+    // (two real binaries).
     let dir = tempfile::tempdir().unwrap();
     let node = test_node(dir.path()).await;
 
