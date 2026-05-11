@@ -108,4 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - run: helm lint chart/peat-node/
+      - name: helm lint
+        run: helm lint chart/peat-node/
+      - name: helm template (render check)
+        run: helm template chart/peat-node/ > /dev/null
