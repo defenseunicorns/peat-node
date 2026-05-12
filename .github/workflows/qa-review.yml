@@ -101,11 +101,22 @@ jobs:
                bypass the cipher when configured, or skip the established zeroization patterns are
                [BLOCKER]. Format-version bumps must remain backward-compatible with on-disk data.
              - peat-mesh dependency pin: \`peat-mesh = "=X.Y.Z-rc.N"\` in \`Cargo.toml\` is
-               intentional. Any bump REQUIRES evidence of full integration validation in the PR:
-               \`cargo build\` + \`cargo test\` (which exercises the in-process two-node sync via
-               \`tests/sync_test.rs\`) + \`test/cross-cluster-sync.sh\` + \`helm template chart/peat-node\`.
-               A pin bump without integration evidence is [BLOCKER]. New features added on the back
-               of an unverified bump are [BLOCKER].
+               intentional. Bumps must show integration evidence in the PR description or CI
+               logs (the latter counts — \"green CI on this PR\" is acceptable evidence):
+                 - REQUIRED: \`cargo test\` green. The Rust test surface includes both the
+                   in-process two-node sync (\`tests/sync_test.rs\`) and the subprocess
+                   two-binary sync with non-zero byte-counter assertions
+                   (\`tests/sync_subprocess_test.rs\`). CI's \`Test\` job runs both.
+                 - REQUIRED: \`helm template chart/peat-node\` clean. CI's \`Helm Lint\` job
+                   runs both \`helm lint\` and \`helm template\` on every PR.
+                 - RECOMMENDED, NOT required: \`test/cross-cluster-sync.sh\` when the diff
+                   touches \`chart/peat-node/\`, \`src/node.rs\`'s sync wiring, or the
+                   \`peat-mesh\` sync API. Not hard-required (requires k3d/helm/kubectl
+                   tooling not in default CI); the cargo + helm evidence above is the
+                   minimum gate for a routine bump.
+               A pin bump with only \`cargo build\` evidence (no \`cargo test\` green, no
+               Helm Lint green) is [BLOCKER]. New features added on the back of an
+               unverified bump are [BLOCKER].
              - Helm / Zarf packaging: changes to \`chart/peat-node/\` or \`zarf.yaml\` MUST include
                \`helm template chart/peat-node\` evidence in the PR description or CI logs.
                Hardcoded absolute paths, embedded secrets / KMS material, or test fixtures with
@@ -185,11 +196,22 @@ jobs:
                bypass the cipher when configured, or skip the established zeroization patterns are
                [BLOCKER]. Format-version bumps must remain backward-compatible with on-disk data.
              - peat-mesh dependency pin: \`peat-mesh = "=X.Y.Z-rc.N"\` in \`Cargo.toml\` is
-               intentional. Any bump REQUIRES evidence of full integration validation in the PR:
-               \`cargo build\` + \`cargo test\` (which exercises the in-process two-node sync via
-               \`tests/sync_test.rs\`) + \`test/cross-cluster-sync.sh\` + \`helm template chart/peat-node\`.
-               A pin bump without integration evidence is [BLOCKER]. New features added on the back
-               of an unverified bump are [BLOCKER].
+               intentional. Bumps must show integration evidence in the PR description or CI
+               logs (the latter counts — \"green CI on this PR\" is acceptable evidence):
+                 - REQUIRED: \`cargo test\` green. The Rust test surface includes both the
+                   in-process two-node sync (\`tests/sync_test.rs\`) and the subprocess
+                   two-binary sync with non-zero byte-counter assertions
+                   (\`tests/sync_subprocess_test.rs\`). CI's \`Test\` job runs both.
+                 - REQUIRED: \`helm template chart/peat-node\` clean. CI's \`Helm Lint\` job
+                   runs both \`helm lint\` and \`helm template\` on every PR.
+                 - RECOMMENDED, NOT required: \`test/cross-cluster-sync.sh\` when the diff
+                   touches \`chart/peat-node/\`, \`src/node.rs\`'s sync wiring, or the
+                   \`peat-mesh\` sync API. Not hard-required (requires k3d/helm/kubectl
+                   tooling not in default CI); the cargo + helm evidence above is the
+                   minimum gate for a routine bump.
+               A pin bump with only \`cargo build\` evidence (no \`cargo test\` green, no
+               Helm Lint green) is [BLOCKER]. New features added on the back of an
+               unverified bump are [BLOCKER].
              - Helm / Zarf packaging: changes to \`chart/peat-node/\` or \`zarf.yaml\` MUST include
                \`helm template chart/peat-node\` evidence in the PR description or CI logs.
                Hardcoded absolute paths, embedded secrets / KMS material, or test fixtures with

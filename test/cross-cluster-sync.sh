@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
 # Cross-cluster CRDT sync test for peat-node.
 #
-# Creates two k3d clusters, deploys a peat-node to each, connects them
-# via Iroh relay, writes data on one side, and verifies it syncs to the other.
+# Creates two k3d clusters on a shared Docker network, deploys peat-node
+# to each via the in-tree Helm chart, peers them via direct Iroh UDP
+# addressing (k3d node hostnames on the shared network), and verifies
+# bidirectional CRDT sync.
 #
-# Uses kubectl exec + curl (Connect protocol / HTTP+JSON) — no Go toolchain needed.
+# Uses kubectl exec + curl (Connect protocol / HTTP+JSON). No Go
+# toolchain needed.
 #
-# Prerequisites: k3d, docker, kubectl, python3
+# Prerequisites: k3d, helm, docker, kubectl, python3
 #
-# IMPORTANT: Cross-cluster sync requires that pods can resolve public DNS
-# (Iroh relay at *.relay.iroh.network). Some local k3d/OrbStack configurations
-# have broken DNS egress. If peer connection fails, verify with:
-#   kubectl exec sidecar -- curl -s https://euw1-1.relay.iroh.network/
-# For CI environments with proper DNS, this test works end-to-end.
+# Relay model: this script uses the relay-off-by-default path that v0.1.1+
+# ships. Peers reach each other via direct UDP at the k3d node container's
+# hostname on the shared `peat-mesh-net` Docker network — no dependency
+# on the public n0 relay or any external NAT-traversal infrastructure.
+# The chart pins `PEAT_NODE_IROH_UDP_PORT` and sets `hostPort` so the
+# pod's UDP socket is reachable from the other cluster's pods.
 #
 # Usage:
 #   ./test/cross-cluster-sync.sh          # full lifecycle
-#   ./test/cross-cluster-sync.sh create   # create clusters only
+#   ./test/cross-cluster-sync.sh create   # create clusters + deploy only
 #   ./test/cross-cluster-sync.sh test     # run tests (clusters must exist)
 #   ./test/cross-cluster-sync.sh cleanup  # destroy clusters
 
@@ -28,6 +32,12 @@ IMAGE="peat-node:dev"
 
 ALPHA="peat-sync-alpha"
 BRAVO="peat-sync-bravo"
+NETWORK="peat-mesh-net"
+IROH_PORT="51071"
+
+# Demo shared key — same on both clusters so they're in one formation.
+# 32 zero bytes, base64-encoded. Generate a real key for any non-test use.
+SHARED_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 # --- Helpers ---
 
@@ -35,10 +45,10 @@ log()  { echo "==> $*"; }
 pass() { echo "  ✓ $*"; }
 fail() { echo "  ✗ $*"; FAILED=true; }
 
-# Execute an RPC via kubectl exec + curl inside the pod (avoids port-forward issues)
+# Execute an RPC via kubectl exec + curl inside the sidecar pod.
 rpc_on() {
     local context="$1" method="$2" body="${3:-{}}"
-    kubectl --context "${context}" exec sidecar -- \
+    kubectl --context "${context}" exec -n peat svc/peat-peat-node -c peat-node -- \
         curl -s -X POST "http://localhost:50051/peat.sidecar.v1.PeatSidecar/${method}" \
         -H "content-type: application/json" \
         -d "${body}" 2>/dev/null
@@ -59,51 +69,53 @@ build_image() {
     fi
 }
 
+deploy_to() {
+    local cluster="$1" node_id="$2"
+    kubectl --context "k3d-${cluster}" create namespace peat --dry-run=client -o yaml | \
+        kubectl --context "k3d-${cluster}" apply -f -
+    helm --kube-context "k3d-${cluster}" upgrade --install peat \
+        "${REPO_DIR}/chart/peat-node" \
+        --namespace peat \
+        --set image.repository=peat-node \
+        --set image.tag=dev \
+        --set image.pullPolicy=Never \
+        --set listen="tcp://0.0.0.0:50051" \
+        --set nodeId="${node_id}" \
+        --set sharedKey="${SHARED_KEY}" \
+        --set autoSync=true \
+        --set irohUdpPort="${IROH_PORT}" \
+        --set irohUdpHostPort=true \
+        --wait --timeout 90s
+}
+
 create_clusters() {
     build_image
 
-    # Both clusters share a Docker network so Iroh QUIC can route between them
-    log "Creating k3d cluster: ${ALPHA}"
-    k3d cluster create "${ALPHA}" --network peat-mesh-net --wait 2>&1 | tail -1
+    # Both clusters share a Docker network so each cluster's node
+    # container is reachable from the other's pods via Docker DNS at
+    # `k3d-${CLUSTER}-server-0` on the `${NETWORK}` network.
+    log "Creating k3d cluster: ${ALPHA} on network ${NETWORK}"
+    k3d cluster create "${ALPHA}" --network "${NETWORK}" --wait 2>&1 | tail -1
 
-    log "Creating k3d cluster: ${BRAVO}"
-    k3d cluster create "${BRAVO}" --network peat-mesh-net --wait 2>&1 | tail -1
+    log "Creating k3d cluster: ${BRAVO} on network ${NETWORK}"
+    k3d cluster create "${BRAVO}" --network "${NETWORK}" --wait 2>&1 | tail -1
 
     log "Loading image into clusters..."
     k3d image import "${IMAGE}" -c "${ALPHA}" 2>&1 | tail -1
     k3d image import "${IMAGE}" -c "${BRAVO}" 2>&1 | tail -1
 
-    # Deploy sidecar pods
-    for ctx in "k3d-${ALPHA}:alpha-agent" "k3d-${BRAVO}:bravo-agent"; do
-        IFS=: read -r context node_id <<< "${ctx}"
-        kubectl --context "${context}" apply -f - <<EOF
-apiVersion: v1
-kind: Pod
-metadata:
-  name: sidecar
-  labels:
-    app: peat-node
-spec:
-  containers:
-  - name: sidecar
-    image: ${IMAGE}
-    imagePullPolicy: Never
-    args: ["peat-node", "--node-id=${node_id}", "--listen=tcp://0.0.0.0:50051", "--auto-sync"]
-    ports:
-    - containerPort: 50051
-EOF
-    done
+    log "Deploying peat-node to ${ALPHA} via Helm..."
+    deploy_to "${ALPHA}" "alpha-agent"
 
-    log "Waiting for pods..."
-    kubectl --context "k3d-${ALPHA}" wait --for=condition=Ready pod/sidecar --timeout=60s
-    kubectl --context "k3d-${BRAVO}" wait --for=condition=Ready pod/sidecar --timeout=60s
+    log "Deploying peat-node to ${BRAVO} via Helm..."
+    deploy_to "${BRAVO}" "bravo-agent"
 }
 
 cleanup_clusters() {
     log "Cleaning up..."
     k3d cluster delete "${ALPHA}" 2>/dev/null || true
     k3d cluster delete "${BRAVO}" 2>/dev/null || true
-    docker network rm peat-mesh-net 2>/dev/null || true
+    docker network rm "${NETWORK}" 2>/dev/null || true
 }
 
 # --- Test ---
@@ -112,6 +124,12 @@ run_test() {
     local CTX_A="k3d-${ALPHA}"
     local CTX_B="k3d-${BRAVO}"
     FAILED=false
+
+    # The chart's hostPort binds the pod's Iroh UDP socket on the k3d
+    # node container's interface. Pods in the *other* cluster reach it
+    # via the node container's hostname on the shared Docker network.
+    local ALPHA_HOST="k3d-${ALPHA}-server-0:${IROH_PORT}"
+    local BRAVO_HOST="k3d-${BRAVO}-server-0:${IROH_PORT}"
 
     # ── Test 1: Both nodes healthy ────────────────────────────────
     log "Test 1: Node health"
@@ -124,10 +142,11 @@ run_test() {
 
     ALPHA_ENDPOINT=$(rpc_on "${CTX_A}" GetStatus | jq_py "print(json.load(sys.stdin)['endpointAddr'])")
 
-    # ── Test 2: Peer connection (cross-cluster via Iroh relay) ────
-    log "Test 2: Cross-cluster peer connection"
+    # ── Test 2: Peer connection via direct UDP (no relay) ─────────
+    log "Test 2: Cross-cluster peer connection via direct UDP at ${ALPHA_HOST}"
 
-    rpc_on "${CTX_B}" ConnectPeer "{\"endpointId\":\"${ALPHA_ENDPOINT}\"}" >/dev/null
+    rpc_on "${CTX_B}" ConnectPeer \
+        "{\"endpointId\":\"${ALPHA_ENDPOINT}\",\"addresses\":[\"${ALPHA_HOST}\"]}" >/dev/null
 
     CONNECTED=false
     for i in $(seq 1 30); do
@@ -198,6 +217,16 @@ run_test() {
     [ "${ALPHA_COUNT}" = "2" ] && [ "${BRAVO_COUNT}" = "2" ] \
         && pass "Fleet converged: both clusters see 2 platforms" \
         || fail "fleet state mismatch: alpha=${ALPHA_COUNT} bravo=${BRAVO_COUNT}"
+
+    # ── Test 5: GetSyncStats reports non-zero byte counters ─────
+    log "Test 5: GetSyncStats byte counters (real wire traffic)"
+
+    # Proto3 JSON emits uint64 as string; bytesSent may be missing
+    # entirely if 0 (proto3 default elision). Treat absent as 0.
+    BYTES_A=$(rpc_on "${CTX_A}" GetSyncStats | jq_py "d=json.load(sys.stdin); print(int(d.get('bytesSent','0') or 0))")
+    BYTES_B=$(rpc_on "${CTX_B}" GetSyncStats | jq_py "d=json.load(sys.stdin); print(int(d.get('bytesSent','0') or 0))")
+    [ "${BYTES_A}" -gt 0 ] && pass "Alpha bytesSent=${BYTES_A}" || fail "Alpha bytesSent=${BYTES_A} (expected >0)"
+    [ "${BYTES_B}" -gt 0 ] && pass "Bravo bytesSent=${BYTES_B}" || fail "Bravo bytesSent=${BYTES_B} (expected >0)"
 
     echo ""
     if ${FAILED}; then

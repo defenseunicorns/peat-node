@@ -1,0 +1,57 @@
+name: Cross-cluster sync
+
+# Heavy integration test — spins up two k3d clusters on a shared
+# Docker network, helm-installs peat-node to each, and verifies
+# bidirectional CRDT sync over direct UDP (no relay). Takes ~5-10
+# minutes end-to-end, so it doesn't run on every PR.
+#
+# Triggers:
+#   - on push of any `v*` tag (gates releases on real-K8s deployment)
+#   - manually via the Actions UI (workflow_dispatch) for substantial
+#     PRs touching chart/sync code
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit SHA to test against"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-cluster-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-cluster-sync:
+    name: Cross-cluster sync (k3d × 2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install k3d
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
+          k3d version
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Verify kubectl
+        run: kubectl version --client
+
+      - name: Build peat-node image
+        run: docker build -t peat-node:dev .
+
+      - name: Run cross-cluster-sync
+        run: ./test/cross-cluster-sync.sh all

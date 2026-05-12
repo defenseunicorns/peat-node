@@ -34,6 +34,21 @@ peers: []
 # -- Auto-start CRDT sync on boot
 autoSync: true
 
+# -- Pin the Iroh QUIC UDP port. 0 (default) selects an ephemeral port at
+# startup. Pin to a known value for deployments where peers reach this
+# node via a stable UDP host:port — Docker Compose, k3d-on-shared-network,
+# fleet-managed sidecars with NodePort/hostPort exposure. The n0 public
+# relay is disabled by default in the binary, so peers either need a
+# direct address (this port, exposed somehow) or an explicit relay URL
+# passed through `ConnectPeer.relay_url` at runtime.
+irohUdpPort: 0
+
+# -- When irohUdpPort > 0, also expose it as a `hostPort` on the pod.
+# Useful for k3d-style multi-cluster setups on a shared Docker network
+# where pods in *other* clusters reach this node at the k3d node's
+# hostname:port. Default false (sidecar-only consumers don't need it).
+irohUdpHostPort: false
+
 # -- Agent watcher: poll a co-located service (e.g. UDS Remote Agent)
 # Set agentAddr to enable. Example: http://localhost:8080 or https://localhost:8080
 agentAddr: ""
