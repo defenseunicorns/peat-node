@@ -46,8 +46,13 @@ pass() { echo "  ✓ $*"; }
 fail() { echo "  ✗ $*"; FAILED=true; }
 
 # Execute an RPC via kubectl exec + curl inside the sidecar pod.
+# NOTE on the default-body: do not use `${3:-{}}` — bash closes the
+# parameter expansion at the first `}`, so the literal `{}` default
+# leaves a trailing `}` attached to any caller-supplied body, breaking
+# the JSON silently. Use a sentinel default instead.
 rpc_on() {
-    local context="$1" method="$2" body="${3:-{}}"
+    local context="$1" method="$2" body="${3-}"
+    [ -z "${body}" ] && body='{}'
     kubectl --context "${context}" exec -n peat svc/peat-peat-node -c peat-node -- \
         curl -s -X POST "http://localhost:50051/peat.sidecar.v1.PeatSidecar/${method}" \
         -H "content-type: application/json" \
@@ -127,9 +132,24 @@ run_test() {
 
     # The chart's hostPort binds the pod's Iroh UDP socket on the k3d
     # node container's interface. Pods in the *other* cluster reach it
-    # via the node container's hostname on the shared Docker network.
-    local ALPHA_HOST="k3d-${ALPHA}-server-0:${IROH_PORT}"
-    local BRAVO_HOST="k3d-${BRAVO}-server-0:${IROH_PORT}"
+    # at the node container's IP on the shared Docker network.
+    #
+    # Resolve to a raw IP rather than passing the Docker DNS hostname:
+    # iroh's address parser takes a slow discovery path on hostnames
+    # (≈2 min before falling through to direct UDP), but accepts an
+    # IP:port immediately. Pods *can* resolve the k3d hostname via
+    # CoreDNS — the issue is just iroh's side, not Kubernetes.
+    local ALPHA_IP BRAVO_IP
+    ALPHA_IP=$(docker network inspect "${NETWORK}" \
+        --format "{{range .Containers}}{{if eq .Name \"k3d-${ALPHA}-server-0\"}}{{.IPv4Address}}{{end}}{{end}}" \
+        | cut -d/ -f1)
+    BRAVO_IP=$(docker network inspect "${NETWORK}" \
+        --format "{{range .Containers}}{{if eq .Name \"k3d-${BRAVO}-server-0\"}}{{.IPv4Address}}{{end}}{{end}}" \
+        | cut -d/ -f1)
+    [ -n "${ALPHA_IP}" ] || { echo "fatal: could not resolve k3d-${ALPHA}-server-0 IP"; exit 1; }
+    [ -n "${BRAVO_IP}" ] || { echo "fatal: could not resolve k3d-${BRAVO}-server-0 IP"; exit 1; }
+    local ALPHA_HOST="${ALPHA_IP}:${IROH_PORT}"
+    local BRAVO_HOST="${BRAVO_IP}:${IROH_PORT}"
 
     # ── Test 1: Both nodes healthy ────────────────────────────────
     log "Test 1: Node health"
