@@ -68,6 +68,10 @@ Usage in a parent chart:
     - name: PEAT_NODE_AUTO_SYNC
       value: "true"
     {{- end }}
+    {{- if gt (int .Values.irohUdpPort) 0 }}
+    - name: PEAT_NODE_IROH_UDP_PORT
+      value: {{ .Values.irohUdpPort | quote }}
+    {{- end }}
     {{- if .Values.agentAddr }}
     - name: PEAT_NODE_AGENT_ADDR
       value: {{ .Values.agentAddr | quote }}
@@ -91,6 +95,14 @@ Usage in a parent chart:
     - name: grpc
       containerPort: {{ (split ":" .Values.listen)._2 }}
       protocol: TCP
+    {{- end }}
+    {{- if gt (int .Values.irohUdpPort) 0 }}
+    - name: iroh-quic
+      containerPort: {{ .Values.irohUdpPort }}
+      protocol: UDP
+      {{- if .Values.irohUdpHostPort }}
+      hostPort: {{ .Values.irohUdpPort }}
+      {{- end }}
     {{- end }}
   livenessProbe:
     {{- if hasPrefix "tcp://" .Values.listen }}
