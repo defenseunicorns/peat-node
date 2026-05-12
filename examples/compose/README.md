@@ -16,8 +16,6 @@ docker compose up -d
 ./demo.sh         # write on node-a, read on node-b, verify sync
 ```
 
-> If you're running this **before the next peat-node release ships**, the published `ghcr.io/defenseunicorns/peat-node:v0.1.0` image predates the relay-off-by-default change and will fail `ConnectPeer`. Edit `docker-compose.yml`, comment out the `image:` line, uncomment the `build:` block, and run `docker compose up -d --build` to build from the repo root. After the next release lands, the pinned image will Just Work.
-
 Expected output from `demo.sh`:
 
 ```
