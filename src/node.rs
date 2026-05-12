@@ -349,11 +349,43 @@ impl SidecarNode {
 
         self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
 
-        // Connect and authenticate via formation key handshake
-        let connection = self
-            .sync_transport
-            .connect_and_authenticate(peer_id)
-            .await?;
+        // Connect and authenticate via formation key handshake.
+        //
+        // Workaround for upstream peat#759: the initiator's `open_bi()`
+        // and the acceptor's `accept_bi()` don't always pair on the
+        // first attempt during HMAC challenge-response, returning a
+        // fast `formation auth failed (code 1)` close. Evidence in
+        // peat#759's comment thread is that a single retry succeeds;
+        // the race is timing-sensitive on startup. We retry up to
+        // `CONNECT_RETRY_ATTEMPTS - 1` times with a small backoff. All
+        // failure classes retry — the fast-failure cases (handshake
+        // race) cost ~200ms each; genuine unreachable peers still
+        // converge to a final error after the per-attempt timeout
+        // elapses each loop, which is acceptable for a config that
+        // rarely changes after deployment.
+        const CONNECT_RETRY_ATTEMPTS: usize = 3;
+        const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+        let mut attempt = 0;
+        let connection = loop {
+            attempt += 1;
+            match self.sync_transport.connect_and_authenticate(peer_id).await {
+                Ok(c) => break c,
+                Err(e) if attempt < CONNECT_RETRY_ATTEMPTS => {
+                    warn!(
+                        peer = endpoint_id_str,
+                        attempt,
+                        max_attempts = CONNECT_RETRY_ATTEMPTS,
+                        "connect_and_authenticate failed, retrying: {e}"
+                    );
+                    tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "connect_and_authenticate failed after {attempt} attempts: {e}"
+                    ));
+                }
+            }
+        };
 
         // Register the connection for CRDT sync
         self.sync_transport
