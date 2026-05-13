@@ -368,6 +368,126 @@ impl pb::PeatSidecar for PeatSidecarService {
         ))
     }
 
+    // --- Deployment (P2P Zarf package distribution) ---
+
+    async fn publish_deployment(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::PublishDeploymentRequestView<'static>>,
+    ) -> Result<(pb::PublishDeploymentResponse, Context), ConnectError> {
+        // Pitfall 1: materialize the borrowed view because of the map<string,string> field.
+        let req = request.to_owned_message();
+
+        // Validate inputs
+        if req.target_agent_id.is_empty() {
+            return Err(ConnectError::invalid_argument("target_agent_id is required"));
+        }
+        let path = std::path::Path::new(&req.package_path);
+        if !path.exists() {
+            return Err(ConnectError::invalid_argument(format!(
+                "package_path does not exist: {}",
+                req.package_path
+            )));
+        }
+
+        // Derive a stable name from the filename (best-effort; the sender owns the path).
+        let package_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Publish blob to Iroh store (BLOB-01; already implemented on SidecarNode).
+        let token = self
+            .node
+            .publish_blob(path, &package_name)
+            .await
+            .map_err(internal)?;
+
+        // Pitfall 5: always generate a new UUID — no dedup on the sender side.
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let sender_endpoint_id = self.node.endpoint_addr();
+
+        // Synthesize blob_ticket (Phase 3 parses this; see RESEARCH.md §"What blob_ticket Is").
+        let blob_ticket = serde_json::json!({
+            "hash": token.hash.as_hex(),
+            "size_bytes": token.size_bytes,
+            "sender_endpoint_id": sender_endpoint_id,
+        })
+        .to_string();
+
+        // Pitfall 2: build the typed struct, not a json! macro. serde_json::to_string
+        // guarantees the locked schema (DeploymentStatus::Pending → "pending" via serde rename_all).
+        let doc = crate::types::DeploymentRequest {
+            id: request_id.clone(),
+            target_agent_id: req.target_agent_id.clone(),
+            package_name,
+            package_version: String::new(),
+            architecture: String::new(),
+            iroh_blob_hash: token.hash.as_hex().to_string(),
+            sender_endpoint_id,
+            zarf_vars: req.zarf_vars.into_iter().collect(),
+            sender_status: crate::types::DeploymentStatus::Pending,
+            receiver_status: crate::types::DeploymentStatus::Pending,
+            created_at: chrono::Utc::now().timestamp(),
+            blob_ticket,
+        };
+
+        let json = serde_json::to_string(&doc)
+            .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
+
+        self.node
+            .put_document("deployment_requests", &request_id, &json)
+            .await
+            .map_err(internal)?;
+
+        Ok((
+            pb::PublishDeploymentResponse {
+                request_id,
+                ..Default::default()
+            },
+            ctx,
+        ))
+    }
+
+    async fn get_deployment_requests(
+        &self,
+        ctx: Context,
+        _request: OwnedView<pb::GetDeploymentRequestsRequestView<'static>>,
+    ) -> Result<(pb::GetDeploymentRequestsResponse, Context), ConnectError> {
+        let doc_ids = self
+            .node
+            .list_documents("deployment_requests")
+            .await
+            .map_err(internal)?;
+
+        let mut requests = Vec::with_capacity(doc_ids.len());
+        for doc_id in &doc_ids {
+            if let Some(json) = self
+                .node
+                .get_document("deployment_requests", doc_id)
+                .await
+                .map_err(internal)?
+            {
+                match serde_json::from_str::<crate::types::DeploymentRequest>(&json) {
+                    Ok(req) => requests.push(deployment_request_to_proto(doc_id, &req)),
+                    Err(e) => {
+                        error!(doc_id = %doc_id, "failed to deserialize deployment_request: {e}");
+                        // Do not abort — skip the malformed doc and continue.
+                    }
+                }
+            }
+        }
+
+        Ok((
+            pb::GetDeploymentRequestsResponse {
+                requests,
+                ..Default::default()
+            },
+            ctx,
+        ))
+    }
+
     // --- Subscriptions ---
 
     async fn subscribe(
@@ -593,4 +713,32 @@ fn map_to_command(id: &str, json: &str) -> anyhow::Result<pb::Command> {
         payload_json: v["payload_json"].as_str().unwrap_or_default().to_string(),
         ..Default::default()
     })
+}
+
+fn deployment_request_to_proto(
+    id: &str,
+    r: &crate::types::DeploymentRequest,
+) -> pb::DeploymentRequestDoc {
+    pb::DeploymentRequestDoc {
+        id: id.to_string(),
+        target_agent_id: r.target_agent_id.clone(),
+        package_name: r.package_name.clone(),
+        package_version: r.package_version.clone(),
+        architecture: r.architecture.clone(),
+        iroh_blob_hash: r.iroh_blob_hash.clone(),
+        sender_endpoint_id: r.sender_endpoint_id.clone(),
+        blob_ticket: r.blob_ticket.clone(),
+        zarf_vars: r.zarf_vars.clone(),
+        // DeploymentStatus → snake_case string via serde_json (Pitfall — don't use format!("{:?}"))
+        sender_status: serde_json::to_value(&r.sender_status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        receiver_status: serde_json::to_value(&r.receiver_status)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        created_at: r.created_at,
+        ..Default::default()
+    }
 }
