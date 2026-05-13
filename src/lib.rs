@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod node;
 pub mod service;
+pub mod types;
 pub mod watcher;
 
 /// Generated protobuf/Connect RPC types.
