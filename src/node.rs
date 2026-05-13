@@ -300,6 +300,15 @@ impl SidecarNode {
         self.iroh_transport.peer_count() as u32
     }
 
+    /// Return the directory used for blob storage and .meta.json sidecars.
+    ///
+    /// Exposed so the watcher (SYNC-01) can resolve local package file paths
+    /// of the form `{blob_work_dir}/{hash_hex}` that were produced by
+    /// `publish_blob()`.
+    pub fn blob_work_dir(&self) -> &std::path::Path {
+        &self.blob_work_dir
+    }
+
     // --- Sync Control ---
 
     pub async fn start_sync(&self) -> anyhow::Result<()> {
