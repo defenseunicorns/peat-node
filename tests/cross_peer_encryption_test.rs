@@ -25,6 +25,7 @@ async fn boot(
             peers: vec![],
             encryption_key,
             iroh_udp_port: Some(iroh_port),
+            attachment_config: Default::default(),
         })
         .await
         .unwrap(),

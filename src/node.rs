@@ -15,9 +15,12 @@ use std::sync::Arc;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
+use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
+use crate::attachments::config::AttachmentConfig;
+use crate::attachments::registry::{BundleRegistry, RegistryConfig};
 use crate::crypto::StoreCipher;
 
 /// Configuration for the sidecar node.
@@ -35,6 +38,10 @@ pub struct SidecarConfig {
     /// Pin this for deployments where peers need a stable address (e.g. Docker Compose
     /// or any case relying on direct peer-to-peer reachability instead of a relay).
     pub iroh_udp_port: Option<u16>,
+    /// Attachment distribution (PRD-006). Empty roots → service handlers
+    /// return `Unimplemented`. The `IrohFileDistribution` substrate is only
+    /// constructed when at least one root is configured.
+    pub attachment_config: AttachmentConfig,
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -44,6 +51,18 @@ pub struct SidecarNode {
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     cipher: Option<StoreCipher>,
+    /// PRD-006 attachment configuration. Carried through so handlers can
+    /// short-circuit to `Unimplemented` when no `--attachment-root` is
+    /// configured.
+    attachment_config: AttachmentConfig,
+    /// PRD-006 bundle handle table. Always present even when attachments
+    /// are disabled (cheap empty registry) so the service layer can hold
+    /// an unconditional reference.
+    bundle_registry: Arc<BundleRegistry>,
+    /// PRD-006 distribution substrate. `Some` iff
+    /// `attachment_config.has_roots()` — built from the backend's blob
+    /// store + Automerge store, paralleling the rest of the bootstrap.
+    file_distribution: Option<Arc<IrohFileDistribution>>,
 }
 
 /// Internal change event for the broadcast channel.
@@ -118,13 +137,49 @@ impl SidecarNode {
             Self::sync_on_change(sync_rx, sync_coordinator).await;
         });
 
+        // PRD-006: bundle handle table is always present (the cheap empty
+        // map case when attachments are disabled); FileDistribution is
+        // built only when --attachment-root is configured.
+        let bundle_registry = Arc::new(BundleRegistry::new(RegistryConfig {
+            handle_retention_secs: config.attachment_config.handle_retention_secs,
+            max_known_bundles: config.attachment_config.max_known_bundles,
+        }));
+        let file_distribution = if config.attachment_config.has_roots() {
+            Some(Arc::new(IrohFileDistribution::new(
+                Arc::clone(backend.blob_store()),
+                Arc::clone(backend.store()),
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             node_id: config.node_id,
             backend,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             cipher,
+            attachment_config: config.attachment_config,
+            bundle_registry,
+            file_distribution,
         })
+    }
+
+    /// PRD-006 attachment config — used by handlers to decide whether to
+    /// short-circuit to `Unimplemented`.
+    pub fn attachment_config(&self) -> &AttachmentConfig {
+        &self.attachment_config
+    }
+
+    /// PRD-006 bundle handle table.
+    pub fn bundle_registry(&self) -> &Arc<BundleRegistry> {
+        &self.bundle_registry
+    }
+
+    /// PRD-006 distribution substrate. `None` when attachments are
+    /// disabled (no `--attachment-root` configured).
+    pub fn file_distribution(&self) -> Option<&Arc<IrohFileDistribution>> {
+        self.file_distribution.as_ref()
     }
 
     /// React to local document changes by syncing them with all connected peers.

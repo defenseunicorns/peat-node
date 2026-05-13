@@ -232,8 +232,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the attachment configuration. Canonicalises every --attachment-root
     // and fails fast on bad inputs (missing dir, duplicate name, malformed name).
-    // Not yet plumbed into SidecarConfig — that wiring lands in a follow-up
-    // step alongside FileDistribution construction.
     let attachment_config = AttachmentConfig::from_raw(
         &args.attachment_root,
         args.attachment_max_file_bytes,
@@ -261,9 +259,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("attachment distribution disabled — no --attachment-root configured");
     }
-    // TODO: pass attachment_config into SidecarConfig once node.rs grows the
-    // FileDistribution + handlers in the follow-up steps.
-    let _ = attachment_config;
 
     // Bootstrap the mesh node
     let config = SidecarConfig {
@@ -274,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
+        attachment_config,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);

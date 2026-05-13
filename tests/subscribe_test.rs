@@ -19,6 +19,7 @@ async fn fresh_node() -> SidecarNode {
         peers: vec![],
         encryption_key: None,
         iroh_udp_port: None,
+        attachment_config: Default::default(),
     })
     .await
     .expect("boot node")

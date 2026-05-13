@@ -28,6 +28,7 @@ async fn boot(grpc_port: u16, iroh_port: u16) -> (reqwest::Client, String) {
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: Some(iroh_port),
+            attachment_config: Default::default(),
         })
         .await
         .unwrap(),
