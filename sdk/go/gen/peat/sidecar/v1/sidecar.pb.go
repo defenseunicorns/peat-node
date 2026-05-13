@@ -2626,6 +2626,420 @@ func (x *GetSyncStatsResponse) GetBytesReceived() uint64 {
 	return 0
 }
 
+// PublishDeploymentRequest registers a local Zarf package with this node's blob
+// store and creates a deployment_requests CRDT doc addressed to target_agent_id.
+type PublishDeploymentRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	PackagePath    string                 `protobuf:"bytes,1,opt,name=package_path,json=packagePath,proto3" json:"package_path,omitempty"`
+	TargetAgentId  string                 `protobuf:"bytes,2,opt,name=target_agent_id,json=targetAgentId,proto3" json:"target_agent_id,omitempty"`
+	ZarfVars       map[string]string      `protobuf:"bytes,3,rep,name=zarf_vars,json=zarfVars,proto3" json:"zarf_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	PackageVersion string                 `protobuf:"bytes,4,opt,name=package_version,json=packageVersion,proto3" json:"package_version,omitempty"`
+	Architecture   string                 `protobuf:"bytes,5,opt,name=architecture,proto3" json:"architecture,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PublishDeploymentRequest) Reset() {
+	*x = PublishDeploymentRequest{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishDeploymentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishDeploymentRequest) ProtoMessage() {}
+
+func (x *PublishDeploymentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishDeploymentRequest.ProtoReflect.Descriptor instead.
+func (*PublishDeploymentRequest) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *PublishDeploymentRequest) GetPackagePath() string {
+	if x != nil {
+		return x.PackagePath
+	}
+	return ""
+}
+
+func (x *PublishDeploymentRequest) GetTargetAgentId() string {
+	if x != nil {
+		return x.TargetAgentId
+	}
+	return ""
+}
+
+func (x *PublishDeploymentRequest) GetZarfVars() map[string]string {
+	if x != nil {
+		return x.ZarfVars
+	}
+	return nil
+}
+
+func (x *PublishDeploymentRequest) GetPackageVersion() string {
+	if x != nil {
+		return x.PackageVersion
+	}
+	return ""
+}
+
+func (x *PublishDeploymentRequest) GetArchitecture() string {
+	if x != nil {
+		return x.Architecture
+	}
+	return ""
+}
+
+type PublishDeploymentResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PublishDeploymentResponse) Reset() {
+	*x = PublishDeploymentResponse{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PublishDeploymentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PublishDeploymentResponse) ProtoMessage() {}
+
+func (x *PublishDeploymentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PublishDeploymentResponse.ProtoReflect.Descriptor instead.
+func (*PublishDeploymentResponse) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *PublishDeploymentResponse) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+type GetDeploymentRequestsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetDeploymentRequestsRequest) Reset() {
+	*x = GetDeploymentRequestsRequest{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetDeploymentRequestsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetDeploymentRequestsRequest) ProtoMessage() {}
+
+func (x *GetDeploymentRequestsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetDeploymentRequestsRequest.ProtoReflect.Descriptor instead.
+func (*GetDeploymentRequestsRequest) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{47}
+}
+
+type DeploymentRequestDoc struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Id               string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	TargetAgentId    string                 `protobuf:"bytes,2,opt,name=target_agent_id,json=targetAgentId,proto3" json:"target_agent_id,omitempty"`
+	PackageName      string                 `protobuf:"bytes,3,opt,name=package_name,json=packageName,proto3" json:"package_name,omitempty"`
+	PackageVersion   string                 `protobuf:"bytes,4,opt,name=package_version,json=packageVersion,proto3" json:"package_version,omitempty"`
+	Architecture     string                 `protobuf:"bytes,5,opt,name=architecture,proto3" json:"architecture,omitempty"`
+	IrohBlobHash     string                 `protobuf:"bytes,6,opt,name=iroh_blob_hash,json=irohBlobHash,proto3" json:"iroh_blob_hash,omitempty"`
+	SenderEndpointId string                 `protobuf:"bytes,7,opt,name=sender_endpoint_id,json=senderEndpointId,proto3" json:"sender_endpoint_id,omitempty"`
+	BlobTicket       string                 `protobuf:"bytes,8,opt,name=blob_ticket,json=blobTicket,proto3" json:"blob_ticket,omitempty"`
+	ZarfVars         map[string]string      `protobuf:"bytes,9,rep,name=zarf_vars,json=zarfVars,proto3" json:"zarf_vars,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	SenderStatus     string                 `protobuf:"bytes,10,opt,name=sender_status,json=senderStatus,proto3" json:"sender_status,omitempty"`
+	ReceiverStatus   string                 `protobuf:"bytes,11,opt,name=receiver_status,json=receiverStatus,proto3" json:"receiver_status,omitempty"`
+	CreatedAt        int64                  `protobuf:"varint,12,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *DeploymentRequestDoc) Reset() {
+	*x = DeploymentRequestDoc{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeploymentRequestDoc) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeploymentRequestDoc) ProtoMessage() {}
+
+func (x *DeploymentRequestDoc) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeploymentRequestDoc.ProtoReflect.Descriptor instead.
+func (*DeploymentRequestDoc) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{48}
+}
+
+func (x *DeploymentRequestDoc) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetTargetAgentId() string {
+	if x != nil {
+		return x.TargetAgentId
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetPackageName() string {
+	if x != nil {
+		return x.PackageName
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetPackageVersion() string {
+	if x != nil {
+		return x.PackageVersion
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetArchitecture() string {
+	if x != nil {
+		return x.Architecture
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetIrohBlobHash() string {
+	if x != nil {
+		return x.IrohBlobHash
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetSenderEndpointId() string {
+	if x != nil {
+		return x.SenderEndpointId
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetBlobTicket() string {
+	if x != nil {
+		return x.BlobTicket
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetZarfVars() map[string]string {
+	if x != nil {
+		return x.ZarfVars
+	}
+	return nil
+}
+
+func (x *DeploymentRequestDoc) GetSenderStatus() string {
+	if x != nil {
+		return x.SenderStatus
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetReceiverStatus() string {
+	if x != nil {
+		return x.ReceiverStatus
+	}
+	return ""
+}
+
+func (x *DeploymentRequestDoc) GetCreatedAt() int64 {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return 0
+}
+
+type GetDeploymentRequestsResponse struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Requests      []*DeploymentRequestDoc `protobuf:"bytes,1,rep,name=requests,proto3" json:"requests,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetDeploymentRequestsResponse) Reset() {
+	*x = GetDeploymentRequestsResponse{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[49]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetDeploymentRequestsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetDeploymentRequestsResponse) ProtoMessage() {}
+
+func (x *GetDeploymentRequestsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[49]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetDeploymentRequestsResponse.ProtoReflect.Descriptor instead.
+func (*GetDeploymentRequestsResponse) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{49}
+}
+
+func (x *GetDeploymentRequestsResponse) GetRequests() []*DeploymentRequestDoc {
+	if x != nil {
+		return x.Requests
+	}
+	return nil
+}
+
+type ResetDeploymentRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResetDeploymentRequest) Reset() {
+	*x = ResetDeploymentRequest{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[50]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetDeploymentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetDeploymentRequest) ProtoMessage() {}
+
+func (x *ResetDeploymentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[50]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetDeploymentRequest.ProtoReflect.Descriptor instead.
+func (*ResetDeploymentRequest) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{50}
+}
+
+func (x *ResetDeploymentRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+type ResetDeploymentResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResetDeploymentResponse) Reset() {
+	*x = ResetDeploymentResponse{}
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[51]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetDeploymentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetDeploymentResponse) ProtoMessage() {}
+
+func (x *ResetDeploymentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_peat_sidecar_v1_sidecar_proto_msgTypes[51]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetDeploymentResponse.ProtoReflect.Descriptor instead.
+func (*ResetDeploymentResponse) Descriptor() ([]byte, []int) {
+	return file_peat_sidecar_v1_sidecar_proto_rawDescGZIP(), []int{51}
+}
+
 var File_peat_sidecar_v1_sidecar_proto protoreflect.FileDescriptor
 
 const file_peat_sidecar_v1_sidecar_proto_rawDesc = "" +
@@ -2799,7 +3213,45 @@ const file_peat_sidecar_v1_sidecar_proto_rawDesc = "" +
 	"\x0fconnected_peers\x18\x02 \x01(\rR\x0econnectedPeers\x12\x1d\n" +
 	"\n" +
 	"bytes_sent\x18\x03 \x01(\x04R\tbytesSent\x12%\n" +
-	"\x0ebytes_received\x18\x04 \x01(\x04R\rbytesReceived*\x90\x01\n" +
+	"\x0ebytes_received\x18\x04 \x01(\x04R\rbytesReceived\"\xc5\x02\n" +
+	"\x18PublishDeploymentRequest\x12!\n" +
+	"\fpackage_path\x18\x01 \x01(\tR\vpackagePath\x12&\n" +
+	"\x0ftarget_agent_id\x18\x02 \x01(\tR\rtargetAgentId\x12T\n" +
+	"\tzarf_vars\x18\x03 \x03(\v27.peat.sidecar.v1.PublishDeploymentRequest.ZarfVarsEntryR\bzarfVars\x12'\n" +
+	"\x0fpackage_version\x18\x04 \x01(\tR\x0epackageVersion\x12\"\n" +
+	"\farchitecture\x18\x05 \x01(\tR\farchitecture\x1a;\n" +
+	"\rZarfVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\":\n" +
+	"\x19PublishDeploymentResponse\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\"\x1e\n" +
+	"\x1cGetDeploymentRequestsRequest\"\xaf\x04\n" +
+	"\x14DeploymentRequestDoc\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12&\n" +
+	"\x0ftarget_agent_id\x18\x02 \x01(\tR\rtargetAgentId\x12!\n" +
+	"\fpackage_name\x18\x03 \x01(\tR\vpackageName\x12'\n" +
+	"\x0fpackage_version\x18\x04 \x01(\tR\x0epackageVersion\x12\"\n" +
+	"\farchitecture\x18\x05 \x01(\tR\farchitecture\x12$\n" +
+	"\x0eiroh_blob_hash\x18\x06 \x01(\tR\firohBlobHash\x12,\n" +
+	"\x12sender_endpoint_id\x18\a \x01(\tR\x10senderEndpointId\x12\x1f\n" +
+	"\vblob_ticket\x18\b \x01(\tR\n" +
+	"blobTicket\x12P\n" +
+	"\tzarf_vars\x18\t \x03(\v23.peat.sidecar.v1.DeploymentRequestDoc.ZarfVarsEntryR\bzarfVars\x12#\n" +
+	"\rsender_status\x18\n" +
+	" \x01(\tR\fsenderStatus\x12'\n" +
+	"\x0freceiver_status\x18\v \x01(\tR\x0ereceiverStatus\x12\x1d\n" +
+	"\n" +
+	"created_at\x18\f \x01(\x03R\tcreatedAt\x1a;\n" +
+	"\rZarfVarsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"b\n" +
+	"\x1dGetDeploymentRequestsResponse\x12A\n" +
+	"\brequests\x18\x01 \x03(\v2%.peat.sidecar.v1.DeploymentRequestDocR\brequests\"7\n" +
+	"\x16ResetDeploymentRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\"\x19\n" +
+	"\x17ResetDeploymentResponse*\x90\x01\n" +
 	"\tNodePhase\x12\x1a\n" +
 	"\x16NODE_PHASE_UNSPECIFIED\x10\x00\x12\x1b\n" +
 	"\x17NODE_PHASE_INITIALIZING\x10\x01\x12\x14\n" +
@@ -2836,7 +3288,7 @@ const file_peat_sidecar_v1_sidecar_proto_rawDesc = "" +
 	"ChangeType\x12\x1b\n" +
 	"\x17CHANGE_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12CHANGE_TYPE_UPSERT\x10\x01\x12\x16\n" +
-	"\x12CHANGE_TYPE_DELETE\x10\x022\xea\r\n" +
+	"\x12CHANGE_TYPE_DELETE\x10\x022\xb4\x10\n" +
 	"\vPeatSidecar\x12R\n" +
 	"\tGetStatus\x12!.peat.sidecar.v1.GetStatusRequest\x1a\".peat.sidecar.v1.GetStatusResponse\x12X\n" +
 	"\vConnectPeer\x12#.peat.sidecar.v1.ConnectPeerRequest\x1a$.peat.sidecar.v1.ConnectPeerResponse\x12a\n" +
@@ -2854,7 +3306,10 @@ const file_peat_sidecar_v1_sidecar_proto_rawDesc = "" +
 	"\tGetTracks\x12!.peat.sidecar.v1.GetTracksRequest\x1a\".peat.sidecar.v1.GetTracksResponse\x12U\n" +
 	"\n" +
 	"PutCommand\x12\".peat.sidecar.v1.PutCommandRequest\x1a#.peat.sidecar.v1.PutCommandResponse\x12X\n" +
-	"\vGetCommands\x12#.peat.sidecar.v1.GetCommandsRequest\x1a$.peat.sidecar.v1.GetCommandsResponse\x12Q\n" +
+	"\vGetCommands\x12#.peat.sidecar.v1.GetCommandsRequest\x1a$.peat.sidecar.v1.GetCommandsResponse\x12j\n" +
+	"\x11PublishDeployment\x12).peat.sidecar.v1.PublishDeploymentRequest\x1a*.peat.sidecar.v1.PublishDeploymentResponse\x12v\n" +
+	"\x15GetDeploymentRequests\x12-.peat.sidecar.v1.GetDeploymentRequestsRequest\x1a..peat.sidecar.v1.GetDeploymentRequestsResponse\x12d\n" +
+	"\x0fResetDeployment\x12'.peat.sidecar.v1.ResetDeploymentRequest\x1a(.peat.sidecar.v1.ResetDeploymentResponse\x12Q\n" +
 	"\tSubscribe\x12!.peat.sidecar.v1.SubscribeRequest\x1a\x1f.peat.sidecar.v1.DocumentChange0\x01\x12R\n" +
 	"\tStartSync\x12!.peat.sidecar.v1.StartSyncRequest\x1a\".peat.sidecar.v1.StartSyncResponse\x12O\n" +
 	"\bStopSync\x12 .peat.sidecar.v1.StopSyncRequest\x1a!.peat.sidecar.v1.StopSyncResponse\x12[\n" +
@@ -2873,59 +3328,68 @@ func file_peat_sidecar_v1_sidecar_proto_rawDescGZIP() []byte {
 }
 
 var file_peat_sidecar_v1_sidecar_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_peat_sidecar_v1_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 45)
+var file_peat_sidecar_v1_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
 var file_peat_sidecar_v1_sidecar_proto_goTypes = []any{
-	(NodePhase)(0),                 // 0: peat.sidecar.v1.NodePhase
-	(PlatformStatus)(0),            // 1: peat.sidecar.v1.PlatformStatus
-	(CellStatus)(0),                // 2: peat.sidecar.v1.CellStatus
-	(TrackCategory)(0),             // 3: peat.sidecar.v1.TrackCategory
-	(CommandStatus)(0),             // 4: peat.sidecar.v1.CommandStatus
-	(ChangeType)(0),                // 5: peat.sidecar.v1.ChangeType
-	(*GetStatusRequest)(nil),       // 6: peat.sidecar.v1.GetStatusRequest
-	(*GetStatusResponse)(nil),      // 7: peat.sidecar.v1.GetStatusResponse
-	(*ConnectPeerRequest)(nil),     // 8: peat.sidecar.v1.ConnectPeerRequest
-	(*ConnectPeerResponse)(nil),    // 9: peat.sidecar.v1.ConnectPeerResponse
-	(*DisconnectPeerRequest)(nil),  // 10: peat.sidecar.v1.DisconnectPeerRequest
-	(*DisconnectPeerResponse)(nil), // 11: peat.sidecar.v1.DisconnectPeerResponse
-	(*ListPeersRequest)(nil),       // 12: peat.sidecar.v1.ListPeersRequest
-	(*ListPeersResponse)(nil),      // 13: peat.sidecar.v1.ListPeersResponse
-	(*PeerInfo)(nil),               // 14: peat.sidecar.v1.PeerInfo
-	(*PutDocumentRequest)(nil),     // 15: peat.sidecar.v1.PutDocumentRequest
-	(*PutDocumentResponse)(nil),    // 16: peat.sidecar.v1.PutDocumentResponse
-	(*GetDocumentRequest)(nil),     // 17: peat.sidecar.v1.GetDocumentRequest
-	(*GetDocumentResponse)(nil),    // 18: peat.sidecar.v1.GetDocumentResponse
-	(*DeleteDocumentRequest)(nil),  // 19: peat.sidecar.v1.DeleteDocumentRequest
-	(*DeleteDocumentResponse)(nil), // 20: peat.sidecar.v1.DeleteDocumentResponse
-	(*ListDocumentsRequest)(nil),   // 21: peat.sidecar.v1.ListDocumentsRequest
-	(*ListDocumentsResponse)(nil),  // 22: peat.sidecar.v1.ListDocumentsResponse
-	(*Platform)(nil),               // 23: peat.sidecar.v1.Platform
-	(*PutPlatformRequest)(nil),     // 24: peat.sidecar.v1.PutPlatformRequest
-	(*PutPlatformResponse)(nil),    // 25: peat.sidecar.v1.PutPlatformResponse
-	(*GetPlatformsRequest)(nil),    // 26: peat.sidecar.v1.GetPlatformsRequest
-	(*GetPlatformsResponse)(nil),   // 27: peat.sidecar.v1.GetPlatformsResponse
-	(*Cell)(nil),                   // 28: peat.sidecar.v1.Cell
-	(*PutCellRequest)(nil),         // 29: peat.sidecar.v1.PutCellRequest
-	(*PutCellResponse)(nil),        // 30: peat.sidecar.v1.PutCellResponse
-	(*GetCellsRequest)(nil),        // 31: peat.sidecar.v1.GetCellsRequest
-	(*GetCellsResponse)(nil),       // 32: peat.sidecar.v1.GetCellsResponse
-	(*Track)(nil),                  // 33: peat.sidecar.v1.Track
-	(*PutTrackRequest)(nil),        // 34: peat.sidecar.v1.PutTrackRequest
-	(*PutTrackResponse)(nil),       // 35: peat.sidecar.v1.PutTrackResponse
-	(*GetTracksRequest)(nil),       // 36: peat.sidecar.v1.GetTracksRequest
-	(*GetTracksResponse)(nil),      // 37: peat.sidecar.v1.GetTracksResponse
-	(*Command)(nil),                // 38: peat.sidecar.v1.Command
-	(*PutCommandRequest)(nil),      // 39: peat.sidecar.v1.PutCommandRequest
-	(*PutCommandResponse)(nil),     // 40: peat.sidecar.v1.PutCommandResponse
-	(*GetCommandsRequest)(nil),     // 41: peat.sidecar.v1.GetCommandsRequest
-	(*GetCommandsResponse)(nil),    // 42: peat.sidecar.v1.GetCommandsResponse
-	(*SubscribeRequest)(nil),       // 43: peat.sidecar.v1.SubscribeRequest
-	(*DocumentChange)(nil),         // 44: peat.sidecar.v1.DocumentChange
-	(*StartSyncRequest)(nil),       // 45: peat.sidecar.v1.StartSyncRequest
-	(*StartSyncResponse)(nil),      // 46: peat.sidecar.v1.StartSyncResponse
-	(*StopSyncRequest)(nil),        // 47: peat.sidecar.v1.StopSyncRequest
-	(*StopSyncResponse)(nil),       // 48: peat.sidecar.v1.StopSyncResponse
-	(*GetSyncStatsRequest)(nil),    // 49: peat.sidecar.v1.GetSyncStatsRequest
-	(*GetSyncStatsResponse)(nil),   // 50: peat.sidecar.v1.GetSyncStatsResponse
+	(NodePhase)(0),                        // 0: peat.sidecar.v1.NodePhase
+	(PlatformStatus)(0),                   // 1: peat.sidecar.v1.PlatformStatus
+	(CellStatus)(0),                       // 2: peat.sidecar.v1.CellStatus
+	(TrackCategory)(0),                    // 3: peat.sidecar.v1.TrackCategory
+	(CommandStatus)(0),                    // 4: peat.sidecar.v1.CommandStatus
+	(ChangeType)(0),                       // 5: peat.sidecar.v1.ChangeType
+	(*GetStatusRequest)(nil),              // 6: peat.sidecar.v1.GetStatusRequest
+	(*GetStatusResponse)(nil),             // 7: peat.sidecar.v1.GetStatusResponse
+	(*ConnectPeerRequest)(nil),            // 8: peat.sidecar.v1.ConnectPeerRequest
+	(*ConnectPeerResponse)(nil),           // 9: peat.sidecar.v1.ConnectPeerResponse
+	(*DisconnectPeerRequest)(nil),         // 10: peat.sidecar.v1.DisconnectPeerRequest
+	(*DisconnectPeerResponse)(nil),        // 11: peat.sidecar.v1.DisconnectPeerResponse
+	(*ListPeersRequest)(nil),              // 12: peat.sidecar.v1.ListPeersRequest
+	(*ListPeersResponse)(nil),             // 13: peat.sidecar.v1.ListPeersResponse
+	(*PeerInfo)(nil),                      // 14: peat.sidecar.v1.PeerInfo
+	(*PutDocumentRequest)(nil),            // 15: peat.sidecar.v1.PutDocumentRequest
+	(*PutDocumentResponse)(nil),           // 16: peat.sidecar.v1.PutDocumentResponse
+	(*GetDocumentRequest)(nil),            // 17: peat.sidecar.v1.GetDocumentRequest
+	(*GetDocumentResponse)(nil),           // 18: peat.sidecar.v1.GetDocumentResponse
+	(*DeleteDocumentRequest)(nil),         // 19: peat.sidecar.v1.DeleteDocumentRequest
+	(*DeleteDocumentResponse)(nil),        // 20: peat.sidecar.v1.DeleteDocumentResponse
+	(*ListDocumentsRequest)(nil),          // 21: peat.sidecar.v1.ListDocumentsRequest
+	(*ListDocumentsResponse)(nil),         // 22: peat.sidecar.v1.ListDocumentsResponse
+	(*Platform)(nil),                      // 23: peat.sidecar.v1.Platform
+	(*PutPlatformRequest)(nil),            // 24: peat.sidecar.v1.PutPlatformRequest
+	(*PutPlatformResponse)(nil),           // 25: peat.sidecar.v1.PutPlatformResponse
+	(*GetPlatformsRequest)(nil),           // 26: peat.sidecar.v1.GetPlatformsRequest
+	(*GetPlatformsResponse)(nil),          // 27: peat.sidecar.v1.GetPlatformsResponse
+	(*Cell)(nil),                          // 28: peat.sidecar.v1.Cell
+	(*PutCellRequest)(nil),                // 29: peat.sidecar.v1.PutCellRequest
+	(*PutCellResponse)(nil),               // 30: peat.sidecar.v1.PutCellResponse
+	(*GetCellsRequest)(nil),               // 31: peat.sidecar.v1.GetCellsRequest
+	(*GetCellsResponse)(nil),              // 32: peat.sidecar.v1.GetCellsResponse
+	(*Track)(nil),                         // 33: peat.sidecar.v1.Track
+	(*PutTrackRequest)(nil),               // 34: peat.sidecar.v1.PutTrackRequest
+	(*PutTrackResponse)(nil),              // 35: peat.sidecar.v1.PutTrackResponse
+	(*GetTracksRequest)(nil),              // 36: peat.sidecar.v1.GetTracksRequest
+	(*GetTracksResponse)(nil),             // 37: peat.sidecar.v1.GetTracksResponse
+	(*Command)(nil),                       // 38: peat.sidecar.v1.Command
+	(*PutCommandRequest)(nil),             // 39: peat.sidecar.v1.PutCommandRequest
+	(*PutCommandResponse)(nil),            // 40: peat.sidecar.v1.PutCommandResponse
+	(*GetCommandsRequest)(nil),            // 41: peat.sidecar.v1.GetCommandsRequest
+	(*GetCommandsResponse)(nil),           // 42: peat.sidecar.v1.GetCommandsResponse
+	(*SubscribeRequest)(nil),              // 43: peat.sidecar.v1.SubscribeRequest
+	(*DocumentChange)(nil),                // 44: peat.sidecar.v1.DocumentChange
+	(*StartSyncRequest)(nil),              // 45: peat.sidecar.v1.StartSyncRequest
+	(*StartSyncResponse)(nil),             // 46: peat.sidecar.v1.StartSyncResponse
+	(*StopSyncRequest)(nil),               // 47: peat.sidecar.v1.StopSyncRequest
+	(*StopSyncResponse)(nil),              // 48: peat.sidecar.v1.StopSyncResponse
+	(*GetSyncStatsRequest)(nil),           // 49: peat.sidecar.v1.GetSyncStatsRequest
+	(*GetSyncStatsResponse)(nil),          // 50: peat.sidecar.v1.GetSyncStatsResponse
+	(*PublishDeploymentRequest)(nil),      // 51: peat.sidecar.v1.PublishDeploymentRequest
+	(*PublishDeploymentResponse)(nil),     // 52: peat.sidecar.v1.PublishDeploymentResponse
+	(*GetDeploymentRequestsRequest)(nil),  // 53: peat.sidecar.v1.GetDeploymentRequestsRequest
+	(*DeploymentRequestDoc)(nil),          // 54: peat.sidecar.v1.DeploymentRequestDoc
+	(*GetDeploymentRequestsResponse)(nil), // 55: peat.sidecar.v1.GetDeploymentRequestsResponse
+	(*ResetDeploymentRequest)(nil),        // 56: peat.sidecar.v1.ResetDeploymentRequest
+	(*ResetDeploymentResponse)(nil),       // 57: peat.sidecar.v1.ResetDeploymentResponse
+	nil,                                   // 58: peat.sidecar.v1.PublishDeploymentRequest.ZarfVarsEntry
+	nil,                                   // 59: peat.sidecar.v1.DeploymentRequestDoc.ZarfVarsEntry
 }
 var file_peat_sidecar_v1_sidecar_proto_depIdxs = []int32{
 	0,  // 0: peat.sidecar.v1.GetStatusResponse.phase:type_name -> peat.sidecar.v1.NodePhase
@@ -2943,51 +3407,60 @@ var file_peat_sidecar_v1_sidecar_proto_depIdxs = []int32{
 	38, // 12: peat.sidecar.v1.PutCommandRequest.command:type_name -> peat.sidecar.v1.Command
 	38, // 13: peat.sidecar.v1.GetCommandsResponse.commands:type_name -> peat.sidecar.v1.Command
 	5,  // 14: peat.sidecar.v1.DocumentChange.change_type:type_name -> peat.sidecar.v1.ChangeType
-	6,  // 15: peat.sidecar.v1.PeatSidecar.GetStatus:input_type -> peat.sidecar.v1.GetStatusRequest
-	8,  // 16: peat.sidecar.v1.PeatSidecar.ConnectPeer:input_type -> peat.sidecar.v1.ConnectPeerRequest
-	10, // 17: peat.sidecar.v1.PeatSidecar.DisconnectPeer:input_type -> peat.sidecar.v1.DisconnectPeerRequest
-	12, // 18: peat.sidecar.v1.PeatSidecar.ListPeers:input_type -> peat.sidecar.v1.ListPeersRequest
-	15, // 19: peat.sidecar.v1.PeatSidecar.PutDocument:input_type -> peat.sidecar.v1.PutDocumentRequest
-	17, // 20: peat.sidecar.v1.PeatSidecar.GetDocument:input_type -> peat.sidecar.v1.GetDocumentRequest
-	19, // 21: peat.sidecar.v1.PeatSidecar.DeleteDocument:input_type -> peat.sidecar.v1.DeleteDocumentRequest
-	21, // 22: peat.sidecar.v1.PeatSidecar.ListDocuments:input_type -> peat.sidecar.v1.ListDocumentsRequest
-	24, // 23: peat.sidecar.v1.PeatSidecar.PutPlatform:input_type -> peat.sidecar.v1.PutPlatformRequest
-	26, // 24: peat.sidecar.v1.PeatSidecar.GetPlatforms:input_type -> peat.sidecar.v1.GetPlatformsRequest
-	29, // 25: peat.sidecar.v1.PeatSidecar.PutCell:input_type -> peat.sidecar.v1.PutCellRequest
-	31, // 26: peat.sidecar.v1.PeatSidecar.GetCells:input_type -> peat.sidecar.v1.GetCellsRequest
-	34, // 27: peat.sidecar.v1.PeatSidecar.PutTrack:input_type -> peat.sidecar.v1.PutTrackRequest
-	36, // 28: peat.sidecar.v1.PeatSidecar.GetTracks:input_type -> peat.sidecar.v1.GetTracksRequest
-	39, // 29: peat.sidecar.v1.PeatSidecar.PutCommand:input_type -> peat.sidecar.v1.PutCommandRequest
-	41, // 30: peat.sidecar.v1.PeatSidecar.GetCommands:input_type -> peat.sidecar.v1.GetCommandsRequest
-	43, // 31: peat.sidecar.v1.PeatSidecar.Subscribe:input_type -> peat.sidecar.v1.SubscribeRequest
-	45, // 32: peat.sidecar.v1.PeatSidecar.StartSync:input_type -> peat.sidecar.v1.StartSyncRequest
-	47, // 33: peat.sidecar.v1.PeatSidecar.StopSync:input_type -> peat.sidecar.v1.StopSyncRequest
-	49, // 34: peat.sidecar.v1.PeatSidecar.GetSyncStats:input_type -> peat.sidecar.v1.GetSyncStatsRequest
-	7,  // 35: peat.sidecar.v1.PeatSidecar.GetStatus:output_type -> peat.sidecar.v1.GetStatusResponse
-	9,  // 36: peat.sidecar.v1.PeatSidecar.ConnectPeer:output_type -> peat.sidecar.v1.ConnectPeerResponse
-	11, // 37: peat.sidecar.v1.PeatSidecar.DisconnectPeer:output_type -> peat.sidecar.v1.DisconnectPeerResponse
-	13, // 38: peat.sidecar.v1.PeatSidecar.ListPeers:output_type -> peat.sidecar.v1.ListPeersResponse
-	16, // 39: peat.sidecar.v1.PeatSidecar.PutDocument:output_type -> peat.sidecar.v1.PutDocumentResponse
-	18, // 40: peat.sidecar.v1.PeatSidecar.GetDocument:output_type -> peat.sidecar.v1.GetDocumentResponse
-	20, // 41: peat.sidecar.v1.PeatSidecar.DeleteDocument:output_type -> peat.sidecar.v1.DeleteDocumentResponse
-	22, // 42: peat.sidecar.v1.PeatSidecar.ListDocuments:output_type -> peat.sidecar.v1.ListDocumentsResponse
-	25, // 43: peat.sidecar.v1.PeatSidecar.PutPlatform:output_type -> peat.sidecar.v1.PutPlatformResponse
-	27, // 44: peat.sidecar.v1.PeatSidecar.GetPlatforms:output_type -> peat.sidecar.v1.GetPlatformsResponse
-	30, // 45: peat.sidecar.v1.PeatSidecar.PutCell:output_type -> peat.sidecar.v1.PutCellResponse
-	32, // 46: peat.sidecar.v1.PeatSidecar.GetCells:output_type -> peat.sidecar.v1.GetCellsResponse
-	35, // 47: peat.sidecar.v1.PeatSidecar.PutTrack:output_type -> peat.sidecar.v1.PutTrackResponse
-	37, // 48: peat.sidecar.v1.PeatSidecar.GetTracks:output_type -> peat.sidecar.v1.GetTracksResponse
-	40, // 49: peat.sidecar.v1.PeatSidecar.PutCommand:output_type -> peat.sidecar.v1.PutCommandResponse
-	42, // 50: peat.sidecar.v1.PeatSidecar.GetCommands:output_type -> peat.sidecar.v1.GetCommandsResponse
-	44, // 51: peat.sidecar.v1.PeatSidecar.Subscribe:output_type -> peat.sidecar.v1.DocumentChange
-	46, // 52: peat.sidecar.v1.PeatSidecar.StartSync:output_type -> peat.sidecar.v1.StartSyncResponse
-	48, // 53: peat.sidecar.v1.PeatSidecar.StopSync:output_type -> peat.sidecar.v1.StopSyncResponse
-	50, // 54: peat.sidecar.v1.PeatSidecar.GetSyncStats:output_type -> peat.sidecar.v1.GetSyncStatsResponse
-	35, // [35:55] is the sub-list for method output_type
-	15, // [15:35] is the sub-list for method input_type
-	15, // [15:15] is the sub-list for extension type_name
-	15, // [15:15] is the sub-list for extension extendee
-	0,  // [0:15] is the sub-list for field type_name
+	58, // 15: peat.sidecar.v1.PublishDeploymentRequest.zarf_vars:type_name -> peat.sidecar.v1.PublishDeploymentRequest.ZarfVarsEntry
+	59, // 16: peat.sidecar.v1.DeploymentRequestDoc.zarf_vars:type_name -> peat.sidecar.v1.DeploymentRequestDoc.ZarfVarsEntry
+	54, // 17: peat.sidecar.v1.GetDeploymentRequestsResponse.requests:type_name -> peat.sidecar.v1.DeploymentRequestDoc
+	6,  // 18: peat.sidecar.v1.PeatSidecar.GetStatus:input_type -> peat.sidecar.v1.GetStatusRequest
+	8,  // 19: peat.sidecar.v1.PeatSidecar.ConnectPeer:input_type -> peat.sidecar.v1.ConnectPeerRequest
+	10, // 20: peat.sidecar.v1.PeatSidecar.DisconnectPeer:input_type -> peat.sidecar.v1.DisconnectPeerRequest
+	12, // 21: peat.sidecar.v1.PeatSidecar.ListPeers:input_type -> peat.sidecar.v1.ListPeersRequest
+	15, // 22: peat.sidecar.v1.PeatSidecar.PutDocument:input_type -> peat.sidecar.v1.PutDocumentRequest
+	17, // 23: peat.sidecar.v1.PeatSidecar.GetDocument:input_type -> peat.sidecar.v1.GetDocumentRequest
+	19, // 24: peat.sidecar.v1.PeatSidecar.DeleteDocument:input_type -> peat.sidecar.v1.DeleteDocumentRequest
+	21, // 25: peat.sidecar.v1.PeatSidecar.ListDocuments:input_type -> peat.sidecar.v1.ListDocumentsRequest
+	24, // 26: peat.sidecar.v1.PeatSidecar.PutPlatform:input_type -> peat.sidecar.v1.PutPlatformRequest
+	26, // 27: peat.sidecar.v1.PeatSidecar.GetPlatforms:input_type -> peat.sidecar.v1.GetPlatformsRequest
+	29, // 28: peat.sidecar.v1.PeatSidecar.PutCell:input_type -> peat.sidecar.v1.PutCellRequest
+	31, // 29: peat.sidecar.v1.PeatSidecar.GetCells:input_type -> peat.sidecar.v1.GetCellsRequest
+	34, // 30: peat.sidecar.v1.PeatSidecar.PutTrack:input_type -> peat.sidecar.v1.PutTrackRequest
+	36, // 31: peat.sidecar.v1.PeatSidecar.GetTracks:input_type -> peat.sidecar.v1.GetTracksRequest
+	39, // 32: peat.sidecar.v1.PeatSidecar.PutCommand:input_type -> peat.sidecar.v1.PutCommandRequest
+	41, // 33: peat.sidecar.v1.PeatSidecar.GetCommands:input_type -> peat.sidecar.v1.GetCommandsRequest
+	51, // 34: peat.sidecar.v1.PeatSidecar.PublishDeployment:input_type -> peat.sidecar.v1.PublishDeploymentRequest
+	53, // 35: peat.sidecar.v1.PeatSidecar.GetDeploymentRequests:input_type -> peat.sidecar.v1.GetDeploymentRequestsRequest
+	56, // 36: peat.sidecar.v1.PeatSidecar.ResetDeployment:input_type -> peat.sidecar.v1.ResetDeploymentRequest
+	43, // 37: peat.sidecar.v1.PeatSidecar.Subscribe:input_type -> peat.sidecar.v1.SubscribeRequest
+	45, // 38: peat.sidecar.v1.PeatSidecar.StartSync:input_type -> peat.sidecar.v1.StartSyncRequest
+	47, // 39: peat.sidecar.v1.PeatSidecar.StopSync:input_type -> peat.sidecar.v1.StopSyncRequest
+	49, // 40: peat.sidecar.v1.PeatSidecar.GetSyncStats:input_type -> peat.sidecar.v1.GetSyncStatsRequest
+	7,  // 41: peat.sidecar.v1.PeatSidecar.GetStatus:output_type -> peat.sidecar.v1.GetStatusResponse
+	9,  // 42: peat.sidecar.v1.PeatSidecar.ConnectPeer:output_type -> peat.sidecar.v1.ConnectPeerResponse
+	11, // 43: peat.sidecar.v1.PeatSidecar.DisconnectPeer:output_type -> peat.sidecar.v1.DisconnectPeerResponse
+	13, // 44: peat.sidecar.v1.PeatSidecar.ListPeers:output_type -> peat.sidecar.v1.ListPeersResponse
+	16, // 45: peat.sidecar.v1.PeatSidecar.PutDocument:output_type -> peat.sidecar.v1.PutDocumentResponse
+	18, // 46: peat.sidecar.v1.PeatSidecar.GetDocument:output_type -> peat.sidecar.v1.GetDocumentResponse
+	20, // 47: peat.sidecar.v1.PeatSidecar.DeleteDocument:output_type -> peat.sidecar.v1.DeleteDocumentResponse
+	22, // 48: peat.sidecar.v1.PeatSidecar.ListDocuments:output_type -> peat.sidecar.v1.ListDocumentsResponse
+	25, // 49: peat.sidecar.v1.PeatSidecar.PutPlatform:output_type -> peat.sidecar.v1.PutPlatformResponse
+	27, // 50: peat.sidecar.v1.PeatSidecar.GetPlatforms:output_type -> peat.sidecar.v1.GetPlatformsResponse
+	30, // 51: peat.sidecar.v1.PeatSidecar.PutCell:output_type -> peat.sidecar.v1.PutCellResponse
+	32, // 52: peat.sidecar.v1.PeatSidecar.GetCells:output_type -> peat.sidecar.v1.GetCellsResponse
+	35, // 53: peat.sidecar.v1.PeatSidecar.PutTrack:output_type -> peat.sidecar.v1.PutTrackResponse
+	37, // 54: peat.sidecar.v1.PeatSidecar.GetTracks:output_type -> peat.sidecar.v1.GetTracksResponse
+	40, // 55: peat.sidecar.v1.PeatSidecar.PutCommand:output_type -> peat.sidecar.v1.PutCommandResponse
+	42, // 56: peat.sidecar.v1.PeatSidecar.GetCommands:output_type -> peat.sidecar.v1.GetCommandsResponse
+	52, // 57: peat.sidecar.v1.PeatSidecar.PublishDeployment:output_type -> peat.sidecar.v1.PublishDeploymentResponse
+	55, // 58: peat.sidecar.v1.PeatSidecar.GetDeploymentRequests:output_type -> peat.sidecar.v1.GetDeploymentRequestsResponse
+	57, // 59: peat.sidecar.v1.PeatSidecar.ResetDeployment:output_type -> peat.sidecar.v1.ResetDeploymentResponse
+	44, // 60: peat.sidecar.v1.PeatSidecar.Subscribe:output_type -> peat.sidecar.v1.DocumentChange
+	46, // 61: peat.sidecar.v1.PeatSidecar.StartSync:output_type -> peat.sidecar.v1.StartSyncResponse
+	48, // 62: peat.sidecar.v1.PeatSidecar.StopSync:output_type -> peat.sidecar.v1.StopSyncResponse
+	50, // 63: peat.sidecar.v1.PeatSidecar.GetSyncStats:output_type -> peat.sidecar.v1.GetSyncStatsResponse
+	41, // [41:64] is the sub-list for method output_type
+	18, // [18:41] is the sub-list for method input_type
+	18, // [18:18] is the sub-list for extension type_name
+	18, // [18:18] is the sub-list for extension extendee
+	0,  // [0:18] is the sub-list for field type_name
 }
 
 func init() { file_peat_sidecar_v1_sidecar_proto_init() }
@@ -3006,7 +3479,7 @@ func file_peat_sidecar_v1_sidecar_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_peat_sidecar_v1_sidecar_proto_rawDesc), len(file_peat_sidecar_v1_sidecar_proto_rawDesc)),
 			NumEnums:      6,
-			NumMessages:   45,
+			NumMessages:   54,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

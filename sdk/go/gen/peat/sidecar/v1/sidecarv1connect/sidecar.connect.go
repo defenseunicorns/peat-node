@@ -75,6 +75,15 @@ const (
 	PeatSidecarPutCommandProcedure = "/peat.sidecar.v1.PeatSidecar/PutCommand"
 	// PeatSidecarGetCommandsProcedure is the fully-qualified name of the PeatSidecar's GetCommands RPC.
 	PeatSidecarGetCommandsProcedure = "/peat.sidecar.v1.PeatSidecar/GetCommands"
+	// PeatSidecarPublishDeploymentProcedure is the fully-qualified name of the PeatSidecar's
+	// PublishDeployment RPC.
+	PeatSidecarPublishDeploymentProcedure = "/peat.sidecar.v1.PeatSidecar/PublishDeployment"
+	// PeatSidecarGetDeploymentRequestsProcedure is the fully-qualified name of the PeatSidecar's
+	// GetDeploymentRequests RPC.
+	PeatSidecarGetDeploymentRequestsProcedure = "/peat.sidecar.v1.PeatSidecar/GetDeploymentRequests"
+	// PeatSidecarResetDeploymentProcedure is the fully-qualified name of the PeatSidecar's
+	// ResetDeployment RPC.
+	PeatSidecarResetDeploymentProcedure = "/peat.sidecar.v1.PeatSidecar/ResetDeployment"
 	// PeatSidecarSubscribeProcedure is the fully-qualified name of the PeatSidecar's Subscribe RPC.
 	PeatSidecarSubscribeProcedure = "/peat.sidecar.v1.PeatSidecar/Subscribe"
 	// PeatSidecarStartSyncProcedure is the fully-qualified name of the PeatSidecar's StartSync RPC.
@@ -112,6 +121,16 @@ type PeatSidecarClient interface {
 	GetTracks(context.Context, *connect.Request[v1.GetTracksRequest]) (*connect.Response[v1.GetTracksResponse], error)
 	PutCommand(context.Context, *connect.Request[v1.PutCommandRequest]) (*connect.Response[v1.PutCommandResponse], error)
 	GetCommands(context.Context, *connect.Request[v1.GetCommandsRequest]) (*connect.Response[v1.GetCommandsResponse], error)
+	// PublishDeployment registers a local Zarf package with the blob store and
+	// writes a deployment_requests CRDT doc. Returns the request_id (UUID).
+	PublishDeployment(context.Context, *connect.Request[v1.PublishDeploymentRequest]) (*connect.Response[v1.PublishDeploymentResponse], error)
+	// GetDeploymentRequests returns all deployment request docs known to this node
+	// (both sent from this node and received from peers).
+	GetDeploymentRequests(context.Context, *connect.Request[v1.GetDeploymentRequestsRequest]) (*connect.Response[v1.GetDeploymentRequestsResponse], error)
+	// ResetDeployment resets a stuck deployment's receiver_status to "pending" so
+	// the deployer picks it up on the next poll cycle (CRDT-04). Callable from
+	// any current status — the operator knows what they are doing when they invoke this.
+	ResetDeployment(context.Context, *connect.Request[v1.ResetDeploymentRequest]) (*connect.Response[v1.ResetDeploymentResponse], error)
 	// Subscribe streams document changes across all or filtered collections.
 	Subscribe(context.Context, *connect.Request[v1.SubscribeRequest]) (*connect.ServerStreamForClient[v1.DocumentChange], error)
 	// StartSync begins CRDT synchronization with connected peers.
@@ -229,6 +248,24 @@ func NewPeatSidecarClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			connect.WithSchema(peatSidecarMethods.ByName("GetCommands")),
 			connect.WithClientOptions(opts...),
 		),
+		publishDeployment: connect.NewClient[v1.PublishDeploymentRequest, v1.PublishDeploymentResponse](
+			httpClient,
+			baseURL+PeatSidecarPublishDeploymentProcedure,
+			connect.WithSchema(peatSidecarMethods.ByName("PublishDeployment")),
+			connect.WithClientOptions(opts...),
+		),
+		getDeploymentRequests: connect.NewClient[v1.GetDeploymentRequestsRequest, v1.GetDeploymentRequestsResponse](
+			httpClient,
+			baseURL+PeatSidecarGetDeploymentRequestsProcedure,
+			connect.WithSchema(peatSidecarMethods.ByName("GetDeploymentRequests")),
+			connect.WithClientOptions(opts...),
+		),
+		resetDeployment: connect.NewClient[v1.ResetDeploymentRequest, v1.ResetDeploymentResponse](
+			httpClient,
+			baseURL+PeatSidecarResetDeploymentProcedure,
+			connect.WithSchema(peatSidecarMethods.ByName("ResetDeployment")),
+			connect.WithClientOptions(opts...),
+		),
 		subscribe: connect.NewClient[v1.SubscribeRequest, v1.DocumentChange](
 			httpClient,
 			baseURL+PeatSidecarSubscribeProcedure,
@@ -258,26 +295,29 @@ func NewPeatSidecarClient(httpClient connect.HTTPClient, baseURL string, opts ..
 
 // peatSidecarClient implements PeatSidecarClient.
 type peatSidecarClient struct {
-	getStatus      *connect.Client[v1.GetStatusRequest, v1.GetStatusResponse]
-	connectPeer    *connect.Client[v1.ConnectPeerRequest, v1.ConnectPeerResponse]
-	disconnectPeer *connect.Client[v1.DisconnectPeerRequest, v1.DisconnectPeerResponse]
-	listPeers      *connect.Client[v1.ListPeersRequest, v1.ListPeersResponse]
-	putDocument    *connect.Client[v1.PutDocumentRequest, v1.PutDocumentResponse]
-	getDocument    *connect.Client[v1.GetDocumentRequest, v1.GetDocumentResponse]
-	deleteDocument *connect.Client[v1.DeleteDocumentRequest, v1.DeleteDocumentResponse]
-	listDocuments  *connect.Client[v1.ListDocumentsRequest, v1.ListDocumentsResponse]
-	putPlatform    *connect.Client[v1.PutPlatformRequest, v1.PutPlatformResponse]
-	getPlatforms   *connect.Client[v1.GetPlatformsRequest, v1.GetPlatformsResponse]
-	putCell        *connect.Client[v1.PutCellRequest, v1.PutCellResponse]
-	getCells       *connect.Client[v1.GetCellsRequest, v1.GetCellsResponse]
-	putTrack       *connect.Client[v1.PutTrackRequest, v1.PutTrackResponse]
-	getTracks      *connect.Client[v1.GetTracksRequest, v1.GetTracksResponse]
-	putCommand     *connect.Client[v1.PutCommandRequest, v1.PutCommandResponse]
-	getCommands    *connect.Client[v1.GetCommandsRequest, v1.GetCommandsResponse]
-	subscribe      *connect.Client[v1.SubscribeRequest, v1.DocumentChange]
-	startSync      *connect.Client[v1.StartSyncRequest, v1.StartSyncResponse]
-	stopSync       *connect.Client[v1.StopSyncRequest, v1.StopSyncResponse]
-	getSyncStats   *connect.Client[v1.GetSyncStatsRequest, v1.GetSyncStatsResponse]
+	getStatus             *connect.Client[v1.GetStatusRequest, v1.GetStatusResponse]
+	connectPeer           *connect.Client[v1.ConnectPeerRequest, v1.ConnectPeerResponse]
+	disconnectPeer        *connect.Client[v1.DisconnectPeerRequest, v1.DisconnectPeerResponse]
+	listPeers             *connect.Client[v1.ListPeersRequest, v1.ListPeersResponse]
+	putDocument           *connect.Client[v1.PutDocumentRequest, v1.PutDocumentResponse]
+	getDocument           *connect.Client[v1.GetDocumentRequest, v1.GetDocumentResponse]
+	deleteDocument        *connect.Client[v1.DeleteDocumentRequest, v1.DeleteDocumentResponse]
+	listDocuments         *connect.Client[v1.ListDocumentsRequest, v1.ListDocumentsResponse]
+	putPlatform           *connect.Client[v1.PutPlatformRequest, v1.PutPlatformResponse]
+	getPlatforms          *connect.Client[v1.GetPlatformsRequest, v1.GetPlatformsResponse]
+	putCell               *connect.Client[v1.PutCellRequest, v1.PutCellResponse]
+	getCells              *connect.Client[v1.GetCellsRequest, v1.GetCellsResponse]
+	putTrack              *connect.Client[v1.PutTrackRequest, v1.PutTrackResponse]
+	getTracks             *connect.Client[v1.GetTracksRequest, v1.GetTracksResponse]
+	putCommand            *connect.Client[v1.PutCommandRequest, v1.PutCommandResponse]
+	getCommands           *connect.Client[v1.GetCommandsRequest, v1.GetCommandsResponse]
+	publishDeployment     *connect.Client[v1.PublishDeploymentRequest, v1.PublishDeploymentResponse]
+	getDeploymentRequests *connect.Client[v1.GetDeploymentRequestsRequest, v1.GetDeploymentRequestsResponse]
+	resetDeployment       *connect.Client[v1.ResetDeploymentRequest, v1.ResetDeploymentResponse]
+	subscribe             *connect.Client[v1.SubscribeRequest, v1.DocumentChange]
+	startSync             *connect.Client[v1.StartSyncRequest, v1.StartSyncResponse]
+	stopSync              *connect.Client[v1.StopSyncRequest, v1.StopSyncResponse]
+	getSyncStats          *connect.Client[v1.GetSyncStatsRequest, v1.GetSyncStatsResponse]
 }
 
 // GetStatus calls peat.sidecar.v1.PeatSidecar.GetStatus.
@@ -360,6 +400,21 @@ func (c *peatSidecarClient) GetCommands(ctx context.Context, req *connect.Reques
 	return c.getCommands.CallUnary(ctx, req)
 }
 
+// PublishDeployment calls peat.sidecar.v1.PeatSidecar.PublishDeployment.
+func (c *peatSidecarClient) PublishDeployment(ctx context.Context, req *connect.Request[v1.PublishDeploymentRequest]) (*connect.Response[v1.PublishDeploymentResponse], error) {
+	return c.publishDeployment.CallUnary(ctx, req)
+}
+
+// GetDeploymentRequests calls peat.sidecar.v1.PeatSidecar.GetDeploymentRequests.
+func (c *peatSidecarClient) GetDeploymentRequests(ctx context.Context, req *connect.Request[v1.GetDeploymentRequestsRequest]) (*connect.Response[v1.GetDeploymentRequestsResponse], error) {
+	return c.getDeploymentRequests.CallUnary(ctx, req)
+}
+
+// ResetDeployment calls peat.sidecar.v1.PeatSidecar.ResetDeployment.
+func (c *peatSidecarClient) ResetDeployment(ctx context.Context, req *connect.Request[v1.ResetDeploymentRequest]) (*connect.Response[v1.ResetDeploymentResponse], error) {
+	return c.resetDeployment.CallUnary(ctx, req)
+}
+
 // Subscribe calls peat.sidecar.v1.PeatSidecar.Subscribe.
 func (c *peatSidecarClient) Subscribe(ctx context.Context, req *connect.Request[v1.SubscribeRequest]) (*connect.ServerStreamForClient[v1.DocumentChange], error) {
 	return c.subscribe.CallServerStream(ctx, req)
@@ -406,6 +461,16 @@ type PeatSidecarHandler interface {
 	GetTracks(context.Context, *connect.Request[v1.GetTracksRequest]) (*connect.Response[v1.GetTracksResponse], error)
 	PutCommand(context.Context, *connect.Request[v1.PutCommandRequest]) (*connect.Response[v1.PutCommandResponse], error)
 	GetCommands(context.Context, *connect.Request[v1.GetCommandsRequest]) (*connect.Response[v1.GetCommandsResponse], error)
+	// PublishDeployment registers a local Zarf package with the blob store and
+	// writes a deployment_requests CRDT doc. Returns the request_id (UUID).
+	PublishDeployment(context.Context, *connect.Request[v1.PublishDeploymentRequest]) (*connect.Response[v1.PublishDeploymentResponse], error)
+	// GetDeploymentRequests returns all deployment request docs known to this node
+	// (both sent from this node and received from peers).
+	GetDeploymentRequests(context.Context, *connect.Request[v1.GetDeploymentRequestsRequest]) (*connect.Response[v1.GetDeploymentRequestsResponse], error)
+	// ResetDeployment resets a stuck deployment's receiver_status to "pending" so
+	// the deployer picks it up on the next poll cycle (CRDT-04). Callable from
+	// any current status — the operator knows what they are doing when they invoke this.
+	ResetDeployment(context.Context, *connect.Request[v1.ResetDeploymentRequest]) (*connect.Response[v1.ResetDeploymentResponse], error)
 	// Subscribe streams document changes across all or filtered collections.
 	Subscribe(context.Context, *connect.Request[v1.SubscribeRequest], *connect.ServerStream[v1.DocumentChange]) error
 	// StartSync begins CRDT synchronization with connected peers.
@@ -519,6 +584,24 @@ func NewPeatSidecarHandler(svc PeatSidecarHandler, opts ...connect.HandlerOption
 		connect.WithSchema(peatSidecarMethods.ByName("GetCommands")),
 		connect.WithHandlerOptions(opts...),
 	)
+	peatSidecarPublishDeploymentHandler := connect.NewUnaryHandler(
+		PeatSidecarPublishDeploymentProcedure,
+		svc.PublishDeployment,
+		connect.WithSchema(peatSidecarMethods.ByName("PublishDeployment")),
+		connect.WithHandlerOptions(opts...),
+	)
+	peatSidecarGetDeploymentRequestsHandler := connect.NewUnaryHandler(
+		PeatSidecarGetDeploymentRequestsProcedure,
+		svc.GetDeploymentRequests,
+		connect.WithSchema(peatSidecarMethods.ByName("GetDeploymentRequests")),
+		connect.WithHandlerOptions(opts...),
+	)
+	peatSidecarResetDeploymentHandler := connect.NewUnaryHandler(
+		PeatSidecarResetDeploymentProcedure,
+		svc.ResetDeployment,
+		connect.WithSchema(peatSidecarMethods.ByName("ResetDeployment")),
+		connect.WithHandlerOptions(opts...),
+	)
 	peatSidecarSubscribeHandler := connect.NewServerStreamHandler(
 		PeatSidecarSubscribeProcedure,
 		svc.Subscribe,
@@ -577,6 +660,12 @@ func NewPeatSidecarHandler(svc PeatSidecarHandler, opts ...connect.HandlerOption
 			peatSidecarPutCommandHandler.ServeHTTP(w, r)
 		case PeatSidecarGetCommandsProcedure:
 			peatSidecarGetCommandsHandler.ServeHTTP(w, r)
+		case PeatSidecarPublishDeploymentProcedure:
+			peatSidecarPublishDeploymentHandler.ServeHTTP(w, r)
+		case PeatSidecarGetDeploymentRequestsProcedure:
+			peatSidecarGetDeploymentRequestsHandler.ServeHTTP(w, r)
+		case PeatSidecarResetDeploymentProcedure:
+			peatSidecarResetDeploymentHandler.ServeHTTP(w, r)
 		case PeatSidecarSubscribeProcedure:
 			peatSidecarSubscribeHandler.ServeHTTP(w, r)
 		case PeatSidecarStartSyncProcedure:
@@ -656,6 +745,18 @@ func (UnimplementedPeatSidecarHandler) PutCommand(context.Context, *connect.Requ
 
 func (UnimplementedPeatSidecarHandler) GetCommands(context.Context, *connect.Request[v1.GetCommandsRequest]) (*connect.Response[v1.GetCommandsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("peat.sidecar.v1.PeatSidecar.GetCommands is not implemented"))
+}
+
+func (UnimplementedPeatSidecarHandler) PublishDeployment(context.Context, *connect.Request[v1.PublishDeploymentRequest]) (*connect.Response[v1.PublishDeploymentResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("peat.sidecar.v1.PeatSidecar.PublishDeployment is not implemented"))
+}
+
+func (UnimplementedPeatSidecarHandler) GetDeploymentRequests(context.Context, *connect.Request[v1.GetDeploymentRequestsRequest]) (*connect.Response[v1.GetDeploymentRequestsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("peat.sidecar.v1.PeatSidecar.GetDeploymentRequests is not implemented"))
+}
+
+func (UnimplementedPeatSidecarHandler) ResetDeployment(context.Context, *connect.Request[v1.ResetDeploymentRequest]) (*connect.Response[v1.ResetDeploymentResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("peat.sidecar.v1.PeatSidecar.ResetDeployment is not implemented"))
 }
 
 func (UnimplementedPeatSidecarHandler) Subscribe(context.Context, *connect.Request[v1.SubscribeRequest], *connect.ServerStream[v1.DocumentChange]) error {
