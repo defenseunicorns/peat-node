@@ -365,6 +365,12 @@ message PublishDeploymentRequest {
   string target_agent_id = 2;
   // Optional Zarf variable overrides forwarded to the receiver's `uds zarf` invocation.
   map<string, string> zarf_vars = 3;
+  // Semantic version of the package (e.g. "1.2.3"). May be empty when the caller
+  // does not track a version; Phase 3 receiver logic will then skip version matching.
+  string package_version = 4;
+  // Target architecture, e.g. "arm64" or "amd64". May be empty when the caller
+  // does not know the target arch; Phase 3 receiver logic will then skip arch matching.
+  string architecture = 5;
 }
 
 message PublishDeploymentResponse {
