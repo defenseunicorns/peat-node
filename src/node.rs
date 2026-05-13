@@ -6,9 +6,15 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use iroh::PublicKey;
+use peat_mesh::config::IrohConfig;
 use peat_mesh::storage::json_convert::automerge_to_json;
-use peat_mesh::storage::{BlobMetadata, BlobStore, BlobToken, IrohBlobStore};
+use peat_mesh::storage::{
+    BlobHandle, BlobHash, BlobMetadata, BlobProgress, BlobStore, BlobToken,
+    NetworkedIrohBlobStore,
+};
 use peat_mesh::storage::AutomergeStore;
 use peat_protocol::network::IrohTransport;
 use peat_protocol::storage::{AutomergeBackend, StorageBackend};
@@ -46,7 +52,7 @@ pub struct SidecarNode {
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     cipher: Option<StoreCipher>,
-    blob_store: IrohBlobStore,
+    blob_store: Arc<NetworkedIrohBlobStore>,
     blob_work_dir: PathBuf,
     enable_deployer: bool,
 }
@@ -72,16 +78,56 @@ impl SidecarNode {
         let storage_path = config.data_dir.clone();
         tokio::fs::create_dir_all(&storage_path).await?;
 
-        // Phase 1 — BLOB-01 / BLOB-02: wire IrohBlobStore (MemStore tier per D-04).
+        // 1. Open Automerge CRDT store (same as peat-ffi)
+        let store = Arc::new(AutomergeStore::open(&storage_path)?);
+
+        // 2. Create IrohTransport with mDNS discovery (same as peat-ffi).
+        //    Must be created BEFORE the blob store so that endpoint_addr() and
+        //    blob store construction can proceed independently.
+        let seed = format!("{}/{}", config.app_id, storage_path.display());
+        let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let transport = Arc::new(
+            IrohTransport::from_seed_with_discovery_at_addr(&seed, bind_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create transport: {e}"))?,
+        );
+
+        let endpoint_addr = transport.endpoint_addr();
+        info!(
+            node_id = %config.node_id,
+            endpoint_id = %hex::encode(transport.endpoint_id().as_bytes()),
+            endpoint_addr = ?endpoint_addr,
+            "peat-protocol transport bound"
+        );
+
+        // D-04 upgrade (BLOB-03): NetworkedIrohBlobStore replaces IrohBlobStore.
+        //
+        // Architecture note: peat-mesh 0.8.2 uses a separate Iroh endpoint for
+        // the blob store (confirmed from peat-protocol AutomergeIrohBackend source,
+        // and from NetworkedIrohBlobStore::from_config which creates its own
+        // Endpoint via build_endpoint). This differs from the local peat-mesh 0.5.2
+        // which had StaticProvider-based endpoint sharing. Using from_config is the
+        // correct approach for 0.8.2 — see SUMMARY.md deviation D-01.
         tokio::fs::create_dir_all(&config.blob_work_dir).await?;
-        let blob_store = IrohBlobStore::new_in_memory(config.blob_work_dir.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to initialize blob store at {}: {e}", config.blob_work_dir.display()))?;
+        let iroh_config = IrohConfig {
+            download_timeout: Duration::from_secs(config.download_timeout_secs),
+            ..Default::default()
+        };
+        let blob_store = NetworkedIrohBlobStore::from_config(
+            config.blob_work_dir.clone(),
+            &iroh_config,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(
+            "failed to initialize networked blob store at {}: {e}",
+            config.blob_work_dir.display()
+        ))?;
+        // NetworkedIrohBlobStore::from_config returns Arc<Self> directly.
 
         // Startup re-import (D-05 / BLOB-02):
         // list_local_blobs() scans .meta.json sidecars in blob_work_dir; for each token we
-        // reload the raw bytes from disk into the fresh MemStore so the sender can resume
-        // serving blobs after a process restart. MemStore itself is not persistent.
+        // reload the raw bytes from disk into the fresh store so the sender can resume
+        // serving blobs after a process restart.
         let existing_blobs = blob_store.list_local_blobs();
         let mut reimported: usize = 0;
         let mut skipped: usize = 0;
@@ -97,7 +143,7 @@ impl SidecarNode {
             }
             match tokio::fs::read(&blob_file).await {
                 Ok(content) => {
-                    if let Err(e) = blob_store.store().add_bytes(content).await {
+                    if let Err(e) = blob_store.store_api().add_bytes(content).await {
                         tracing::warn!(hash = %token.hash.as_hex(), "failed to re-import blob: {e}");
                         skipped += 1;
                     } else {
@@ -115,26 +161,6 @@ impl SidecarNode {
             reimported,
             skipped,
             "startup blob re-import complete"
-        );
-
-        // 1. Open Automerge CRDT store (same as peat-ffi)
-        let store = Arc::new(AutomergeStore::open(&storage_path)?);
-
-        // 2. Create IrohTransport with mDNS discovery (same as peat-ffi)
-        let seed = format!("{}/{}", config.app_id, storage_path.display());
-        let bind_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let transport = Arc::new(
-            IrohTransport::from_seed_with_discovery_at_addr(&seed, bind_addr)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to create transport: {e}"))?,
-        );
-
-        let endpoint_addr = transport.endpoint_addr();
-        info!(
-            node_id = %config.node_id,
-            endpoint_id = %hex::encode(transport.endpoint_id().as_bytes()),
-            endpoint_addr = ?endpoint_addr,
-            "peat-protocol transport bound"
         );
 
         // 3. Create storage backend with transport (same as peat-ffi)
@@ -494,7 +520,7 @@ impl SidecarNode {
     /// Publish a local file to the Iroh blob store.
     ///
     /// Returns a BlobToken containing the BLAKE3 content hash and size in bytes.
-    /// The file is read, hashed, added to the MemStore, its .meta.json sidecar is
+    /// The file is read, hashed, added to the store, its .meta.json sidecar is
     /// written to blob_work_dir, and the raw bytes are exported to
     /// `blob_work_dir/{hash_hex}` so that a subsequent restart can re-import it.
     ///
@@ -524,6 +550,84 @@ impl SidecarNode {
     /// Exposed as a read-only helper for tests and Phase 3 discovery code.
     pub fn list_local_blobs(&self) -> Vec<BlobToken> {
         self.blob_store.list_local_blobs()
+    }
+
+    // --- Blob P2P wrapper methods (BLOB-03 / D-04 upgrade) ---
+
+    /// Parse a hex-encoded endpoint ID (32 bytes = 64 hex chars) into an iroh::EndpointId.
+    ///
+    /// Private helper — shared by add_blob_peer and advertise_blob_for_hash.
+    ///
+    /// Pattern source: peat-mesh sync_persistence.rs line 335 (verified this session).
+    /// Input validation (T-03-01): hex::decode rejects non-hex; explicit 32-byte length
+    /// check; PublicKey::from_bytes rejects invalid curve points. Never panics.
+    fn parse_endpoint_id_hex(endpoint_id_hex: &str) -> anyhow::Result<iroh::EndpointId> {
+        let bytes = hex::decode(endpoint_id_hex)
+            .map_err(|e| anyhow::anyhow!("invalid endpoint_id hex '{endpoint_id_hex}': {e}"))?;
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!(
+                "endpoint_id must be 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let public_key = PublicKey::from_bytes(&arr)
+            .map_err(|e| anyhow::anyhow!("invalid public key bytes: {e}"))?;
+        Ok(public_key)
+    }
+
+    /// BLOB-03: Add a peer that this node may want to fetch blobs from.
+    ///
+    /// Accepts a 64-char hex-encoded endpoint ID (as written to CRDT doc
+    /// `sender_endpoint_id` by the sender). Wraps
+    /// NetworkedIrohBlobStore::add_peer (iroh_blob_store.rs line 937 in 0.8.2).
+    pub async fn add_blob_peer(&self, endpoint_id_hex: &str) -> anyhow::Result<()> {
+        let peer = Self::parse_endpoint_id_hex(endpoint_id_hex)?;
+        self.blob_store.add_peer(peer).await;
+        Ok(())
+    }
+
+    /// BLOB-03: Record that a given peer has a specific blob hash.
+    ///
+    /// Must be called AFTER add_blob_peer — advertise_blob only updates the
+    /// in-memory peer-blob index; it does not open a QUIC connection.
+    /// Wraps NetworkedIrohBlobStore::advertise_blob (iroh_blob_store.rs line 964 in 0.8.2).
+    pub async fn advertise_blob_for_hash(
+        &self,
+        endpoint_id_hex: &str,
+        hash_hex: &str,
+    ) -> anyhow::Result<()> {
+        let peer = Self::parse_endpoint_id_hex(endpoint_id_hex)?;
+        let hash = BlobHash::from_hex(hash_hex);
+        self.blob_store.advertise_blob(peer, hash).await;
+        Ok(())
+    }
+
+    /// BLOB-04: Fetch a blob from a known peer, forwarding BlobProgress events
+    /// to the caller-supplied closure.
+    ///
+    /// Wraps NetworkedIrohBlobStore::fetch_blob (iroh_blob_store.rs line 1015 in 0.8.2).
+    /// The progress closure receives: Started -> one Downloading{downloaded:0} -> Completed|Failed.
+    /// (NetworkedIrohBlobStore does not surface incremental chunk progress — documented
+    /// limitation per RESEARCH.md "Critical API Reference" section.)
+    pub async fn fetch_blob_from_peer<F>(
+        &self,
+        token: &BlobToken,
+        progress: F,
+    ) -> anyhow::Result<BlobHandle>
+    where
+        F: FnMut(BlobProgress) + Send + 'static,
+    {
+        self.blob_store.fetch_blob(token, progress).await
+    }
+
+    /// CRDT-03 helper: check whether a blob is already on the local filesystem.
+    ///
+    /// Used by the Phase 3 discovery loop to skip re-fetching known packages.
+    /// Wraps the BlobStore trait method (iroh_blob_store.rs line 1083 in 0.8.2).
+    pub fn blob_exists_locally(&self, hash: &BlobHash) -> bool {
+        self.blob_store.blob_exists_locally(hash)
     }
 
     fn maybe_decrypt(&self, value: Option<String>) -> anyhow::Result<Option<String>> {

@@ -44,6 +44,7 @@ thiserror = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+iroh = "0.97"
 
 # Encryption at rest
 aes-gcm = "0.10"
