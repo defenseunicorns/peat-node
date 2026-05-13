@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod node;
+pub mod query;
 pub mod service;
 pub mod watcher;
 

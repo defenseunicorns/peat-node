@@ -307,7 +307,64 @@ message GetCommandsResponse {
 message SubscribeRequest {
   // If empty, subscribe to all collections.
   repeated string collections = 1;
+
+  // Optional predicate evaluated against each document's JSON payload.
+  // Absent (the default) yields the prior behavior: stream every change
+  // for the requested collections. See `SubscriptionQuery`.
+  optional SubscriptionQuery query = 2;
 }
+
+// SubscriptionQuery filters change events by document content.
+//
+// Mirrors `peat_mesh::sync::types::Query` for the variants meaningful at
+// the sidecar boundary (no spatial / deletion-aware modifiers in v1).
+// `value` fields are JSON-encoded scalars (e.g. `"\"vehicle\""`, `"42"`,
+// `"true"`) — matches the `string json_data` convention used elsewhere
+// in this proto and keeps the wire format trivially debuggable.
+//
+// DELETE events have no payload to evaluate against; the matcher passes
+// them through only for `Query::all` so callers asking for filtered
+// streams aren't surprised by tombstones outside their predicate.
+message SubscriptionQuery {
+  oneof q {
+    QueryEq  eq  = 1;
+    QueryCmp lt  = 2;
+    QueryCmp gt  = 3;
+    QueryAnd and = 4;
+    QueryOr  or  = 5;
+    SubscriptionQuery not = 6;
+    QueryAll all = 7;
+  }
+}
+
+message QueryEq {
+  // Top-level JSON field name, e.g. "platform_type". Nested paths
+  // (e.g. "location.lat") are not supported in v1; the matcher does a
+  // single-level object lookup. Dotted-path support is planned and will
+  // be additive — no wire change required.
+  string field = 1;
+  // JSON-encoded value (e.g. `"\"vehicle\""`, `"true"`, `"3.14"`).
+  string value = 2;
+}
+
+message QueryCmp {
+  // Top-level JSON field name, e.g. "altitude_m". Same v1 restriction
+  // as `QueryEq.field`: no nested / dotted paths.
+  string field = 1;
+  // JSON-encoded value. Strings, integers, and floats compare; bools
+  // and null do not.
+  string value = 2;
+}
+
+message QueryAnd {
+  repeated SubscriptionQuery clauses = 1;
+}
+
+message QueryOr {
+  repeated SubscriptionQuery clauses = 1;
+}
+
+message QueryAll {}
 
 message DocumentChange {
   string collection = 1;

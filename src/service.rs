@@ -6,7 +6,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
-use buffa::OwnedView;
+use buffa::{MessageView, OwnedView};
 use connectrpc::{ConnectError, Context};
 use futures::stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -15,6 +15,7 @@ use tracing::error;
 
 use crate::node::{ChangeType as NodeChangeType, SidecarNode};
 use crate::pb;
+use crate::query::{event_passes, Matcher};
 
 /// Connect RPC service wrapping a SidecarNode.
 pub struct PeatSidecarService {
@@ -384,12 +385,31 @@ impl pb::PeatSidecar for PeatSidecarService {
     > {
         let filter_collections: Vec<String> =
             request.collections.iter().map(|s| s.to_string()).collect();
+
+        // Translate the optional wire-level query into an owned matcher.
+        // Materialize the view as an owned proto first so the matcher
+        // doesn't have to thread the View lifetime through the stream
+        // closure.
+        let matcher: Option<Matcher> = match request.query.as_option() {
+            Some(view) => {
+                let owned = view.to_owned_message();
+                Some(Matcher::from_proto(&owned).map_err(|e| {
+                    ConnectError::invalid_argument(format!("invalid subscription query: {e}"))
+                })?)
+            }
+            None => None,
+        };
+
         let rx = self.node.subscribe();
 
         let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
             Ok(event) => {
-                if !filter_collections.is_empty() && !filter_collections.contains(&event.collection)
-                {
+                if !event_passes(
+                    &filter_collections,
+                    matcher.as_ref(),
+                    &event.collection,
+                    event.json_data.as_deref(),
+                ) {
                     return None;
                 }
                 let change_type = match event.change_type {
