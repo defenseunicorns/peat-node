@@ -12,11 +12,10 @@ name = "peat-node"
 path = "src/main.rs"
 
 [dependencies]
-# Mesh networking (Automerge CRDT sync + Iroh blob transfer)
+# Peat protocol — same stack as peat-ffi for wire-compatible formation handshake
+peat-protocol = { path = "../peat/peat-protocol", default-features = false, features = ["automerge-backend"] }
+# Peat mesh — for AutomergeStore and json_convert utilities
 peat-mesh = { version = "0.8.2", features = ["automerge-backend"] }
-
-# P2P networking
-iroh = "0.97"
 
 # Connect RPC (Connect + gRPC + gRPC-Web on single port)
 connectrpc = { version = "0.2", features = ["server"] }

@@ -99,21 +99,147 @@ pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
     loop {
         interval.tick().await;
 
-        // Poll agent status
-        if let Err(e) = poll_status(&client, &config.agent_addr, &agent_id, &node).await {
-            warn!("poll /status failed: {e}");
-        }
-
-        // Poll deployed packages via Connect RPC (JSON encoding)
-        if let Err(e) = poll_packages(&client, &config.agent_addr, &agent_id, &node).await {
-            warn!("poll ListPackages failed: {e}");
-        }
-
-        // Poll pulled packages
-        if let Err(e) = poll_pulled_packages(&client, &config.agent_addr, &agent_id, &node).await {
-            debug!("poll ListPulledPackages failed: {e}");
+        // Poll all data and write a single combined document per agent.
+        // This ensures one CRDT sync operation transfers all health data.
+        if let Err(e) = poll_all(&client, &config.agent_addr, &agent_id, &node).await {
+            warn!("poll cycle failed: {e}");
         }
     }
+}
+
+/// Poll all agent endpoints and write a single combined document to platforms/{agent_id}.
+/// This ensures the entire health snapshot syncs in one CRDT operation.
+async fn poll_all(
+    client: &reqwest::Client,
+    agent_addr: &str,
+    agent_id: &str,
+    node: &SidecarNode,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+
+    // 1. Agent status
+    let status = poll_status_data(client, agent_addr).await.ok();
+
+    // 2. Deployed packages
+    let packages = poll_packages_data(client, agent_addr).await.unwrap_or_default();
+
+    // 3. Pod health
+    let pod_health = poll_pods_data(client, agent_addr).await.ok();
+
+    // Build combined document
+    let mut pkg_array = Vec::new();
+    for pkg in &packages {
+        pkg_array.push(serde_json::json!({
+            "package": pkg.name,
+            "version": pkg.version,
+            "status": pkg.status,
+            "flavor": pkg.flavor,
+            "namespace_override": pkg.namespace_override,
+        }));
+    }
+
+    let platform_json = serde_json::json!({
+        "agent_id": agent_id,
+        "platform_type": "uds-remote-agent",
+        "version": status.as_ref().and_then(|s| s.version.as_deref()),
+        "architecture": status.as_ref().and_then(|s| s.architecture.as_deref()),
+        "classification": status.as_ref().and_then(|s| s.classification.as_deref()),
+        "k8s_version": status.as_ref().and_then(|s| s.k8s_version.as_deref()),
+        "k8s_node_status": status.as_ref().and_then(|s| s.k8s_node_status.as_deref()),
+        "zarf_version": status.as_ref().and_then(|s| s.zarf_version.as_deref()),
+        "run_mode": status.as_ref().and_then(|s| s.run_mode.as_deref()),
+        "packages": pkg_array,
+        "total_pods": pod_health.as_ref().map(|p| p.total),
+        "ready_pods": pod_health.as_ref().map(|p| p.ready),
+        "error_pods": pod_health.as_ref().map(|p| p.errors),
+        "error_pod_names": pod_health.as_ref().map(|p| &p.error_names),
+        "namespaces": pod_health.as_ref().map(|p| &p.namespace_counts),
+        "last_seen": now,
+    });
+
+    node.put_document("platforms", agent_id, &platform_json.to_string())
+        .await?;
+
+    debug!(
+        agent_id,
+        packages = packages.len(),
+        pods = pod_health.as_ref().map(|p| p.total).unwrap_or(0),
+        "synced all agent data to mesh"
+    );
+    Ok(())
+}
+
+// --- Data fetchers (return structured data, don't write to store) ---
+
+async fn poll_status_data(client: &reqwest::Client, agent_addr: &str) -> anyhow::Result<AgentStatus> {
+    let url = format!("{agent_addr}/status");
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("agent /status returned {}", resp.status());
+    }
+    Ok(resp.json().await?)
+}
+
+async fn poll_packages_data(client: &reqwest::Client, agent_addr: &str) -> anyhow::Result<Vec<ZarfPackage>> {
+    let url = format!("{agent_addr}/zarfapi.v1.ZarfAPIService/ListPackages");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("ListPackages returned {}", resp.status());
+    }
+    let body: ListPackagesResponse = resp.json().await?;
+    Ok(body.packages.unwrap_or_default())
+}
+
+struct PodHealthData {
+    total: usize,
+    ready: usize,
+    errors: usize,
+    error_names: Vec<String>,
+    namespace_counts: std::collections::HashMap<String, usize>,
+}
+
+async fn poll_pods_data(client: &reqwest::Client, agent_addr: &str) -> anyhow::Result<PodHealthData> {
+    let url = format!("{agent_addr}/zarfapi.v1.ZarfAPIService/ListPods");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("ListPods returned {}", resp.status());
+    }
+    let body: ListPodsResponse = resp.json().await?;
+    let pods = body.pods.unwrap_or_default();
+
+    let total = pods.len();
+    let ready = pods.iter().filter(|p| p.ready == Some(true)).count();
+    let error_pods: Vec<&StatusPod> = pods
+        .iter()
+        .filter(|p| matches!(p.status, Some(9) | Some(10) | Some(11) | Some(12)))
+        .collect();
+
+    let mut namespace_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pod in &pods {
+        let ns = pod.pod.as_ref()
+            .and_then(|p| p.metadata.as_ref())
+            .and_then(|m| m.namespace.as_deref())
+            .unwrap_or("unknown");
+        *namespace_counts.entry(ns.to_string()).or_default() += 1;
+    }
+
+    Ok(PodHealthData {
+        total,
+        ready,
+        errors: error_pods.len(),
+        error_names: error_pods.iter().filter_map(|p| p.name.clone()).collect(),
+        namespace_counts,
+    })
 }
 
 // --- Agent Status ---
@@ -180,11 +306,37 @@ struct ListPackagesResponse {
 struct ZarfPackage {
     name: Option<String>,
     version: Option<String>,
+    /// Status can be either an int32 (proto numeric) or a string (Connect RPC JSON enum name)
+    #[serde(default, deserialize_with = "deserialize_status")]
     status: Option<i32>,
     flavor: Option<String>,
     namespace_override: Option<String>,
     #[serde(default)]
     annotations: serde_json::Map<String, serde_json::Value>,
+    readiness: Option<serde_json::Value>,
+}
+
+/// Deserialize proto enum status from either int or string representation
+fn deserialize_status<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_i64().map(|v| v as i32)),
+        Some(serde_json::Value::String(s)) => Ok(Some(match s.as_str() {
+            "DEPLOY_PACKAGE_STATUS_DEPLOYING" => 1,
+            "DEPLOY_PACKAGE_STATUS_DEPLOYED" => 2,
+            "DEPLOY_PACKAGE_STATUS_DEPLOY_ERROR" => 3,
+            "DEPLOY_PACKAGE_STATUS_CANCELLED" => 4,
+            "DEPLOY_PACKAGE_STATUS_RECEIVING" => 5,
+            "DEPLOY_PACKAGE_STATUS_REMOVING" => 6,
+            "DEPLOY_PACKAGE_STATUS_REMOVED" => 7,
+            "DEPLOY_PACKAGE_STATUS_REMOVE_ERROR" => 8,
+            _ => 0,
+        })),
+        _ => Ok(None),
+    }
 }
 
 async fn poll_packages(
@@ -267,7 +419,27 @@ struct PackageTag {
 #[serde(rename_all = "camelCase")]
 struct PullInfo {
     downloaded_bytes: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_pull_status")]
     status: Option<i32>,
+}
+
+fn deserialize_pull_status<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_i64().map(|v| v as i32)),
+        Some(serde_json::Value::String(s)) => Ok(Some(match s.as_str() {
+            "PULL_STATUS_PENDING" => 1,
+            "PULL_STATUS_PULLING" => 2,
+            "PULL_STATUS_PULLED" => 3,
+            "PULL_STATUS_CANCELLED" => 4,
+            "PULL_STATUS_ERROR" => 5,
+            _ => 0,
+        })),
+        _ => Ok(None),
+    }
 }
 
 async fn poll_pulled_packages(
@@ -320,5 +492,130 @@ async fn poll_pulled_packages(
     }
 
     debug!(agent_id, count, "synced pulled packages to mesh");
+    Ok(())
+}
+
+// --- Pods (cluster health via ListPods RPC) ---
+
+#[derive(Debug, Deserialize)]
+struct ListPodsResponse {
+    pods: Option<Vec<StatusPod>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusPod {
+    name: Option<String>,
+    /// Pod status as string enum name (e.g. "POD_STATUS_RUNNING") or int
+    #[serde(default, deserialize_with = "deserialize_pod_status")]
+    status: Option<i32>,
+    message: Option<String>,
+    ready: Option<bool>,
+    pod: Option<PodInfo>,
+}
+
+fn deserialize_pod_status<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_i64().map(|v| v as i32)),
+        Some(serde_json::Value::String(s)) => Ok(Some(match s.as_str() {
+            "POD_STATUS_RUNNING" => 3,
+            "POD_STATUS_COMPLETED" => 5,
+            "POD_STATUS_CRASH_LOOP_BACKOFF" => 9,
+            "POD_STATUS_ERROR" => 10,
+            "POD_STATUS_IMAGE_PULL_BACKOFF" => 11,
+            "POD_STATUS_OOM_KILLED" => 12,
+            "POD_STATUS_PENDING" => 13,
+            "POD_STATUS_TERMINATING" => 1,
+            "POD_STATUS_NOT_READY" => 4,
+            "POD_STATUS_CONTAINER_CREATING" => 6,
+            "POD_STATUS_POD_INITIALIZING" => 7,
+            _ => 0,
+        })),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodInfo {
+    metadata: Option<PodMetadata>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PodMetadata {
+    name: Option<String>,
+    namespace: Option<String>,
+    #[serde(default)]
+    labels: serde_json::Map<String, serde_json::Value>,
+}
+
+async fn poll_pods(
+    client: &reqwest::Client,
+    agent_addr: &str,
+    agent_id: &str,
+    node: &SidecarNode,
+) -> anyhow::Result<()> {
+    let url = format!("{agent_addr}/zarfapi.v1.ZarfAPIService/ListPods");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("ListPods returned {}", resp.status());
+    }
+
+    let body: ListPodsResponse = resp.json().await?;
+    let pods = body.pods.unwrap_or_default();
+
+    // Aggregate pod health into a summary document
+    let total = pods.len();
+    let ready = pods.iter().filter(|p| p.ready == Some(true)).count();
+    let error_pods: Vec<&StatusPod> = pods
+        .iter()
+        .filter(|p| {
+            // Pod statuses: 9=CrashLoopBackOff, 10=Error, 11=ImagePullBackOff, 12=OOMKilled
+            matches!(p.status, Some(9) | Some(10) | Some(11) | Some(12))
+        })
+        .collect();
+
+    // Count pods by namespace
+    let mut namespace_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for pod in &pods {
+        let ns = pod
+            .pod
+            .as_ref()
+            .and_then(|p| p.metadata.as_ref())
+            .and_then(|m| m.namespace.as_deref())
+            .unwrap_or("unknown");
+        *namespace_counts.entry(ns.to_string()).or_default() += 1;
+    }
+
+    let error_names: Vec<String> = error_pods
+        .iter()
+        .filter_map(|p| p.name.clone())
+        .collect();
+
+    let doc = serde_json::json!({
+        "agent_id": agent_id,
+        "total_pods": total,
+        "ready_pods": ready,
+        "error_pods": error_pods.len(),
+        "error_pod_names": error_names,
+        "namespaces": namespace_counts,
+        "last_seen": chrono::Utc::now().timestamp(),
+    });
+
+    node.put_document("pods", agent_id, &doc.to_string())
+        .await?;
+
+    debug!(agent_id, total, ready, errors = error_pods.len(), "synced pod health to mesh");
     Ok(())
 }
