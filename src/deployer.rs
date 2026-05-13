@@ -1,26 +1,34 @@
 // Copyright 2026 Defense Unicorns
 // SPDX-License-Identifier: LicenseRef-Defense-Unicorns-Commercial
-//! Deployer — Phase 3 receiver-side loops.
+//! Deployer — Phase 3 + Phase 4 receiver-side loops.
 //!
-//! Two independent poll-driven cycles run on every tick of `run`:
+//! Three independent poll-driven cycles run on every tick of `run`:
 //!
-//! 1. **Deployment observer** (CRDT-02 + CRDT-03 + BLOB-03 + BLOB-04):
+//! 1. **Deployment observer** (CRDT-02 + CRDT-03 + BLOB-03 + BLOB-04 + RECV-03):
 //!    Scan `deployment_requests`, filter to docs targeting this node with
-//!    `receiver_status == "pending"`, wire the blob peer index, fetch the blob.
+//!    `receiver_status == "pending"`, validate architecture, wire the blob peer
+//!    index, fetch the blob.
 //!
-//! 2. **Discovery loop** (SYNC-03):
+//! 2. **Deploy loop** (RECV-02 + RECV-04):
+//!    Scan `deployment_requests` for docs with `receiver_status == "fetching"`,
+//!    shell out to `uds zarf package deploy`, transition through
+//!    Deploying → Deployed | Failed with exponential backoff.
+//!
+//! 3. **Discovery loop** (SYNC-03):
 //!    Scan `available_packages`, skip blobs already staged locally, otherwise
 //!    fetch and copy to `{blob_work_dir}/catalog/{pkg_ref}/package.zarf.tar.zst`.
 //!
 //! Per RECV-01, this module is explicitly SEPARATE from watcher.rs so RA
 //! health polling is not blocked by multi-minute blob downloads.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use peat_mesh::storage::{BlobHash, BlobMetadata, BlobProgress, BlobToken};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -32,9 +40,23 @@ use crate::types::{AvailablePackage, DeploymentRequest, DeploymentStatus};
 pub struct DeployerConfig {
     pub poll_interval: Duration,
     pub blob_work_dir: PathBuf,
+    /// Path to kubeconfig file. When Some(path), exported as KUBECONFIG env
+    /// to the `uds zarf` subprocess. When None, the subprocess inherits the
+    /// parent process's KUBECONFIG (production K8s pods always have one;
+    /// dev machines fall back to ~/.kube/config automatically).
+    pub kubeconfig: Option<PathBuf>,
+    /// Maximum deploy retries before writing receiver_status = Failed (RECV-04).
+    pub max_deploy_retries: u32,
+    /// Initial backoff seconds; each retry doubles up to a 300-second cap.
+    /// Production default 2; tests set to 0 for in-millisecond test runs.
+    pub initial_backoff_secs: u64,
+    /// Command to invoke for deployment. Production = "uds"; tests inject a
+    /// mock script path so the test harness can exercise shell-out behavior
+    /// without requiring the real UDS CLI or a k3s cluster.
+    pub deploy_command: String,
 }
 
-/// Run the deployer loop. Ticks on `poll_interval` and drives both cycles.
+/// Run the deployer loop. Ticks on `poll_interval` and drives all three cycles.
 ///
 /// Spawned in a separate tokio task from the watcher so that multi-minute
 /// blob downloads do not block the agent health poll cycle (RECV-01).
@@ -42,20 +64,30 @@ pub async fn run(config: DeployerConfig, node: Arc<SidecarNode>) {
     let mut interval = tokio::time::interval(config.poll_interval);
     // Pitfall 4 (T-03-02-03): prevents double-fetch on overlapping poll cycles.
     let in_progress: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // RECV-04: in-memory retry counter keyed by request_id. Lost on process
+    // restart (intentional — restart is a natural recovery event).
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     info!(
         node_id = node.node_id(),
         poll_interval = ?config.poll_interval,
         blob_work_dir = %config.blob_work_dir.display(),
+        kubeconfig = ?config.kubeconfig,
+        max_deploy_retries = config.max_deploy_retries,
+        deploy_command = %config.deploy_command,
         "deployer started"
     );
 
     loop {
         interval.tick().await;
         if let Err(e) =
-            poll_deployment_requests_with_guard(&node, &config, &in_progress).await
+            poll_deployment_requests_with_guard(&node, &config, &in_progress, &retry_counts).await
         {
             warn!("deployer poll (deployments) failed: {e}");
+        }
+        if let Err(e) = poll_deploying_requests(&node, &config, &retry_counts).await {
+            warn!("deployer poll (deploying) failed: {e}");
         }
         if let Err(e) = poll_available_packages(&node, &config).await {
             warn!("deployer poll (discovery) failed: {e}");
@@ -72,13 +104,36 @@ pub async fn poll_deployment_requests(
     config: &DeployerConfig,
 ) -> anyhow::Result<()> {
     let guard: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    poll_deployment_requests_with_guard(node, config, &guard).await
+    let counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    poll_deployment_requests_with_guard(node, config, &guard, &counts).await
+}
+
+/// Test helper — expose the retry_counts map so tests can inspect counter state
+/// after poll_deploying_requests completes.
+pub async fn poll_deploying_requests_with_counts(
+    node: &SidecarNode,
+    config: &DeployerConfig,
+    retry_counts: &Arc<Mutex<HashMap<String, u32>>>,
+) -> anyhow::Result<()> {
+    poll_deploying_requests(node, config, retry_counts).await
+}
+
+/// Test helper — run one Pending-handler poll cycle with a caller-supplied
+/// retry_counts map so tests can verify the counter is cleared on Pending → Fetching.
+pub async fn poll_deployment_requests_with_counts(
+    node: &SidecarNode,
+    config: &DeployerConfig,
+    retry_counts: &Arc<Mutex<HashMap<String, u32>>>,
+) -> anyhow::Result<()> {
+    let guard: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    poll_deployment_requests_with_guard(node, config, &guard, retry_counts).await
 }
 
 async fn poll_deployment_requests_with_guard(
     node: &SidecarNode,
     _config: &DeployerConfig,
     in_progress: &Arc<Mutex<HashSet<String>>>,
+    retry_counts: &Arc<Mutex<HashMap<String, u32>>>,
 ) -> anyhow::Result<()> {
     let doc_ids = node.list_documents("deployment_requests").await?;
     for id in doc_ids {
@@ -156,6 +211,9 @@ async fn poll_deployment_requests_with_guard(
         match result {
             Ok(handle) => {
                 req.receiver_status = DeploymentStatus::Fetching;
+                // RECV-04: fresh Pending → Fetching transition clears any prior retry counter
+                // so ResetDeployment gives the operator a full retry budget (not the old count).
+                retry_counts.lock().await.remove(&req.id);
                 info!(
                     doc_id = %req.id,
                     path = %handle.path.display(),
@@ -164,6 +222,10 @@ async fn poll_deployment_requests_with_guard(
             }
             Err(e) => {
                 req.receiver_status = DeploymentStatus::Failed;
+                // Also clear the deploy-stage retry counter on fetch failure: the doc goes
+                // to Failed and will not re-enter the deploying stage without a ResetDeployment,
+                // which re-promotes it to Pending → Fetching and gets a fresh budget anyway.
+                retry_counts.lock().await.remove(&req.id);
                 warn!(doc_id = %req.id, "deployer: fetch failed: {e}");
             }
         }
@@ -195,10 +257,11 @@ enum ArchCheck {
 
 /// RECV-03: Read the receiver's own `platforms/{node_id}` doc and compare the
 /// `architecture` field against `req.architecture`. Returns:
-///   - Ok(Match)       — arches agree OR req.architecture is empty (Pitfall 5)
-///                      OR platforms doc is missing / has no arch (Pitfall 1)
-///   - Ok(Mismatch)    — both arches are non-empty strings AND they differ
-///   - Err(e)          — CRDT read failure (bubble up; caller writes Failed)
+///
+/// - `Ok(Match)` — arches agree OR req.architecture is empty (Pitfall 5)
+///   OR platforms doc is missing / has no arch (Pitfall 1)
+/// - `Ok(Mismatch)` — both arches are non-empty strings AND they differ
+/// - `Err(e)` — CRDT read failure (bubble up; caller writes Failed)
 ///
 /// The deployer treats Mismatch as a terminal Failed state and does NOT fetch.
 async fn validate_architecture(
@@ -347,6 +410,213 @@ async fn fetch_for_deployment(
         })
         .await?;
     Ok(handle)
+}
+
+/// RECV-02 + RECV-04: scan deployment_requests for docs in Fetching state that
+/// target this node, shell out to `uds zarf package deploy`, transition to
+/// Deployed or Failed. Applies exponential backoff around transient failures.
+///
+/// Design note: retries loop INSIDE a single poll tick (not one attempt per tick)
+/// so the doc stays in Deploying state and does not re-enter the Fetching filter
+/// on the next tick (which would re-fetch the blob unnecessarily).
+async fn poll_deploying_requests(
+    node: &SidecarNode,
+    config: &DeployerConfig,
+    retry_counts: &Arc<Mutex<HashMap<String, u32>>>,
+) -> anyhow::Result<()> {
+    let doc_ids = node.list_documents("deployment_requests").await?;
+    for id in doc_ids {
+        let Some(json) = node.get_document("deployment_requests", &id).await? else {
+            continue;
+        };
+        let mut req: DeploymentRequest = match serde_json::from_str(&json) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(doc_id = %id, "deployer: malformed deployment_requests doc in deploying scan: {e}");
+                continue;
+            }
+        };
+        if req.target_agent_id != node.node_id() {
+            continue;
+        }
+        if req.receiver_status != DeploymentStatus::Fetching {
+            continue;
+        }
+
+        // Pitfall 2: the canonical blob file must exist before shelling out.
+        // T-04-03-02: validate hash is ^[0-9a-fA-F]{64}$ BEFORE path join to
+        // prevent directory traversal from a malicious iroh_blob_hash value.
+        let hash = &req.iroh_blob_hash;
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            warn!(
+                doc_id = %req.id,
+                hash = %hash,
+                "deployer: iroh_blob_hash is not a valid 64-char hex string — marking Failed"
+            );
+            req.receiver_status = DeploymentStatus::Failed;
+            let updated = serde_json::to_string(&req)?;
+            let _ = node.put_document("deployment_requests", &req.id, &updated).await;
+            retry_counts.lock().await.remove(&req.id);
+            continue;
+        }
+        let blob_path = config.blob_work_dir.join(hash.as_str());
+        if !blob_path.exists() {
+            warn!(
+                doc_id = %req.id,
+                path = %blob_path.display(),
+                "deployer: canonical blob missing — marking Failed"
+            );
+            req.receiver_status = DeploymentStatus::Failed;
+            let updated = serde_json::to_string(&req)?;
+            let _ = node.put_document("deployment_requests", &req.id, &updated).await;
+            retry_counts.lock().await.remove(&req.id);
+            continue;
+        }
+
+        // Pitfall 3: write Deploying to CRDT BEFORE invoking subprocess so that
+        // a crashed peat-node leaves a recoverable Deploying doc rather than a
+        // re-deployable Fetching doc (which would cause a duplicate deploy).
+        req.receiver_status = DeploymentStatus::Deploying;
+        let deploying_json = serde_json::to_string(&req)?;
+        if let Err(e) = node
+            .put_document("deployment_requests", &req.id, &deploying_json)
+            .await
+        {
+            warn!(doc_id = %req.id, "deployer: failed to write Deploying status: {e}");
+            continue;
+        }
+
+        // RECV-04: in-poll-tick retry loop with exponential backoff.
+        let outcome = try_deploy_with_backoff(&blob_path, &req, config, retry_counts).await;
+
+        match outcome {
+            Ok(()) => {
+                req.receiver_status = DeploymentStatus::Deployed;
+                retry_counts.lock().await.remove(&req.id);
+                info!(doc_id = %req.id, "deployer: uds zarf deploy succeeded");
+            }
+            Err(e) => {
+                req.receiver_status = DeploymentStatus::Failed;
+                retry_counts.lock().await.remove(&req.id);
+                warn!(doc_id = %req.id, "deployer: uds zarf deploy exhausted retries: {e}");
+            }
+        }
+        let final_json = serde_json::to_string(&req)?;
+        if let Err(e) = node
+            .put_document("deployment_requests", &req.id, &final_json)
+            .await
+        {
+            warn!(doc_id = %req.id, "deployer: failed to write final deploy status: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Run `<deploy_command> zarf package deploy <blob_path> --confirm [--set-variables=K=V…]`
+/// with retries and exponential backoff. Returns Ok(()) on a zero-exit run,
+/// Err on exhausted retries.
+///
+/// T-04-03-01: tokio::process::Command::arg does NOT invoke a shell — each arg is
+/// a separate argv[n] entry with no field-splitting or glob expansion.
+/// T-04-03-05: deploy_command defaults to "uds"; only tests set a mock path
+/// via direct struct construction (no CLI flag exposes this field).
+/// T-04-03-07: worst-case hold time = max_retries × initial_backoff × 2^n, capped
+/// at 300s per sleep. With defaults (5 retries, 2s initial): (2+4+8+16+32) = 62s.
+async fn try_deploy_with_backoff(
+    blob_path: &std::path::Path,
+    req: &DeploymentRequest,
+    config: &DeployerConfig,
+    retry_counts: &Arc<Mutex<HashMap<String, u32>>>,
+) -> anyhow::Result<()> {
+    loop {
+        // Build the command fresh each attempt (Command is not Clone/reusable).
+        let mut cmd = Command::new(&config.deploy_command);
+        cmd.arg("zarf")
+            .arg("package")
+            .arg("deploy")
+            .arg(blob_path)
+            .arg("--confirm");
+        // Pitfall 4: emit one --set-variables per entry (stringToString format).
+        for (k, v) in &req.zarf_vars {
+            cmd.arg(format!("--set-variables={}={}", k, v));
+        }
+        // Pitfall 6: only set KUBECONFIG when configured; inherit otherwise so
+        // dev machines with ~/.kube/config work without explicit configuration.
+        if let Some(kubeconfig) = &config.kubeconfig {
+            cmd.env("KUBECONFIG", kubeconfig);
+        }
+
+        let result = cmd.output().await;
+        let exit_ok = match &result {
+            Ok(out) => out.status.success(),
+            Err(_) => false, // ErrorKind::NotFound (uds missing in PATH) etc.
+        };
+
+        if exit_ok {
+            if let Ok(out) = &result {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.is_empty() {
+                    debug!(doc_id = %req.id, stdout = %stdout, "deployer: uds zarf stdout");
+                }
+            }
+            return Ok(());
+        }
+
+        // Log the failure details for operator visibility.
+        match &result {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                warn!(
+                    doc_id = %req.id,
+                    status = ?out.status,
+                    stderr = %stderr,
+                    "deployer: uds zarf exited non-zero"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    doc_id = %req.id,
+                    error = %e,
+                    "deployer: uds zarf spawn failed (binary missing in PATH?)"
+                );
+            }
+        }
+
+        // Increment the per-request retry counter.
+        let attempt = {
+            let mut g = retry_counts.lock().await;
+            let counter = g.entry(req.id.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+
+        if attempt > config.max_deploy_retries {
+            anyhow::bail!(
+                "uds zarf deploy failed {} times (max {})",
+                attempt,
+                config.max_deploy_retries
+            );
+        }
+
+        // Exponential backoff: initial_backoff_secs * 2^attempt, capped at 300s.
+        // Use attempt.min(8) in the exponent so the shift never overflows u64.
+        let backoff = std::cmp::min(
+            config
+                .initial_backoff_secs
+                .saturating_mul(1u64 << attempt.min(8) as u64),
+            300,
+        );
+        info!(
+            doc_id = %req.id,
+            attempt,
+            max = config.max_deploy_retries,
+            backoff_secs = backoff,
+            "deployer: retrying deploy after backoff"
+        );
+        if backoff > 0 {
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+        }
+    }
 }
 
 /// SYNC-03: Discovery loop — scan available_packages and pull unknown blobs

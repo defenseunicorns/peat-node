@@ -98,6 +98,19 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_DOWNLOAD_TIMEOUT_SECS", default_value = "30")]
     download_timeout_secs: u64,
 
+    /// Path to kubeconfig file for `uds zarf package deploy` on the receiver.
+    /// When unset, the uds subprocess inherits KUBECONFIG from the peat-node
+    /// environment (which is the normal K8s pod case — KUBECONFIG is set by
+    /// the pod's service account volume mount or explicit env injection).
+    #[arg(long, env = "PEAT_NODE_KUBECONFIG")]
+    kubeconfig: Option<PathBuf>,
+
+    /// Maximum deploy retries before marking receiver_status = Failed (RECV-04).
+    /// Each retry sleeps 2^n seconds (capped at 300s). Default 5 gives a
+    /// worst-case wait of 2+4+8+16+32 = 62 seconds before writing Failed.
+    #[arg(long, env = "PEAT_NODE_DEPLOY_MAX_RETRIES", default_value = "5")]
+    deploy_max_retries: u32,
+
 }
 
 #[tokio::main]
@@ -194,6 +207,10 @@ async fn main() -> anyhow::Result<()> {
         let deployer_config = deployer::DeployerConfig {
             poll_interval: Duration::from_secs(args.agent_poll_interval),
             blob_work_dir: blob_work_dir.clone(),
+            kubeconfig: args.kubeconfig.clone(),
+            max_deploy_retries: args.deploy_max_retries,
+            initial_backoff_secs: 2, // production default; tests use 0
+            deploy_command: "uds".to_string(),
         };
         let deployer_node = Arc::clone(&node);
         tokio::spawn(async move {

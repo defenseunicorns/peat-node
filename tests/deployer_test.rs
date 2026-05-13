@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peat_node::deployer::{
-    poll_available_packages, poll_deployment_requests, poll_deploying_requests_with_counts,
-    DeployerConfig,
+    poll_available_packages, poll_deployment_requests, poll_deployment_requests_with_counts,
+    poll_deploying_requests_with_counts, DeployerConfig,
 };
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::types::{AvailablePackage, DeploymentRequest, DeploymentStatus};
@@ -1117,8 +1117,11 @@ async fn test_recv_04_reset_clears_retry_counter() {
         .await
         .insert(req_id.to_string(), 5);
 
-    // Call poll_deployment_requests — the Pending handler clears the counter on Pending → Fetching
-    poll_deployment_requests(&node, &config).await.unwrap();
+    // Call poll_deployment_requests_with_counts — the Pending handler clears the counter
+    // on Pending → Fetching, giving ResetDeployment a fresh retry budget.
+    poll_deployment_requests_with_counts(&node, &config, &retry_counts)
+        .await
+        .unwrap();
 
     // Assert retry_counts no longer contains the request_id
     let counts = retry_counts.lock().await;
