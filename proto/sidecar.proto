@@ -70,6 +70,11 @@ service PeatSidecar {
   // (both sent from this node and received from peers).
   rpc GetDeploymentRequests(GetDeploymentRequestsRequest) returns (GetDeploymentRequestsResponse);
 
+  // ResetDeployment resets a stuck deployment's receiver_status to "pending" so
+  // the deployer picks it up on the next poll cycle (CRDT-04). Callable from
+  // any current status — the operator knows what they are doing when they invoke this.
+  rpc ResetDeployment(ResetDeploymentRequest) returns (ResetDeploymentResponse);
+
   // --- Subscriptions ---
 
   // Subscribe streams document changes across all or filtered collections.
@@ -402,3 +407,12 @@ message DeploymentRequestDoc {
 message GetDeploymentRequestsResponse {
   repeated DeploymentRequestDoc requests = 1;
 }
+
+// ResetDeploymentRequest asks the sidecar to rewrite the targeted deployment
+// request's receiver_status back to "pending" (CRDT-04).
+message ResetDeploymentRequest {
+  // UUID of the deployment_requests CRDT doc to reset. Required.
+  string request_id = 1;
+}
+
+message ResetDeploymentResponse {}

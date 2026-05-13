@@ -488,6 +488,50 @@ impl pb::PeatSidecar for PeatSidecarService {
         ))
     }
 
+    async fn reset_deployment(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::ResetDeploymentRequestView<'static>>,
+    ) -> Result<(pb::ResetDeploymentResponse, Context), ConnectError> {
+        // Validate input — request_id must be non-empty.
+        let request_id = request.request_id;
+        if request_id.is_empty() {
+            return Err(ConnectError::invalid_argument("request_id is required"));
+        }
+
+        // Read the existing doc — 404 if absent.
+        let json = self
+            .node
+            .get_document("deployment_requests", request_id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| ConnectError::not_found("deployment request not found"))?;
+
+        // Deserialize into the locked schema so we only mutate receiver_status
+        // without clobbering other fields (T-04-02-05 tamper mitigation).
+        let mut req: crate::types::DeploymentRequest = serde_json::from_str(&json)
+            .map_err(|e| ConnectError::internal(format!("deserialize error: {e}")))?;
+
+        // CRDT-04: rewrite receiver_status to Pending regardless of current value.
+        // Log a warning if already Pending — the operator is doing a no-op reset.
+        if req.receiver_status == crate::types::DeploymentStatus::Pending {
+            tracing::warn!(
+                request_id = %request_id,
+                "ResetDeployment called on already-Pending doc (no-op)"
+            );
+        }
+        req.receiver_status = crate::types::DeploymentStatus::Pending;
+
+        let updated = serde_json::to_string(&req)
+            .map_err(|e| ConnectError::internal(format!("serialize error: {e}")))?;
+        self.node
+            .put_document("deployment_requests", request_id, &updated)
+            .await
+            .map_err(internal)?;
+
+        Ok((pb::ResetDeploymentResponse::default(), ctx))
+    }
+
     // --- Subscriptions ---
 
     async fn subscribe(
