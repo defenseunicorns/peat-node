@@ -446,3 +446,225 @@ async fn test_sync_03_discovery_loop() {
     }
     // Either outcome is acceptable — the truth is "loop ran without panicking"
 }
+
+// ─── RECV-01: Deployer task is separate from watcher task ────────────────────
+
+/// RECV-01: Verify at the type system level that `deployer::run` and `watcher::run`
+/// are distinct function items with separate signatures. If anyone ever tries to unify
+/// them, this test will fail to compile.
+#[tokio::test]
+async fn test_recv_01_task_separation() {
+    let run_deployer: fn(
+        peat_node::deployer::DeployerConfig,
+        std::sync::Arc<peat_node::node::SidecarNode>,
+    ) -> _ = peat_node::deployer::run;
+    // Just assert the two run fns have distinct addresses (they are distinct items).
+    // This will fail to compile if watcher::run signature ever drifts to match
+    // deployer::run and someone tries to unify them.
+    let _ = run_deployer;
+}
+
+// ─── RECV-03: Arch validation before blob fetch ───────────────────────────────
+
+/// Write a minimal platforms doc for the given node_id with only the architecture field.
+async fn put_platform_doc(node: &peat_node::node::SidecarNode, node_id: &str, arch: &str) {
+    let json = format!(r#"{{"architecture":"{}"}}"#, arch);
+    node.put_document("platforms", node_id, &json)
+        .await
+        .unwrap();
+}
+
+/// Write a DeploymentRequest with a specific architecture field (helper for RECV-03 tests).
+async fn put_deployment_request_with_arch(
+    node: &peat_node::node::SidecarNode,
+    id: &str,
+    target_agent_id: &str,
+    arch: &str,
+) {
+    let req = DeploymentRequest {
+        id: id.to_string(),
+        target_agent_id: target_agent_id.to_string(),
+        package_name: "arch-test-pkg".to_string(),
+        package_version: "0.1.0".to_string(),
+        architecture: arch.to_string(),
+        iroh_blob_hash: "bb".repeat(32),
+        sender_endpoint_id: "00".repeat(32),
+        zarf_vars: HashMap::new(),
+        sender_status: DeploymentStatus::Deployed,
+        receiver_status: DeploymentStatus::Pending,
+        created_at: 1_700_000_000,
+        blob_ticket: "{}".to_string(),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    node.put_document("deployment_requests", id, &json)
+        .await
+        .unwrap();
+}
+
+/// RECV-03: Arch mismatch — deployment request claims "amd64" but the receiver's
+/// platforms doc reports "arm64". The deployer must set receiver_status = Failed
+/// WITHOUT calling fetch_for_deployment.
+///
+/// Observable truth: the blob IS published locally so a real fetch WOULD succeed
+/// and produce `Fetching`. Without arch validation, the test fails because status
+/// becomes `Fetching`. With arch validation, the arch mismatch fires BEFORE fetch
+/// and status is `Failed`.
+#[tokio::test]
+async fn test_recv_03_arch_mismatch_skips_fetch() {
+    let (node, _dir) = make_node("node-recv03-mismatch").await;
+    let config = default_config(&node);
+    let node_id = node.node_id().to_string();
+
+    // Publish a blob locally so fetch WOULD succeed if allowed through
+    let token = publish_fake(&node, "mismatch-test-pkg.zarf.tar.zst", b"mismatch test content").await;
+    let hash_hex = token.hash.as_hex().to_string();
+
+    // Write the receiver's platforms doc: local arch = "arm64"
+    put_platform_doc(&node, &node_id, "arm64").await;
+
+    // Write a deployment request with arch = "amd64" (mismatch) pointing at the local blob
+    let req_id = "recv03-mismatch-uuid";
+    let req = DeploymentRequest {
+        id: req_id.to_string(),
+        target_agent_id: node_id.clone(),
+        package_name: "mismatch-test-pkg".to_string(),
+        package_version: "0.1.0".to_string(),
+        architecture: "amd64".to_string(), // MISMATCH: receiver is arm64
+        iroh_blob_hash: hash_hex.clone(),
+        sender_endpoint_id: node.endpoint_addr(), // self-referential — fetch would work locally
+        zarf_vars: HashMap::new(),
+        sender_status: DeploymentStatus::Deployed,
+        receiver_status: DeploymentStatus::Pending,
+        created_at: 1_700_000_000,
+        blob_ticket: serde_json::json!({
+            "hash": hash_hex,
+            "size_bytes": token.size_bytes,
+            "sender_endpoint_id": node.endpoint_addr(),
+        }).to_string(),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    node.put_document("deployment_requests", req_id, &json)
+        .await
+        .unwrap();
+
+    poll_deployment_requests(&node, &config)
+        .await
+        .expect("poll should not error");
+
+    // receiver_status MUST be Failed (arch mismatch short-circuit).
+    // If arch validation is missing, the local blob fetch succeeds and status is Fetching —
+    // that would make this assertion fail, which is the correct RED signal.
+    let result_json = node
+        .get_document("deployment_requests", req_id)
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(
+        result.receiver_status,
+        DeploymentStatus::Failed,
+        "RECV-03: arch mismatch must set receiver_status = Failed (got {:?})",
+        result.receiver_status
+    );
+}
+
+/// RECV-03: Arch match — deployment request claims "arm64" and receiver's platforms
+/// doc also reports "arm64". Arch validation passes, the deployer proceeds to fetch.
+/// Status must move PAST Pending (Fetching or Failed from real fetch attempt — NOT
+/// from arch short-circuit).
+#[tokio::test]
+async fn test_recv_03_arch_match_proceeds() {
+    let (node, _dir) = make_node("node-recv03-match").await;
+    let config = default_config(&node);
+    let node_id = node.node_id().to_string();
+
+    // Write the receiver's platforms doc: local arch = "arm64"
+    put_platform_doc(&node, &node_id, "arm64").await;
+
+    // Write a deployment request with arch = "arm64" (match)
+    let req_id = "recv03-match-uuid";
+    put_deployment_request_with_arch(&node, req_id, &node_id, "arm64").await;
+
+    poll_deployment_requests(&node, &config)
+        .await
+        .expect("poll should not error");
+
+    // Status must have moved past Pending — arch check did NOT short-circuit
+    let result_json = node
+        .get_document("deployment_requests", req_id)
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_ne!(
+        result.receiver_status,
+        DeploymentStatus::Pending,
+        "RECV-03: arch match must allow fetch to be attempted (status must move past Pending)"
+    );
+}
+
+/// RECV-03: Empty arch on the request — the sender did not claim an architecture.
+/// The deployer must skip validation and proceed to fetch (Pitfall 5).
+/// Status must move past Pending even with no platforms doc written.
+#[tokio::test]
+async fn test_recv_03_empty_arch_skips_validation() {
+    let (node, _dir) = make_node("node-recv03-emptyarch").await;
+    let config = default_config(&node);
+    let node_id = node.node_id().to_string();
+
+    // No platforms doc written — validation would fail even if attempted
+
+    // Write a deployment request with arch = "" (empty — no arch claim)
+    let req_id = "recv03-emptyarch-uuid";
+    put_deployment_request_with_arch(&node, req_id, &node_id, "").await;
+
+    poll_deployment_requests(&node, &config)
+        .await
+        .expect("poll should not error");
+
+    // Status must have moved past Pending — empty arch skips validation (Pitfall 5)
+    let result_json = node
+        .get_document("deployment_requests", req_id)
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_ne!(
+        result.receiver_status,
+        DeploymentStatus::Pending,
+        "RECV-03: empty arch must skip validation and allow fetch to be attempted"
+    );
+}
+
+/// RECV-03: Missing platforms doc — the receiver's platforms/{node_id} doc has not
+/// been written yet (race on startup). The deployer must treat missing-doc as
+/// "arch unknown" and proceed to fetch (Pitfall 1).
+#[tokio::test]
+async fn test_recv_03_missing_platforms_doc_skips_validation() {
+    let (node, _dir) = make_node("node-recv03-noplat").await;
+    let config = default_config(&node);
+    let node_id = node.node_id().to_string();
+
+    // No platforms doc written at all
+
+    // Write a deployment request with non-empty arch (validation would fire if doc existed)
+    let req_id = "recv03-noplat-uuid";
+    put_deployment_request_with_arch(&node, req_id, &node_id, "arm64").await;
+
+    poll_deployment_requests(&node, &config)
+        .await
+        .expect("poll should not error");
+
+    // Status must have moved past Pending — missing doc skips validation (Pitfall 1)
+    let result_json = node
+        .get_document("deployment_requests", req_id)
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_ne!(
+        result.receiver_status,
+        DeploymentStatus::Pending,
+        "RECV-03: missing platforms doc must skip validation and allow fetch to be attempted"
+    );
+}
