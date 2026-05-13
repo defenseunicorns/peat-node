@@ -210,6 +210,44 @@ func (c *Client) GetCommands(ctx context.Context) ([]*sidecarv1.Command, error) 
 	return resp.Msg.Commands, nil
 }
 
+// --- Deployment ---
+
+// PublishDeployment registers a local Zarf package with the blob store and writes
+// a deployment_requests CRDT doc addressed to targetAgentID. Returns the UUID
+// request_id. zarfVars, packageVersion, and architecture may be zero values.
+func (c *Client) PublishDeployment(ctx context.Context, packagePath, targetAgentID string, zarfVars map[string]string, packageVersion, architecture string) (string, error) {
+	resp, err := c.sidecar.PublishDeployment(ctx, connect.NewRequest(&sidecarv1.PublishDeploymentRequest{
+		PackagePath:    packagePath,
+		TargetAgentId:  targetAgentID,
+		ZarfVars:       zarfVars,
+		PackageVersion: packageVersion,
+		Architecture:   architecture,
+	}))
+	if err != nil {
+		return "", err
+	}
+	return resp.Msg.RequestId, nil
+}
+
+// GetDeploymentRequests returns every deployment_requests CRDT doc known to
+// this node (both sent from this node and received from peers).
+func (c *Client) GetDeploymentRequests(ctx context.Context) ([]*sidecarv1.DeploymentRequestDoc, error) {
+	resp, err := c.sidecar.GetDeploymentRequests(ctx, connect.NewRequest(&sidecarv1.GetDeploymentRequestsRequest{}))
+	if err != nil {
+		return nil, err
+	}
+	return resp.Msg.Requests, nil
+}
+
+// ResetDeployment resets a stuck deployment's receiver_status to "pending" so
+// the deployer picks it up on the next poll cycle (CRDT-04).
+func (c *Client) ResetDeployment(ctx context.Context, requestID string) error {
+	_, err := c.sidecar.ResetDeployment(ctx, connect.NewRequest(&sidecarv1.ResetDeploymentRequest{
+		RequestId: requestID,
+	}))
+	return err
+}
+
 // --- Subscriptions ---
 
 // DocumentChange represents a change event from the mesh.
