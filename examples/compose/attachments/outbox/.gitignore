@@ -1,0 +1,4 @@
+# Generated test files from send.sh. The script regenerates these on
+# every run from /dev/urandom; keeping them out of git also avoids
+# committing 100+ MiB of throwaway data.
+test-*.bin
