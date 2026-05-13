@@ -1,18 +1,20 @@
 //! SidecarNode — lifecycle wrapper for the Peat mesh participation stack.
 //!
-//! Follows the same bootstrap pattern as `peat-registry::mesh::node::create_mesh_stack()`:
-//! AutomergeStore + IrohEndpoint + MeshSyncTransport + AutomergeSyncCoordinator.
+//! Bootstrap is delegated to `peat_mesh::sync::AutomergeBackend::with_iroh`,
+//! which subsumes the manual `AutomergeStore` + Iroh `Endpoint` +
+//! `MeshSyncTransport` + `AutomergeSyncCoordinator` + `SyncProtocolHandler` +
+//! `NetworkedIrohBlobStore` wiring this module used to do by hand. Sidecar-
+//! specific layers stay here: encryption-at-rest cipher, the change-event
+//! broadcast channel that `service.rs::subscribe` consumes, the
+//! `connect_peer` retry loop, and the `start_sync`/`stop_sync` flag.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use peat_mesh::security::FormationKey;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{
-    AutomergeStore, AutomergeSyncCoordinator, MeshSyncTransport, NetworkedIrohBlobStore,
-    SyncProtocolHandler, SyncTransport, CAP_AUTOMERGE_ALPN,
-};
+use peat_mesh::storage::{AutomergeStore, SyncTransport};
+use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -38,10 +40,7 @@ pub struct SidecarConfig {
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
 pub struct SidecarNode {
     node_id: String,
-    store: Arc<AutomergeStore>,
-    coordinator: Arc<AutomergeSyncCoordinator>,
-    sync_transport: Arc<MeshSyncTransport>,
-    blob_store: Arc<NetworkedIrohBlobStore>,
+    backend: Arc<AutomergeBackend>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     cipher: Option<StoreCipher>,
@@ -65,73 +64,27 @@ pub enum ChangeType {
 impl SidecarNode {
     /// Create a new SidecarNode, bootstrapping the full P2P sync stack.
     pub async fn new(config: SidecarConfig) -> anyhow::Result<Self> {
-        let automerge_dir = config.data_dir.join("automerge");
-        let iroh_dir = config.data_dir.join("iroh");
-        tokio::fs::create_dir_all(&automerge_dir).await?;
-        tokio::fs::create_dir_all(&iroh_dir).await?;
+        let iroh_bind_addr = config
+            .iroh_udp_port
+            .map(|port| -> anyhow::Result<std::net::SocketAddr> {
+                Ok(format!("0.0.0.0:{port}").parse()?)
+            })
+            .transpose()?;
 
-        // 1. Open Automerge CRDT store
-        let store = Arc::new(AutomergeStore::open(&automerge_dir)?);
-
-        // 2. Build Iroh endpoint with memory lookup.
-        //
-        // `presets::N0DisableRelay` configures the endpoint with n0's DNS/pkarr
-        // discovery but `RelayMode::Disabled`. Our subsequent `.address_lookup`
-        // overrides the n0 DNS publisher with the in-memory lookup used for
-        // explicit `ConnectPeer` peering. Net effect: no dependency on n0's
-        // public relay pool. Operators that need NAT traversal for production
-        // can opt back into a relay by passing a relay URL via the
-        // `ConnectPeer` RPC.
-        let memory_lookup = iroh::address_lookup::memory::MemoryLookup::new();
-        let mut builder = iroh::Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
-            .address_lookup(memory_lookup.clone());
-        if let Some(port) = config.iroh_udp_port {
-            let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse()?;
-            builder = builder.bind_addr(bind_addr)?;
-        }
-        let endpoint = builder.bind().await?;
+        let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
+            data_dir: config.data_dir.clone(),
+            formation_id: config.app_id.clone(),
+            base64_shared_key: config.shared_key.clone(),
+            iroh_bind_addr,
+        })
+        .await?;
 
         info!(
             node_id = %config.node_id,
-            endpoint_id = %endpoint.id(),
+            endpoint_id = %backend.blob_store().endpoint_id(),
             "iroh endpoint bound"
         );
 
-        // 3. Derive formation key from shared secret for peer authentication
-        let formation_key = FormationKey::from_base64(&config.app_id, &config.shared_key)
-            .map_err(|e| anyhow::anyhow!("invalid formation key: {e}"))?;
-
-        // 4. Create sync transport wrapping the Iroh endpoint
-        let sync_transport = Arc::new(MeshSyncTransport::new(
-            endpoint.clone(),
-            formation_key.clone(),
-        ));
-
-        // 5. Create sync coordinator
-        let coordinator = Arc::new(AutomergeSyncCoordinator::new(
-            Arc::clone(&store),
-            sync_transport.clone(),
-        ));
-
-        // 6. Create sync protocol handler (accepts incoming CRDT sync connections)
-        let handler = SyncProtocolHandler::new(
-            sync_transport.clone(),
-            coordinator.clone(),
-            formation_key.clone(),
-        );
-
-        // 7. Create networked blob store with sync protocol registered
-        let blob_store = NetworkedIrohBlobStore::from_endpoint_with_protocols(
-            iroh_dir,
-            endpoint,
-            memory_lookup,
-            vec![(CAP_AUTOMERGE_ALPN, Box::new(handler))],
-        )
-        .await?;
-        // from_endpoint_with_protocols already returns Arc<NetworkedIrohBlobStore>
-        let blob_store = blob_store;
-
-        // Initialize optional encryption cipher
         let cipher = match &config.encryption_key {
             Some(key) if !key.is_empty() => {
                 let c = StoreCipher::from_base64_key(key)?;
@@ -143,29 +96,31 @@ impl SidecarNode {
 
         let (change_tx, _) = broadcast::channel(256);
 
-        // Spawn a task to forward store observer changes to the broadcast channel
-        let observer_rx = store.subscribe_to_observer_changes();
+        // Forward AutomergeStore observer events into our ChangeEvent shape
+        // (collection/doc_id split + cipher decrypt) for service.rs::subscribe.
+        // The backend spawns its own observer-forwarder for `Node::observe()`,
+        // but that emits a different event shape and doesn't decrypt.
+        let observer_rx = backend.store().subscribe_to_observer_changes();
         let change_tx_clone = change_tx.clone();
-        let store_clone = Arc::clone(&store);
+        let store_clone = Arc::clone(backend.store());
         let cipher_clone = cipher.clone();
         tokio::spawn(async move {
             Self::forward_store_changes(observer_rx, change_tx_clone, store_clone, cipher_clone)
                 .await;
         });
 
-        // Spawn a sync loop: when local documents change, push to all peers
-        let sync_rx = store.subscribe_to_changes();
-        let sync_coordinator = Arc::clone(&coordinator);
+        // On every local write, push the doc to all connected peers.
+        // AutomergeBackend doesn't spawn this — its `SyncEngine::start_sync`
+        // is a separate concept (a flag toggle), not the on-change push loop.
+        let sync_rx = backend.store().subscribe_to_changes();
+        let sync_coordinator = Arc::clone(backend.coordinator());
         tokio::spawn(async move {
             Self::sync_on_change(sync_rx, sync_coordinator).await;
         });
 
         Ok(Self {
             node_id: config.node_id,
-            store,
-            coordinator,
-            sync_transport,
-            blob_store,
+            backend,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             cipher,
@@ -175,7 +130,7 @@ impl SidecarNode {
     /// React to local document changes by syncing them with all connected peers.
     async fn sync_on_change(
         mut rx: broadcast::Receiver<String>,
-        coordinator: Arc<AutomergeSyncCoordinator>,
+        coordinator: Arc<peat_mesh::storage::AutomergeSyncCoordinator>,
     ) {
         loop {
             match rx.recv().await {
@@ -249,7 +204,7 @@ impl SidecarNode {
     }
 
     pub fn endpoint_addr(&self) -> String {
-        format!("{}", self.blob_store.endpoint_id())
+        format!("{}", self.backend.blob_store().endpoint_id())
     }
 
     pub fn is_sync_active(&self) -> bool {
@@ -257,16 +212,21 @@ impl SidecarNode {
     }
 
     pub fn connected_peer_count(&self) -> u32 {
-        self.sync_transport.connected_peers().len() as u32
+        self.backend.transport().connected_peers().len() as u32
     }
 
     // --- Sync Control ---
 
     pub async fn start_sync(&self) -> anyhow::Result<()> {
         // Sync all documents with all connected peers
-        let peers = self.sync_transport.connected_peers();
+        let peers = self.backend.transport().connected_peers();
         for peer_id in peers {
-            if let Err(e) = self.coordinator.sync_all_documents_with_peer(peer_id).await {
+            if let Err(e) = self
+                .backend
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
                 warn!(peer = %peer_id, "initial sync failed: {e}");
             }
         }
@@ -285,8 +245,8 @@ impl SidecarNode {
         SyncStats {
             sync_active: self.is_sync_active(),
             connected_peers: self.connected_peer_count(),
-            bytes_sent: self.coordinator.total_bytes_sent(),
-            bytes_received: self.coordinator.total_bytes_received(),
+            bytes_sent: self.backend.coordinator().total_bytes_sent(),
+            bytes_received: self.backend.coordinator().total_bytes_received(),
         }
     }
 
@@ -347,7 +307,10 @@ impl SidecarNode {
             peer_addr = peer_addr.with_relay_url(relay);
         }
 
-        self.blob_store.memory_lookup().add_endpoint_info(peer_addr);
+        self.backend
+            .blob_store()
+            .memory_lookup()
+            .add_endpoint_info(peer_addr);
 
         // Connect and authenticate via formation key handshake.
         //
@@ -368,7 +331,12 @@ impl SidecarNode {
         let mut attempt = 0;
         let connection = loop {
             attempt += 1;
-            match self.sync_transport.connect_and_authenticate(peer_id).await {
+            match self
+                .backend
+                .transport()
+                .connect_and_authenticate(peer_id)
+                .await
+            {
                 Ok(c) => break c,
                 Err(e) if attempt < CONNECT_RETRY_ATTEMPTS => {
                     warn!(
@@ -388,8 +356,9 @@ impl SidecarNode {
         };
 
         // Register the connection for CRDT sync
-        self.sync_transport
-            .start_sync_connection(connection, self.coordinator.clone());
+        self.backend
+            .transport()
+            .start_sync_connection(connection, Arc::clone(self.backend.coordinator()));
 
         info!(peer = endpoint_id_str, "connected to peer");
         Ok(())
@@ -400,11 +369,11 @@ impl SidecarNode {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
         // Close the QUIC connection (causes the background sync task to exit)
-        if let Some(conn) = self.sync_transport.get_connection(&peer_id) {
+        if let Some(conn) = self.backend.transport().get_connection(&peer_id) {
             conn.close(0u32.into(), b"disconnect requested");
         }
-        self.sync_transport.remove_connection(&peer_id);
-        self.coordinator.clear_peer_sync_state(peer_id);
+        self.backend.transport().remove_connection(&peer_id);
+        self.backend.coordinator().clear_peer_sync_state(peer_id);
         // Yield to let background sync tasks observe the closed connection and clean up
         tokio::task::yield_now().await;
         info!(peer = endpoint_id_str, "disconnected from peer");
@@ -412,7 +381,8 @@ impl SidecarNode {
     }
 
     pub fn list_peers(&self) -> Vec<PeerInfoInternal> {
-        self.sync_transport
+        self.backend
+            .transport()
             .connected_peers()
             .into_iter()
             .map(|id| PeerInfoInternal {
@@ -447,10 +417,11 @@ impl SidecarNode {
 
         // Create or update an Automerge document with the (possibly encrypted) value
         let json_value = serde_json::json!({ "value": store_value });
-        let existing = self.store.get(&key)?;
+        let store = self.backend.store();
+        let existing = store.get(&key)?;
         let doc = json_to_automerge(&json_value, existing.as_ref())?;
 
-        self.store.put(&key, &doc)?;
+        store.put(&key, &doc)?;
 
         // Local change notification
         let _ = self.change_tx.send(ChangeEvent {
@@ -469,7 +440,7 @@ impl SidecarNode {
         doc_id: &str,
     ) -> anyhow::Result<Option<String>> {
         let key = format!("{collection}:{doc_id}");
-        match self.store.get(&key)? {
+        match self.backend.store().get(&key)? {
             Some(doc) => {
                 let value = automerge_to_json(&doc)
                     .get("value")
@@ -483,7 +454,7 @@ impl SidecarNode {
 
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
-        self.store.delete(&key)?;
+        self.backend.store().delete(&key)?;
 
         let _ = self.change_tx.send(ChangeEvent {
             collection: collection.to_string(),
@@ -497,7 +468,7 @@ impl SidecarNode {
 
     pub async fn list_documents(&self, collection: &str) -> anyhow::Result<Vec<String>> {
         let prefix = format!("{collection}:");
-        let entries = self.store.scan_prefix(&prefix)?;
+        let entries = self.backend.store().scan_prefix(&prefix)?;
         Ok(entries
             .into_iter()
             .filter_map(|(k, _)| k.strip_prefix(&prefix).map(|s| s.to_string()))
@@ -523,7 +494,7 @@ impl SidecarNode {
 
     /// Shutdown the node gracefully.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.blob_store.shutdown().await?;
+        self.backend.blob_store().shutdown().await?;
         Ok(())
     }
 }
