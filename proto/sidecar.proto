@@ -60,6 +60,16 @@ service PeatSidecar {
   rpc PutCommand(PutCommandRequest) returns (PutCommandResponse);
   rpc GetCommands(GetCommandsRequest) returns (GetCommandsResponse);
 
+  // --- Deployment (P2P Zarf package distribution) ---
+
+  // PublishDeployment registers a local Zarf package with the blob store and
+  // writes a deployment_requests CRDT doc. Returns the request_id (UUID).
+  rpc PublishDeployment(PublishDeploymentRequest) returns (PublishDeploymentResponse);
+
+  // GetDeploymentRequests returns all deployment request docs known to this node
+  // (both sent from this node and received from peers).
+  rpc GetDeploymentRequests(GetDeploymentRequestsRequest) returns (GetDeploymentRequestsResponse);
+
   // --- Subscriptions ---
 
   // Subscribe streams document changes across all or filtered collections.
@@ -342,4 +352,47 @@ message GetSyncStatsResponse {
   uint32 connected_peers = 2;
   uint64 bytes_sent = 3;
   uint64 bytes_received = 4;
+}
+
+// --- Deployment Messages (P2P Zarf package distribution) ---
+
+// PublishDeploymentRequest registers a local Zarf package with this node's blob
+// store and creates a deployment_requests CRDT doc addressed to target_agent_id.
+message PublishDeploymentRequest {
+  // Absolute path to the local .zarf.tar.zst package file on the peat-node host.
+  string package_path = 1;
+  // Node ID of the intended receiver.
+  string target_agent_id = 2;
+  // Optional Zarf variable overrides forwarded to the receiver's `uds zarf` invocation.
+  map<string, string> zarf_vars = 3;
+}
+
+message PublishDeploymentResponse {
+  // UUID of the deployment_requests CRDT doc created by this call.
+  string request_id = 1;
+}
+
+message GetDeploymentRequestsRequest {}
+
+// DeploymentRequestDoc is the proto-shaped view of a deployment_requests CRDT
+// document. sender_status and receiver_status are strings (not proto enums) to
+// preserve the serde snake_case wire format produced by the Rust DeploymentStatus
+// enum (see src/types.rs DeploymentStatus).
+message DeploymentRequestDoc {
+  string id = 1;
+  string target_agent_id = 2;
+  string package_name = 3;
+  string package_version = 4;
+  string architecture = 5;
+  string iroh_blob_hash = 6;
+  string sender_endpoint_id = 7;
+  string blob_ticket = 8;
+  map<string, string> zarf_vars = 9;
+  string sender_status = 10;
+  string receiver_status = 11;
+  int64 created_at = 12;
+}
+
+message GetDeploymentRequestsResponse {
+  repeated DeploymentRequestDoc requests = 1;
 }
