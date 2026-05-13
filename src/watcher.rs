@@ -31,6 +31,18 @@ impl TlsConfig {
     }
 }
 
+/// A minimal, testable reference to a package reported by RA.
+///
+/// Built from the private ZarfPackage inside poll_all so the SYNC-01 helper
+/// can be invoked directly from integration tests without spinning up a fake
+/// RA HTTP server. Intentionally narrow: only the fields SYNC-01 uses.
+#[derive(Debug, Clone)]
+pub struct DeployedPackageRef {
+    pub name: String,
+    pub version: String,
+    pub status_is_deployed: bool,
+}
+
 /// Configuration for the agent watcher.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
@@ -170,6 +182,23 @@ async fn poll_all(
 
     node.put_document("platforms", agent_id, &platform_json.to_string())
         .await?;
+
+    // --- SYNC-01: auto-publish deployed packages to available_packages ---
+    let arch = status
+        .as_ref()
+        .and_then(|s| s.architecture.as_deref())
+        .unwrap_or("unknown");
+    let refs: Vec<DeployedPackageRef> = packages
+        .iter()
+        .filter_map(|p| {
+            Some(DeployedPackageRef {
+                name: p.name.as_deref()?.to_string(),
+                version: p.version.as_deref()?.to_string(),
+                status_is_deployed: p.status == Some(2),
+            })
+        })
+        .collect();
+    sync_available_packages(node, &refs, arch, now).await;
 
     debug!(
         agent_id,
@@ -631,3 +660,93 @@ async fn poll_pods(
     Ok(())
 }
 
+/// SYNC-01: auto-publish deployed packages into the available_packages CRDT collection.
+///
+/// For each DeployedPackageRef where status_is_deployed is true:
+///   1. Compute pkg_ref = "{name}-{version}-{arch}".
+///   2. Skip if available_packages/{pkg_ref} already exists (SYNC-02 immutability).
+///   3. Look up a matching local blob via node.list_local_blobs() — the blob MUST have
+///      already been published locally (via publish_blob) for the package to be advertised.
+///      This is Recommendation A from 02-RESEARCH.md §Open Questions #1.
+///   4. Serialize an AvailablePackage struct and write it to available_packages/{pkg_ref}.
+///
+/// Per-package errors are logged at warn! and skipped; the caller's poll cycle continues.
+/// BlobMetadata accessor: t.metadata.name is a public field (Option<String>), accessed
+/// via .as_deref() (field form, not method call).
+pub async fn sync_available_packages(
+    node: &crate::node::SidecarNode,
+    packages: &[DeployedPackageRef],
+    arch: &str,
+    now: i64,
+) {
+    // Snapshot local blobs once per call (cheap — scans .meta.json sidecars synchronously).
+    let local_blobs = node.list_local_blobs();
+
+    for pkg in packages {
+        if !pkg.status_is_deployed {
+            continue;
+        }
+        if pkg.name.is_empty() || pkg.version.is_empty() {
+            continue;
+        }
+        let pkg_ref = format!("{}-{}-{}", pkg.name, pkg.version, arch);
+
+        // Idempotency guard — SYNC-02 immutability.
+        match node.get_document("available_packages", &pkg_ref).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(e) => {
+                warn!(pkg_ref = %pkg_ref, "SYNC-01: failed to check available_packages: {e}");
+                continue;
+            }
+        }
+
+        // Match a local blob by metadata name. publish_blob callers typically use
+        // filenames like "{name}-{version}-{arch}.zarf.tar.zst"; we do a tolerant
+        // substring match on name AND version to absorb minor filename variations.
+        // BlobMetadata.name is a public field (Option<String>), accessed via .as_deref().
+        let matched = local_blobs.iter().find(|t| {
+            let blob_name = t.metadata.name.as_deref().unwrap_or("");
+            blob_name.contains(&pkg.name) && blob_name.contains(&pkg.version)
+        });
+        let token = match matched {
+            Some(t) => t,
+            None => {
+                debug!(
+                    pkg = %pkg.name,
+                    version = %pkg.version,
+                    arch,
+                    "SYNC-01: no matching local blob; skipping advertisement (Recommendation A)"
+                );
+                continue;
+            }
+        };
+
+        let avail = crate::types::AvailablePackage {
+            name: pkg.name.clone(),
+            version: pkg.version.clone(),
+            architecture: arch.to_string(),
+            iroh_blob_hash: token.hash.as_hex().to_string(),
+            sender_endpoint_id: node.endpoint_addr(),
+            published_at: now,
+        };
+
+        let json = match serde_json::to_string(&avail) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(pkg_ref = %pkg_ref, "SYNC-01: failed to serialize AvailablePackage: {e}");
+                continue;
+            }
+        };
+
+        if let Err(e) = node.put_document("available_packages", &pkg_ref, &json).await {
+            warn!(pkg_ref = %pkg_ref, "SYNC-01: failed to write available_packages doc: {e}");
+        } else {
+            info!(
+                pkg_ref = %pkg_ref,
+                iroh_blob_hash = %token.hash.as_hex(),
+                "SYNC-01: advertised package to available_packages"
+            );
+        }
+    }
+}
