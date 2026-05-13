@@ -34,7 +34,7 @@ use std::task::{Context, Poll};
 use connectrpc::ConnectError;
 use peat_mesh::storage::blob_traits::{BlobHash, BlobMetadata, BlobStore, BlobToken};
 use peat_protocol::storage::file_distribution::{
-    DistributionScope, FileDistribution, TransferPriority,
+    DistributionHandle, DistributionScope, FileDistribution, TransferPriority,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -45,13 +45,18 @@ use crate::attachments::validate::{ValidatedBundle, ValidatedFile, ValidatedScop
 /// One file's ingest result. Maps directly onto the `AttachmentHandle` wire
 /// message returned in [`pb::SendAttachmentsResponse`].
 ///
+/// Carries the full [`DistributionHandle`] (not just the distribution_id)
+/// so subsequent calls to [`FileDistribution::status`] /
+/// [`FileDistribution::cancel`] can pass the handle peat-protocol gave us
+/// rather than reconstructing one with dummy fields.
+///
 /// [`pb::SendAttachmentsResponse`]: crate::pb::SendAttachmentsResponse
 #[derive(Debug, Clone)]
 pub struct IngestedBlob {
     /// Position in the caller's `SendAttachmentsRequest::files`.
     pub file_index: usize,
     pub blob_token: BlobToken,
-    pub distribution_id: String,
+    pub distribution_handle: DistributionHandle,
 }
 
 /// Ingest every file in a validated bundle, then start a distribution per
@@ -104,7 +109,7 @@ where
             Ok(h) => handles.push(IngestedBlob {
                 file_index: file.file_index,
                 blob_token: token.clone(),
-                distribution_id: h.distribution_id,
+                distribution_handle: h,
             }),
             Err(e) => {
                 rollback(blob_store, &created, &pre_existing).await;

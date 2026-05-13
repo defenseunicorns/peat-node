@@ -65,6 +65,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
+use peat_protocol::storage::file_distribution::DistributionHandle;
+
 use crate::attachments::validate::ValidatedFile;
 
 /// Subset of `ValidatedFile` that participates in the bundle-id identity
@@ -112,11 +114,22 @@ impl BundleIdentity {
 pub struct AttachmentHandleRecord {
     pub file_index: usize,
     pub blob_token_hash: String,
-    pub distribution_id: String,
+    /// The full handle returned by `FileDistribution::distribute`. Stored
+    /// so subsequent `file_distribution.status / cancel` calls receive
+    /// the exact handle peat-protocol issued, not a partial reconstruction.
+    pub distribution_handle: DistributionHandle,
     /// Original metadata. Resubmits never overwrite — PRD Rule 12
     /// "original values retained".
     pub content_type: Option<String>,
     pub display_name: Option<String>,
+}
+
+impl AttachmentHandleRecord {
+    /// Convenience accessor — the distribution_id key used by the registry
+    /// reverse index.
+    pub fn distribution_id(&self) -> &str {
+        &self.distribution_handle.distribution_id
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,7 +297,7 @@ impl BundleRegistry {
         for h in &record.handles {
             inner
                 .distribution_index
-                .insert(h.distribution_id.clone(), record.bundle_id.clone());
+                .insert(h.distribution_id().to_string(), record.bundle_id.clone());
         }
         inner.bundles.insert(record.bundle_id.clone(), record);
     }
@@ -377,7 +390,7 @@ fn drop_record(inner: &mut RegistryInner, rec: &BundleRecord) {
 /// itself has already been removed via `bundles.remove`).
 fn drop_record_indexes_only(inner: &mut RegistryInner, rec: &BundleRecord) {
     for h in &rec.handles {
-        inner.distribution_index.remove(&h.distribution_id);
+        inner.distribution_index.remove(h.distribution_id());
     }
 }
 
@@ -399,15 +412,25 @@ mod tests {
     }
 
     fn record(bundle_id: &str, identity: BundleIdentity, dist_ids: &[&str]) -> BundleRecord {
+        use peat_mesh::storage::blob_traits::BlobHash;
+        use peat_protocol::storage::file_distribution::{DistributionScope, TransferPriority};
         let handles = dist_ids
             .iter()
             .enumerate()
-            .map(|(i, d)| AttachmentHandleRecord {
-                file_index: i,
-                blob_token_hash: format!("token-{i}"),
-                distribution_id: (*d).to_string(),
-                content_type: None,
-                display_name: None,
+            .map(|(i, d)| {
+                let mut handle = DistributionHandle::new(
+                    BlobHash(format!("token-{i}")),
+                    DistributionScope::AllNodes,
+                    TransferPriority::Normal,
+                );
+                handle.distribution_id = (*d).to_string();
+                AttachmentHandleRecord {
+                    file_index: i,
+                    blob_token_hash: format!("token-{i}"),
+                    distribution_handle: handle,
+                    content_type: None,
+                    display_name: None,
+                }
             })
             .collect();
         BundleRecord::new(bundle_id.to_string(), identity, handles)
@@ -431,7 +454,7 @@ mod tests {
             BundleLookup::Idempotent(rec) => {
                 assert_eq!(rec.bundle_id, "X");
                 assert_eq!(rec.handles.len(), 1);
-                assert_eq!(rec.handles[0].distribution_id, "dist-a");
+                assert_eq!(rec.handles[0].distribution_id(), "dist-a");
             }
             other => panic!("expected Idempotent, got {other:?}"),
         }
@@ -460,7 +483,7 @@ mod tests {
             BundleLookup::Idempotent(rec) => {
                 // The stored handles are unchanged — original metadata
                 // (which would live on the handle record) is preserved.
-                assert_eq!(rec.handles[0].distribution_id, "dist-x");
+                assert_eq!(rec.handles[0].distribution_id(), "dist-x");
             }
             other => panic!("expected Idempotent, got {other:?}"),
         }
@@ -482,7 +505,7 @@ mod tests {
                 // is preserved, not overwritten.
                 let got = reg.get("X").expect("bundle X must remain resident");
                 assert_eq!(got.created_at, created_at);
-                assert_eq!(got.handles[0].distribution_id, "dist-a");
+                assert_eq!(got.handles[0].distribution_id(), "dist-a");
             }
             other => panic!("expected Conflict, got {other:?}"),
         }

@@ -182,6 +182,13 @@ impl SidecarNode {
         self.file_distribution.as_ref()
     }
 
+    /// PRD-006 ingest target — the iroh blob store the backend holds.
+    /// Exposed for the attachment handlers; otherwise prefer the
+    /// higher-level mesh operations.
+    pub fn blob_store(&self) -> &peat_mesh::storage::NetworkedIrohBlobStore {
+        self.backend.blob_store()
+    }
+
     /// React to local document changes by syncing them with all connected peers.
     async fn sync_on_change(
         mut rx: broadcast::Receiver<String>,

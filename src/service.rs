@@ -478,22 +478,23 @@ impl pb::PeatSidecar for PeatSidecarService {
 
     async fn send_attachments(
         &self,
-        _ctx: Context,
-        _request: OwnedView<pb::SendAttachmentsRequestView<'static>>,
+        ctx: Context,
+        request: OwnedView<pb::SendAttachmentsRequestView<'static>>,
     ) -> Result<(pb::SendAttachmentsResponse, Context), ConnectError> {
-        Err(ConnectError::unimplemented(
-            "SendAttachments requires --attachment-root to be configured",
-        ))
+        let req = request.to_owned_message();
+        let resp = crate::attachments::handlers::send_attachments(&self.node, req).await?;
+        Ok((resp, ctx))
     }
 
     async fn get_attachment_distribution(
         &self,
-        _ctx: Context,
-        _request: OwnedView<pb::GetAttachmentDistributionRequestView<'static>>,
+        ctx: Context,
+        request: OwnedView<pb::GetAttachmentDistributionRequestView<'static>>,
     ) -> Result<(pb::GetAttachmentDistributionResponse, Context), ConnectError> {
-        Err(ConnectError::unimplemented(
-            "GetAttachmentDistribution requires --attachment-root to be configured",
-        ))
+        let req = request.to_owned_message();
+        let resp =
+            crate::attachments::handlers::get_attachment_distribution(&self.node, req).await?;
+        Ok((resp, ctx))
     }
 
     async fn subscribe_attachment_bundle(
@@ -507,19 +508,22 @@ impl pb::PeatSidecar for PeatSidecarService {
         ),
         ConnectError,
     > {
+        // 7b lands the late-subscribe multiplexer; until then this RPC is
+        // intentionally unimplemented even when --attachment-root is set.
         Err(ConnectError::unimplemented(
-            "SubscribeAttachmentBundle requires --attachment-root to be configured",
+            "SubscribeAttachmentBundle is wired in a follow-up step",
         ))
     }
 
     async fn cancel_attachment_distribution(
         &self,
-        _ctx: Context,
-        _request: OwnedView<pb::CancelAttachmentDistributionRequestView<'static>>,
+        ctx: Context,
+        request: OwnedView<pb::CancelAttachmentDistributionRequestView<'static>>,
     ) -> Result<(pb::CancelAttachmentDistributionResponse, Context), ConnectError> {
-        Err(ConnectError::unimplemented(
-            "CancelAttachmentDistribution requires --attachment-root to be configured",
-        ))
+        let req = request.to_owned_message();
+        let resp =
+            crate::attachments::handlers::cancel_attachment_distribution(&self.node, req).await?;
+        Ok((resp, ctx))
     }
 }
 

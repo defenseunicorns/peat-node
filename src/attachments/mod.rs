@@ -20,6 +20,7 @@
 //! handlers land in Step 7.
 
 pub mod config;
+pub mod handlers;
 pub mod ingest;
 pub mod registry;
 pub mod validate;
