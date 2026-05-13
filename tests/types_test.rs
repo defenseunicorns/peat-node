@@ -24,6 +24,7 @@ fn sample_deployment_request() -> DeploymentRequest {
         sender_status: DeploymentStatus::Pending,
         receiver_status: DeploymentStatus::Pending,
         created_at: 1_700_000_000,
+        blob_ticket: "ticket-a".to_string(),
     }
 }
 
@@ -55,6 +56,7 @@ fn test_deployment_request_serde_round_trip() {
     assert_eq!(parsed.sender_status, original.sender_status);
     assert_eq!(parsed.receiver_status, original.receiver_status);
     assert_eq!(parsed.created_at, original.created_at);
+    assert_eq!(parsed.blob_ticket, original.blob_ticket);
 }
 
 #[test]
@@ -68,6 +70,10 @@ fn test_deployment_request_has_no_shared_status_field() {
     assert!(
         !obj.contains_key("status"),
         "must NOT carry a shared `status` field (Automerge LWW race guard per D-02)"
+    );
+    assert!(
+        obj.contains_key("blob_ticket"),
+        "DeploymentRequest must carry blob_ticket field (Phase 2)"
     );
 }
 

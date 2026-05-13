@@ -56,6 +56,9 @@ pub struct DeploymentRequest {
     pub receiver_status: DeploymentStatus,
     /// Unix timestamp (seconds) when this request was created.
     pub created_at: i64,
+    /// JSON-encoded blob ticket: {"hash":"<hex>","size_bytes":<u64>,"sender_endpoint_id":"<hex>"}.
+    /// Phase 3 parses this to wire the blob peer index before calling fetch_blob.
+    pub blob_ticket: String,
 }
 
 /// Locked schema for `available_packages/{pkg_ref}` CRDT documents.
