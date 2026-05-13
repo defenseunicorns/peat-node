@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Send `outbox/hello.txt` through peat-node's SendAttachments RPC.
 #
-# Prereqs: docker compose up -d && curl + sha256sum + base64 + jq on PATH.
+# Prereqs: docker compose up -d && curl + openssl + base64 + jq on PATH.
+# (openssl is more ubiquitous than xxd for the hex-bytes → base64 conversion
+# the wire format needs.)
 #
 # What this exercises end-to-end:
 #   - The attachment safety default (the RPC is enabled because the
@@ -24,9 +26,12 @@ if [[ ! -f "${LOCAL_PATH}" ]]; then
 fi
 
 SIZE=$(wc -c < "${LOCAL_PATH}" | tr -d ' ')
-SHA256_HEX=$(sha256sum "${LOCAL_PATH}" | cut -d' ' -f1)
-# Proto3 JSON encodes the `bytes` field as base64.
-SHA256_B64=$(printf '%s' "${SHA256_HEX}" | xxd -r -p | base64)
+# Proto3 JSON encodes the `bytes` field as base64. Compute the sha256 as
+# raw bytes once and pipe directly to base64 — avoids `xxd` (often
+# missing on minimal Linux images) and the hex-string intermediate.
+SHA256_B64=$(openssl dgst -sha256 -binary "${LOCAL_PATH}" | base64 | tr -d '\n')
+# Also keep a hex form for the human-readable log line.
+SHA256_HEX=$(openssl dgst -sha256 -hex "${LOCAL_PATH}" | awk '{print $NF}')
 
 echo ">>> SendAttachments: ${FILE} (${SIZE} bytes, sha256=${SHA256_HEX:0:16}...)"
 
