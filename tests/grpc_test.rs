@@ -15,14 +15,18 @@ use peat_node::service::PeatSidecarService;
 /// Boot a Connect RPC server on the given port and return a reqwest client + base URL.
 async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Client, String) {
     let dir = tempfile::tempdir().unwrap();
+    let dir_path = dir.keep();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
             node_id: format!("test-{port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),
-            data_dir: dir.keep(),
+            data_dir: dir_path.clone(),
             peers: vec![],
             encryption_key,
+            enable_deployer: false,
+            blob_work_dir: dir_path.join("blobs"),
+            download_timeout_secs: 30,
         })
         .await
         .unwrap(),

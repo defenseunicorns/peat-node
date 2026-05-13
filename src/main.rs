@@ -79,11 +79,6 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_AGENT_TLS_CA")]
     agent_tls_ca: Option<PathBuf>,
 
-    // --- CV Inference Integration ---
-    /// CV inference service address for polling model metrics.
-    /// Example: http://localhost:30080
-    #[arg(long, env = "PEAT_NODE_CV_ADDR")]
-    cv_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -111,6 +106,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.data_dir).await?;
 
     // Bootstrap the mesh node
+    // TODO(Plan 03): wire --enable-deployer, --blob-work-dir, --download-timeout-secs
+    // clap flags here. Temporary defaults satisfy the compiler until Plan 03 lands.
+    let blob_work_dir = args.data_dir.join("blobs");
     let config = SidecarConfig {
         node_id: node_id.clone(),
         app_id: args.app_id,
@@ -118,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
         data_dir: args.data_dir,
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
+        enable_deployer: false,
+        blob_work_dir,
+        download_timeout_secs: 30,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
@@ -148,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
                 key: args.agent_tls_key,
                 ca_cert: args.agent_tls_ca,
             },
-            cv_addr: args.cv_addr,
         };
         let watcher_node = Arc::clone(&node);
         tokio::spawn(async move {

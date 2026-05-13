@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use peat_mesh::storage::json_convert::automerge_to_json;
+use peat_mesh::storage::{BlobMetadata, BlobStore, BlobToken, IrohBlobStore};
 use peat_mesh::storage::AutomergeStore;
 use peat_protocol::network::IrohTransport;
 use peat_protocol::storage::{AutomergeBackend, StorageBackend};
@@ -27,6 +28,12 @@ pub struct SidecarConfig {
     pub data_dir: PathBuf,
     pub peers: Vec<String>,
     pub encryption_key: Option<String>,
+    /// Enable the deployer task (disabled by default; explicit opt-in on receiver nodes).
+    pub enable_deployer: bool,
+    /// Directory for blob storage and metadata sidecars. Never under /tmp (K8s memory-backed).
+    pub blob_work_dir: PathBuf,
+    /// Timeout in seconds for blob download operations.
+    pub download_timeout_secs: u64,
 }
 
 /// Manages the full Peat mesh stack using peat-protocol for wire compatibility.
@@ -39,6 +46,9 @@ pub struct SidecarNode {
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     cipher: Option<StoreCipher>,
+    blob_store: IrohBlobStore,
+    blob_work_dir: PathBuf,
+    enable_deployer: bool,
 }
 
 /// Internal change event for the broadcast channel.
@@ -61,6 +71,51 @@ impl SidecarNode {
     pub async fn new(config: SidecarConfig) -> anyhow::Result<Self> {
         let storage_path = config.data_dir.clone();
         tokio::fs::create_dir_all(&storage_path).await?;
+
+        // Phase 1 — BLOB-01 / BLOB-02: wire IrohBlobStore (MemStore tier per D-04).
+        tokio::fs::create_dir_all(&config.blob_work_dir).await?;
+        let blob_store = IrohBlobStore::new_in_memory(config.blob_work_dir.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize blob store at {}: {e}", config.blob_work_dir.display()))?;
+
+        // Startup re-import (D-05 / BLOB-02):
+        // list_local_blobs() scans .meta.json sidecars in blob_work_dir; for each token we
+        // reload the raw bytes from disk into the fresh MemStore so the sender can resume
+        // serving blobs after a process restart. MemStore itself is not persistent.
+        let existing_blobs = blob_store.list_local_blobs();
+        let mut reimported: usize = 0;
+        let mut skipped: usize = 0;
+        for token in &existing_blobs {
+            let blob_file = config.blob_work_dir.join(token.hash.as_hex());
+            if !blob_file.exists() {
+                tracing::warn!(
+                    hash = %token.hash.as_hex(),
+                    "sidecar exists but blob file missing; skipping re-import"
+                );
+                skipped += 1;
+                continue;
+            }
+            match tokio::fs::read(&blob_file).await {
+                Ok(content) => {
+                    if let Err(e) = blob_store.store().add_bytes(content).await {
+                        tracing::warn!(hash = %token.hash.as_hex(), "failed to re-import blob: {e}");
+                        skipped += 1;
+                    } else {
+                        reimported += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(hash = %token.hash.as_hex(), "blob file unreadable: {e}");
+                    skipped += 1;
+                }
+            }
+        }
+        tracing::info!(
+            blob_work_dir = %config.blob_work_dir.display(),
+            reimported,
+            skipped,
+            "startup blob re-import complete"
+        );
 
         // 1. Open Automerge CRDT store (same as peat-ffi)
         let store = Arc::new(AutomergeStore::open(&storage_path)?);
@@ -148,6 +203,9 @@ impl SidecarNode {
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             cipher,
+            blob_store,
+            blob_work_dir: config.blob_work_dir,
+            enable_deployer: config.enable_deployer,
         })
     }
 
@@ -422,6 +480,41 @@ impl SidecarNode {
             .into_iter()
             .filter_map(|(k, _)| k.strip_prefix(&prefix).map(|s| s.to_string()))
             .collect())
+    }
+
+    /// Publish a local file to the Iroh blob store.
+    ///
+    /// Returns a BlobToken containing the BLAKE3 content hash and size in bytes.
+    /// The file is read, hashed, added to the MemStore, its .meta.json sidecar is
+    /// written to blob_work_dir, and the raw bytes are exported to
+    /// `blob_work_dir/{hash_hex}` so that a subsequent restart can re-import it.
+    ///
+    /// BLOB-01: content-addressed publish.
+    pub async fn publish_blob(
+        &self,
+        path: &std::path::Path,
+        name: &str,
+    ) -> anyhow::Result<BlobToken> {
+        let metadata = BlobMetadata::with_name(name);
+        let token = self.blob_store.create_blob(path, metadata).await?;
+
+        // Per RESEARCH.md Pitfall 3: create_blob writes the sidecar but does NOT
+        // export the raw bytes to disk. Export explicitly so the next SidecarNode
+        // startup can re-import this blob (BLOB-02). Use blob_work_dir stored on
+        // self (fallback option (a) per plan) since IrohBlobStore::blob_dir() may
+        // differ between peat-mesh 0.5.2 local source and 0.8.2 crates.io.
+        let blob_file = self.blob_work_dir.join(token.hash.as_hex());
+        if !blob_file.exists() {
+            let bytes = tokio::fs::read(path).await?;
+            tokio::fs::write(&blob_file, &bytes).await?;
+        }
+        Ok(token)
+    }
+
+    /// List all blobs known locally (by sidecar scan).
+    /// Exposed as a read-only helper for tests and Phase 3 discovery code.
+    pub fn list_local_blobs(&self) -> Vec<BlobToken> {
+        self.blob_store.list_local_blobs()
     }
 
     fn maybe_decrypt(&self, value: Option<String>) -> anyhow::Result<Option<String>> {

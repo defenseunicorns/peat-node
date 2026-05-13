@@ -17,6 +17,9 @@ async fn test_node_with_encryption(
         data_dir: dir.to_path_buf(),
         peers: vec![],
         encryption_key,
+        enable_deployer: false,
+        blob_work_dir: dir.join("blobs"),
+        download_timeout_secs: 30,
     })
     .await
     .expect("failed to create node")

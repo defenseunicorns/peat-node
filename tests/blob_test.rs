@@ -60,24 +60,58 @@ async fn test_publish_blob_creates_sidecar_on_disk() {
 
 #[tokio::test]
 async fn test_blob_reimport_across_restart() {
-    let tmp = tempfile::tempdir().unwrap();
-    let blob_work_dir = tmp.path().join("blobs");
+    // Use a persistent root dir for blob_work_dir (the part that must survive restart),
+    // but separate data_dirs for each SidecarNode instance to avoid redb lock contention
+    // (AutomergeStore opens an exclusive redb lock on data_dir).
+    let root = tempfile::tempdir().unwrap();
+    let blob_work_dir = root.path().join("blobs");
 
     // --- Session 1: publish a blob ---
     let published_hash_hex = {
-        let node = test_node_at(tmp.path()).await;
-        let file_path = tmp.path().join("input.bin");
+        let data_dir1 = root.path().join("node1");
+        std::fs::create_dir_all(&data_dir1).unwrap();
+        let node = SidecarNode::new(SidecarConfig {
+            node_id: "test-node-1".to_string(),
+            app_id: "test".to_string(),
+            shared_key: String::new(),
+            data_dir: data_dir1,
+            peers: vec![],
+            encryption_key: None,
+            enable_deployer: false,
+            blob_work_dir: blob_work_dir.clone(),
+            download_timeout_secs: 30,
+        })
+        .await
+        .expect("failed to create node1");
+
+        let file_path = root.path().join("input.bin");
         std::fs::write(&file_path, b"File content for testing").unwrap();
         let token = node.publish_blob(&file_path, "input.bin").await.unwrap();
         token.hash.as_hex().to_string()
-    }; // node1 dropped here
+    }; // node1 dropped here — redb lock released
 
     // Sanity: sidecar survived the drop
     let sidecar = blob_work_dir.join(format!("{}.meta.json", &published_hash_hex));
     assert!(sidecar.exists(), "sidecar must persist on disk after node drop");
 
     // --- Session 2: new SidecarNode at the SAME blob_work_dir should re-import ---
-    let node2 = test_node_at(tmp.path()).await;
+    // Use a fresh data_dir (simulates a process restart with persistent blob storage)
+    let data_dir2 = root.path().join("node2");
+    std::fs::create_dir_all(&data_dir2).unwrap();
+    let node2 = SidecarNode::new(SidecarConfig {
+        node_id: "test-node-2".to_string(),
+        app_id: "test".to_string(),
+        shared_key: String::new(),
+        data_dir: data_dir2,
+        peers: vec![],
+        encryption_key: None,
+        enable_deployer: false,
+        blob_work_dir: blob_work_dir.clone(),
+        download_timeout_secs: 30,
+    })
+    .await
+    .expect("failed to create node2");
+
     let tokens = node2.list_local_blobs();
     let found = tokens.iter().any(|t| t.hash.as_hex() == published_hash_hex);
     assert!(
