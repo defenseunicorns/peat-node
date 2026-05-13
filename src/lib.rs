@@ -1,3 +1,4 @@
+pub mod cli_validation;
 pub mod crypto;
 pub mod node;
 pub mod service;
