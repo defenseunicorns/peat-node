@@ -116,6 +116,40 @@ async fn poll_deployment_requests_with_guard(
             }
         }
 
+        // RECV-03: arch validation BEFORE blob fetch.
+        // Must release the in-progress guard on every code path that `continue`s.
+        let arch_check = match validate_architecture(node, &req).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(doc_id = %req.id, "deployer: arch validation read failed: {e}");
+                // Release guard, skip this doc this cycle — next tick will retry
+                let mut g = in_progress.lock().await;
+                g.remove(&req.id);
+                continue;
+            }
+        };
+
+        if let ArchCheck::Mismatch { local, requested } = arch_check {
+            // Pitfall 7: release the in-progress guard on arch-failure path
+            req.receiver_status = DeploymentStatus::Failed;
+            warn!(
+                doc_id = %req.id,
+                local_arch = %local,
+                requested_arch = %requested,
+                "deployer: RECV-03 arch mismatch, writing receiver_status = Failed"
+            );
+            let updated = serde_json::to_string(&req)?;
+            if let Err(e) = node
+                .put_document("deployment_requests", &req.id, &updated)
+                .await
+            {
+                warn!(doc_id = %req.id, "deployer: failed to write arch-mismatch Failed: {e}");
+            }
+            let mut g = in_progress.lock().await;
+            g.remove(&req.id);
+            continue;
+        }
+
         let result = fetch_for_deployment(node, &req).await;
 
         // Record status transition — write back to CRDT store regardless of success/failure
@@ -148,6 +182,71 @@ async fn poll_deployment_requests_with_guard(
         }
     }
     Ok(())
+}
+
+/// Result of the RECV-03 architecture compatibility check.
+#[derive(Debug)]
+enum ArchCheck {
+    /// Arches agree, or req.architecture is empty, or platforms doc is missing/has no arch.
+    Match,
+    /// Both arches are non-empty strings AND they differ.
+    Mismatch { local: String, requested: String },
+}
+
+/// RECV-03: Read the receiver's own `platforms/{node_id}` doc and compare the
+/// `architecture` field against `req.architecture`. Returns:
+///   - Ok(Match)       — arches agree OR req.architecture is empty (Pitfall 5)
+///                      OR platforms doc is missing / has no arch (Pitfall 1)
+///   - Ok(Mismatch)    — both arches are non-empty strings AND they differ
+///   - Err(e)          — CRDT read failure (bubble up; caller writes Failed)
+///
+/// The deployer treats Mismatch as a terminal Failed state and does NOT fetch.
+async fn validate_architecture(
+    node: &SidecarNode,
+    req: &DeploymentRequest,
+) -> anyhow::Result<ArchCheck> {
+    // Pitfall 5: empty arch on the request means the sender did not claim an arch.
+    // Proceed to fetch — the package file itself carries arch info.
+    if req.architecture.is_empty() {
+        return Ok(ArchCheck::Match);
+    }
+
+    // Pitfall 1: platforms/{node_id} may not yet be written on the first poll
+    // after process start. Treat missing as "arch unknown" and proceed.
+    let Some(json) = node.get_document("platforms", node.node_id()).await? else {
+        debug!(
+            doc_id = %req.id,
+            "deployer: platforms doc missing, skipping arch validation"
+        );
+        return Ok(ArchCheck::Match);
+    };
+
+    let platform: serde_json::Value =
+        serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+    let local_arch = platform.get("architecture").and_then(|v| v.as_str());
+
+    match local_arch {
+        None => {
+            debug!(
+                doc_id = %req.id,
+                "deployer: platforms doc has no architecture field, skipping validation"
+            );
+            Ok(ArchCheck::Match)
+        }
+        Some(arch) if arch == req.architecture => Ok(ArchCheck::Match),
+        Some(arch) => {
+            warn!(
+                doc_id = %req.id,
+                local_arch = %arch,
+                request_arch = %req.architecture,
+                "deployer: RECV-03 arch mismatch — will mark Failed without fetch"
+            );
+            Ok(ArchCheck::Mismatch {
+                local: arch.to_string(),
+                requested: req.architecture.clone(),
+            })
+        }
+    }
 }
 
 /// BLOB-03 + BLOB-04: three-step peer wiring followed by a progress-emitting fetch.
