@@ -222,3 +222,107 @@ async fn two_subscribers_each_receive_terminal_frame() {
     assert!(is_terminal(&frame_b));
     assert_eq!(frame_a.distribution_id, frame_b.distribution_id);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// PRD §Testing Plan test 28 — subscribe_after_terminal_emits_snapshot_then_eof
+// ─────────────────────────────────────────────────────────────────────
+
+/// Send a 2-file bundle, wait for both distributions to terminate, then
+/// subscribe. The PRD contract is: emit exactly one snapshot frame per
+/// distribution, then close — no hang, no precondition error.
+///
+/// PRD's named version of this test drives one distribution to FAILED
+/// via fault injection. We don't currently have a fault-injection hook,
+/// so the zero-peer scenario is the next-best-equivalent: both
+/// distributions terminate as Completed (the zero-target short-circuit
+/// in the watcher) and the subscribe handler still has to walk the
+/// snapshot-then-close path for 2 frames rather than 1. Mixed Completed
+/// + Failed coverage is parked under the deferred-tests file with a
+/// fault-injection hook follow-up.
+#[tokio::test]
+async fn subscribe_after_terminal_emits_snapshot_then_eof() {
+    let (node, root, _root_guard) = boot_with_attachments().await;
+
+    let payload_a = b"file A";
+    let payload_b = b"file B";
+    std::fs::write(root.join("a.bin"), payload_a).unwrap();
+    std::fs::write(root.join("b.bin"), payload_b).unwrap();
+
+    let send_req = pb::SendAttachmentsRequest {
+        files: vec![
+            pb::FileSpec {
+                root_name: "outbox".into(),
+                relative_path: "a.bin".into(),
+                size_bytes: payload_a.len() as u64,
+                sha256: sha256_of(payload_a),
+                ..Default::default()
+            },
+            pb::FileSpec {
+                root_name: "outbox".into(),
+                relative_path: "b.bin".into(),
+                size_bytes: payload_b.len() as u64,
+                sha256: sha256_of(payload_b),
+                ..Default::default()
+            },
+        ],
+        scope: buffa::MessageField::some(pb::DistributionScopeSpec {
+            scope: Some(pb::distribution_scope_spec::Scope::AllNodes(Box::default())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let resp = handlers::send_attachments(&node, send_req).await.unwrap();
+    let bundle_id = resp.bundle_id.clone();
+    assert_eq!(resp.handles.len(), 2);
+
+    // Let both watchers terminate before subscribing. The zero-peer
+    // short-circuit fires on the initial status check, so the wait is
+    // generous-but-bounded.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut stream = handlers::subscribe_attachment_bundle(
+        &node,
+        pb::SubscribeAttachmentBundleRequest {
+            bundle_id,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Drain the stream — should yield exactly 2 terminal frames then close.
+    let mut received = Vec::new();
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("stream must not hang")
+    {
+        let frame = item.expect("frame must not be Err");
+        received.push(frame);
+    }
+
+    assert_eq!(
+        received.len(),
+        2,
+        "expected exactly 2 terminal frames (one per distribution), got {}",
+        received.len()
+    );
+    for f in &received {
+        assert!(
+            is_terminal(f),
+            "every frame in the all-terminal snapshot must carry a terminal status, got {:?}",
+            distribution_status(f)
+        );
+    }
+
+    // Distribution IDs must match the two issued by SendAttachments,
+    // unordered.
+    let issued: std::collections::HashSet<String> = resp
+        .handles
+        .iter()
+        .map(|h| h.distribution_id.clone())
+        .collect();
+    let observed: std::collections::HashSet<String> =
+        received.iter().map(|f| f.distribution_id.clone()).collect();
+    assert_eq!(issued, observed);
+}
