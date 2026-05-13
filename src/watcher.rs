@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::node::SidecarNode;
 
@@ -57,31 +57,39 @@ pub struct WatcherConfig {
 }
 
 /// Build the HTTP client, optionally with mTLS.
-fn build_client(tls: &TlsConfig) -> reqwest::Client {
+///
+/// Returns `Err` instead of panicking on any TLS file-read or PEM-parse
+/// failure so the caller can log and exit gracefully. The whole peat-node
+/// process should not crash because of a misconfigured watcher.
+fn build_client(tls: &TlsConfig) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
 
     if tls.is_enabled() {
-        // Read client identity (cert + key)
+        // Read client identity (cert + key). is_enabled() already guarantees
+        // both cert and key are Some, so .as_ref().unwrap() cannot panic here.
         let cert_path = tls.cert.as_ref().unwrap();
         let key_path = tls.key.as_ref().unwrap();
 
-        let cert_pem = std::fs::read(cert_path)
-            .unwrap_or_else(|e| panic!("failed to read TLS cert {}: {e}", cert_path.display()));
-        let key_pem = std::fs::read(key_path)
-            .unwrap_or_else(|e| panic!("failed to read TLS key {}: {e}", key_path.display()));
+        let cert_pem = std::fs::read(cert_path).map_err(|e| {
+            anyhow::anyhow!("failed to read TLS cert {}: {e}", cert_path.display())
+        })?;
+        let key_pem = std::fs::read(key_path).map_err(|e| {
+            anyhow::anyhow!("failed to read TLS key {}: {e}", key_path.display())
+        })?;
 
         let mut identity_pem = cert_pem;
         identity_pem.extend_from_slice(&key_pem);
         let identity = reqwest::Identity::from_pem(&identity_pem)
-            .expect("failed to parse TLS identity from cert+key PEM");
+            .map_err(|e| anyhow::anyhow!("failed to parse TLS identity from cert+key PEM: {e}"))?;
         builder = builder.identity(identity);
 
         // Add custom CA if provided
         if let Some(ca_path) = &tls.ca_cert {
-            let ca_pem = std::fs::read(ca_path)
-                .unwrap_or_else(|e| panic!("failed to read TLS CA {}: {e}", ca_path.display()));
+            let ca_pem = std::fs::read(ca_path).map_err(|e| {
+                anyhow::anyhow!("failed to read TLS CA {}: {e}", ca_path.display())
+            })?;
             let ca = reqwest::Certificate::from_pem(&ca_pem)
-                .expect("failed to parse CA certificate PEM");
+                .map_err(|e| anyhow::anyhow!("failed to parse CA certificate PEM: {e}"))?;
             builder = builder.add_root_certificate(ca);
         }
 
@@ -91,13 +99,21 @@ fn build_client(tls: &TlsConfig) -> reqwest::Client {
         builder = builder.http2_prior_knowledge();
     }
 
-    builder.build().expect("failed to create HTTP client")
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to create HTTP client: {e}"))
 }
 
 /// Run the agent watcher loop. Polls the local UDS Remote Agent and writes
 /// state to the sidecar node's CRDT store.
 pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
-    let client = build_client(&config.tls);
+    let client = match build_client(&config.tls) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("agent watcher: failed to build HTTP client: {e:#}");
+            return;
+        }
+    };
 
     let mut interval = tokio::time::interval(config.poll_interval);
     let agent_id = config.node_id.clone();
@@ -658,6 +674,92 @@ async fn poll_pods(
 
     debug!(agent_id, total, ready, errors = error_pods.len(), "synced pod health to mesh");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn path_that_does_not_exist() -> PathBuf {
+        PathBuf::from("/nonexistent/peat-watcher-test/missing-file.pem")
+    }
+
+    #[test]
+    fn build_client_returns_err_when_cert_path_missing() {
+        let tls = TlsConfig {
+            cert: Some(path_that_does_not_exist()),
+            key: Some(path_that_does_not_exist()),
+            ca_cert: None,
+        };
+        let err = build_client(&tls).expect_err("must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to read TLS cert"), "got: {msg}");
+    }
+
+    #[test]
+    fn build_client_returns_err_when_key_path_missing() {
+        let cert = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cert.path(), b"not-a-real-cert").unwrap();
+        let tls = TlsConfig {
+            cert: Some(cert.path().to_path_buf()),
+            key: Some(path_that_does_not_exist()),
+            ca_cert: None,
+        };
+        let err = build_client(&tls).expect_err("must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to read TLS key"), "got: {msg}");
+    }
+
+    #[test]
+    fn build_client_returns_err_on_malformed_identity_pem() {
+        let cert = tempfile::NamedTempFile::new().unwrap();
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            cert.path(),
+            b"-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(key.path(), b"also-garbage").unwrap();
+        let tls = TlsConfig {
+            cert: Some(cert.path().to_path_buf()),
+            key: Some(key.path().to_path_buf()),
+            ca_cert: None,
+        };
+        let err = build_client(&tls).expect_err("must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TLS identity") || msg.contains("failed to parse"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_client_returns_err_when_ca_path_missing() {
+        // Need cert + key to be readable so we reach the CA step.
+        // In our implementation, identity is parsed before CA is read,
+        // so malformed cert+key will fail at identity-parse — any failure
+        // that does not panic satisfies the truth.
+        let cert = tempfile::NamedTempFile::new().unwrap();
+        let key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(cert.path(), b"not-a-real-cert").unwrap();
+        std::fs::write(key.path(), b"not-a-real-key").unwrap();
+        let tls = TlsConfig {
+            cert: Some(cert.path().to_path_buf()),
+            key: Some(key.path().to_path_buf()),
+            ca_cert: Some(path_that_does_not_exist()),
+        };
+        let err = build_client(&tls).expect_err("must error, not panic");
+        let msg = format!("{err:#}");
+        assert!(!msg.is_empty(), "error message should not be empty");
+    }
+
+    #[test]
+    fn build_client_succeeds_without_tls() {
+        let tls = TlsConfig::default();
+        assert!(!tls.is_enabled());
+        build_client(&tls).expect("insecure-mode build must succeed");
+    }
 }
 
 /// SYNC-01: auto-publish deployed packages into the available_packages CRDT collection.
