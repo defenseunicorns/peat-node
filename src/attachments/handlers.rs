@@ -17,12 +17,19 @@
 
 #![allow(clippy::result_large_err)]
 
+use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use connectrpc::ConnectError;
+use futures::stream::{Stream, StreamExt};
 use peat_protocol::storage::file_distribution::{
-    FileDistribution, NodeTransferStatus, TransferPriority, TransferState,
+    DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
+    TransferPriority, TransferState,
 };
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::BroadcastStream;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::attachments::config::AttachmentPriorityCli;
@@ -31,6 +38,7 @@ use crate::attachments::registry::{
     AttachmentHandleRecord, BundleIdentity, BundleLookup, BundleRecord, BundleRegistry,
     BundleStatus,
 };
+use crate::attachments::runtime::{BundleRuntime, DistributionState, PerDistributionProgress};
 use crate::attachments::validate;
 use crate::node::SidecarNode;
 use crate::pb;
@@ -130,6 +138,51 @@ pub async fn send_attachments(
     let handles = build_handle_records(&request, &ingested);
     let record = BundleRecord::new(bundle_id.clone(), identity, handles.clone());
     node.bundle_registry().insert(record);
+
+    // 7. Register runtime state for the subscribe fan-out (Step 7b) and
+    //    spawn per-distribution watcher tasks. The runtime is created
+    //    *before* watchers start so a subscriber attaching between
+    //    SendAttachments returning and the watcher's first event still
+    //    sees the empty slot (Pending, last_progress with distribution_id).
+    let runtime_slots = handles
+        .iter()
+        .map(|h| {
+            let bytes_total = ingested
+                .iter()
+                .find(|ib| ib.file_index == h.file_index)
+                .map(|ib| ib.blob_token.size_bytes)
+                .unwrap_or(0);
+            PerDistributionProgress {
+                state: DistributionState::Pending,
+                bytes_transferred: 0,
+                bytes_total,
+                error: None,
+                last_progress: pb::AttachmentProgress {
+                    distribution_id: h.distribution_id().to_string(),
+                    blob_token: h.blob_token_hash.clone(),
+                    status: buffa::EnumValue::from(
+                        pb::DistributionStatus::DISTRIBUTION_STATUS_PENDING as i32,
+                    ),
+                    bytes_transferred: 0,
+                    bytes_total,
+                    ..Default::default()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let runtime = node.bundle_runtime().register(&bundle_id, runtime_slots);
+
+    for h in &handles {
+        spawn_distribution_watcher(
+            Arc::clone(file_distribution),
+            Arc::clone(node.bundle_registry()),
+            Arc::clone(&runtime),
+            bundle_id.clone(),
+            h.file_index,
+            h.distribution_handle.clone(),
+            h.blob_token_hash.clone(),
+        );
+    }
 
     Ok(build_response(&bundle_id, &handles))
 }
@@ -251,13 +304,367 @@ pub async fn cancel_attachment_distribution(
         .await
         .map_err(|e| ConnectError::internal(format!("cancel failed: {e}")))?;
 
-    node.bundle_registry()
-        .update_status(&bundle_id, BundleStatus::Cancelled);
+    // Mirror the cancel into the runtime so subscribers see a Cancelled
+    // terminal frame for this specific distribution.
+    if let Some(runtime) = node.bundle_runtime().get(&bundle_id) {
+        let progress = pb::AttachmentProgress {
+            distribution_id: request.distribution_id.clone(),
+            blob_token: handle_rec.blob_token_hash.clone(),
+            status: buffa::EnumValue::from(
+                pb::DistributionStatus::DISTRIBUTION_STATUS_CANCELLED as i32,
+            ),
+            ..Default::default()
+        };
+        runtime.apply_progress(
+            handle_rec.file_index,
+            DistributionState::Cancelled,
+            progress,
+        );
+        maybe_finalize_bundle(node.bundle_registry(), &runtime, &bundle_id);
+    } else {
+        // No runtime entry (e.g., 7a-era bundle inserted before the
+        // runtime store existed). Fall back to the bundle-level status.
+        node.bundle_registry()
+            .update_status(&bundle_id, BundleStatus::Cancelled);
+    }
 
     Ok(pb::CancelAttachmentDistributionResponse {
         was_cancelled: true,
         ..Default::default()
     })
+}
+
+pub async fn subscribe_attachment_bundle(
+    node: &Arc<SidecarNode>,
+    request: pb::SubscribeAttachmentBundleRequest,
+) -> Result<
+    Pin<Box<dyn Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send>>,
+    ConnectError,
+> {
+    let cfg = node.attachment_config();
+    if !cfg.has_roots() {
+        return Err(unimplemented_no_roots("SubscribeAttachmentBundle"));
+    }
+
+    let runtime = node
+        .bundle_runtime()
+        .get(&request.bundle_id)
+        .ok_or_else(|| {
+            ConnectError::not_found(format!("bundle_id `{}` not found", request.bundle_id))
+        })?;
+
+    // Build the late-subscribe stream per PRD doc-comments on
+    // SubscribeAttachmentBundle:
+    //
+    // 1. Subscribe FIRST (before snapshotting) so events between snapshot
+    //    and subscribe aren't lost.
+    // 2. Snapshot the per-distribution state. Emit one synthetic frame
+    //    per *already-terminal* distribution carrying the terminal
+    //    status. Pending / InProgress distributions are NOT snapshotted —
+    //    the live stream will deliver their updates.
+    // 3. Forward the live broadcast, filtering out any frame whose
+    //    distribution_id we already emitted via snapshot (those
+    //    distributions' terminal frames are stale on the broadcast at
+    //    this point).
+    // 4. Close the stream when the total number of terminal events
+    //    delivered (snapshot + live) equals total_distributions, OR when
+    //    the broadcast closes.
+    let live_rx = runtime.subscribe();
+    let snapshot = runtime.per_distribution_snapshot();
+    let total = runtime.total();
+
+    let (snapshot_frames, snapshot_terminal_ids): (Vec<_>, HashSet<_>) = {
+        let mut frames = Vec::new();
+        let mut ids = HashSet::new();
+        for slot in snapshot {
+            if slot.state.is_terminal() {
+                ids.insert(slot.last_progress.distribution_id.clone());
+                frames.push(slot.last_progress);
+            }
+        }
+        (frames, ids)
+    };
+
+    let stream = build_subscribe_stream(snapshot_frames, snapshot_terminal_ids, live_rx, total);
+    Ok(Box::pin(stream))
+}
+
+/// Build the multiplexed stream: snapshot frames first, then a filtered
+/// view of the live broadcast that closes once `total` terminal frames
+/// have been delivered overall.
+fn build_subscribe_stream(
+    snapshot_frames: Vec<pb::AttachmentProgress>,
+    snapshot_terminal_ids: HashSet<String>,
+    live_rx: broadcast::Receiver<pb::AttachmentProgress>,
+    total: usize,
+) -> impl Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send {
+    use futures::stream;
+
+    let snapshot_count = snapshot_frames.len();
+    let snapshot_stream = stream::iter(snapshot_frames.into_iter().map(Ok));
+
+    let live_stream = BroadcastStream::new(live_rx).filter_map(move |r| {
+        let ids = snapshot_terminal_ids.clone();
+        async move {
+            match r {
+                Ok(progress) => {
+                    if ids.contains(&progress.distribution_id) {
+                        // Already emitted this distribution's terminal
+                        // frame via snapshot. Suppress the live duplicate.
+                        None
+                    } else {
+                        Some(Ok::<_, ConnectError>(progress))
+                    }
+                }
+                Err(_) => None, // skip lag / closed errors
+            }
+        }
+    });
+
+    // Snapshot frames count toward the terminal total *as they are
+    // delivered*, not at construction — pre-closing the stream based on
+    // the snapshot count would consume the closure budget before the
+    // snapshot frames flow through, leaving the subscriber with an
+    // immediately-closed stream and zero frames.
+    let _ = snapshot_count;
+    let combined = snapshot_stream.chain(live_stream);
+    StreamCloser::new(combined, total)
+}
+
+/// Wraps a stream and closes it after `total` terminal-status frames
+/// have been observed. Used to enforce the SubscribeAttachmentBundle
+/// PRD contract that the stream closes when every distribution has
+/// reached a terminal state.
+struct StreamCloser<S> {
+    inner: Pin<Box<S>>,
+    terminal_count: usize,
+    total: usize,
+    closed: bool,
+}
+
+impl<S> StreamCloser<S>
+where
+    S: Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send + 'static,
+{
+    fn new(inner: S, total: usize) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            terminal_count: 0,
+            total,
+            // Bundles with zero distributions are vacuously complete —
+            // close immediately to avoid hanging on an empty stream.
+            closed: total == 0,
+        }
+    }
+}
+
+impl<S> Stream for StreamCloser<S>
+where
+    S: Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send + 'static,
+{
+    type Item = Result<pb::AttachmentProgress, ConnectError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.closed {
+            return std::task::Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(progress))) => {
+                if is_terminal_status(progress.status) {
+                    self.terminal_count += 1;
+                    if self.terminal_count >= self.total {
+                        self.closed = true;
+                    }
+                }
+                std::task::Poll::Ready(Some(Ok(progress)))
+            }
+            other => other,
+        }
+    }
+}
+
+fn is_terminal_status(s: buffa::EnumValue<pb::DistributionStatus>) -> bool {
+    use pb::DistributionStatus as D;
+    matches!(
+        s.as_known(),
+        Some(D::DISTRIBUTION_STATUS_COMPLETED)
+            | Some(D::DISTRIBUTION_STATUS_PARTIAL)
+            | Some(D::DISTRIBUTION_STATUS_FAILED)
+            | Some(D::DISTRIBUTION_STATUS_CANCELLED)
+    )
+}
+
+// ----- watcher task ---------------------------------------------------------
+
+/// Spawn a watcher task for one distribution. Translates peat-protocol
+/// progress updates into `AttachmentProgress` frames, updates the runtime
+/// state, and bumps the registry's BundleStatus on terminal transitions.
+fn spawn_distribution_watcher(
+    file_distribution: Arc<IrohFileDistribution>,
+    registry: Arc<BundleRegistry>,
+    runtime: Arc<BundleRuntime>,
+    bundle_id: String,
+    file_index: usize,
+    distribution_handle: DistributionHandle,
+    blob_token_hash: String,
+) {
+    tokio::spawn(async move {
+        // Initial status check. peat-protocol considers a distribution
+        // "complete" when `completed + failed >= total_targets`, which
+        // is *immediately* true for zero-peer scopes (total_targets=0).
+        // We need to fold that into a terminal frame at watcher start
+        // so subscribers don't wait forever for an event the substrate
+        // never emits.
+        match file_distribution.status(&distribution_handle).await {
+            Ok(s) if s.total_targets == 0 => {
+                // Zero-peer distribution. peat-protocol's `is_complete`
+                // returns true here; map to COMPLETED (no peers to
+                // succeed or fail). The PRD §v1-honesty rule says
+                // sender-side COMPLETED means "every targeted peer
+                // connected and pulled all bytes from this sender" —
+                // zero peers vacuously satisfies that.
+                let progress = pb::AttachmentProgress {
+                    distribution_id: distribution_handle.distribution_id.clone(),
+                    blob_token: blob_token_hash.clone(),
+                    status: buffa::EnumValue::from(
+                        pb::DistributionStatus::DISTRIBUTION_STATUS_COMPLETED as i32,
+                    ),
+                    bytes_transferred: 0,
+                    bytes_total: 0,
+                    ..Default::default()
+                };
+                let _ = runtime.apply_progress(file_index, DistributionState::Completed, progress);
+                maybe_finalize_bundle(&registry, &runtime, &bundle_id);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    distribution_id = %distribution_handle.distribution_id,
+                    error = %e,
+                    "watcher: initial status check failed; marking distribution failed"
+                );
+                let progress = pb::AttachmentProgress {
+                    distribution_id: distribution_handle.distribution_id.clone(),
+                    blob_token: blob_token_hash.clone(),
+                    status: buffa::EnumValue::from(
+                        pb::DistributionStatus::DISTRIBUTION_STATUS_FAILED as i32,
+                    ),
+                    error: Some(format!("initial status check failed: {e}")),
+                    ..Default::default()
+                };
+                let _ = runtime.apply_progress(file_index, DistributionState::Failed, progress);
+                maybe_finalize_bundle(&registry, &runtime, &bundle_id);
+                return;
+            }
+        };
+
+        // Subscribe to live progress.
+        let mut rx = match file_distribution
+            .subscribe_progress(&distribution_handle)
+            .await
+        {
+            Ok(rx) => rx,
+            Err(e) => {
+                warn!(
+                    distribution_id = %distribution_handle.distribution_id,
+                    error = %e,
+                    "watcher: subscribe_progress failed; marking distribution failed"
+                );
+                let progress = pb::AttachmentProgress {
+                    distribution_id: distribution_handle.distribution_id.clone(),
+                    blob_token: blob_token_hash.clone(),
+                    status: buffa::EnumValue::from(
+                        pb::DistributionStatus::DISTRIBUTION_STATUS_FAILED as i32,
+                    ),
+                    error: Some(format!("subscribe_progress failed: {e}")),
+                    ..Default::default()
+                };
+                let _ = runtime.apply_progress(file_index, DistributionState::Failed, progress);
+                maybe_finalize_bundle(&registry, &runtime, &bundle_id);
+                return;
+            }
+        };
+
+        // Forward events until the distribution terminates.
+        loop {
+            match rx.recv().await {
+                Ok(status) => {
+                    let per_node: Vec<&NodeTransferStatus> =
+                        status.node_statuses.values().collect();
+                    let bytes_transferred: u64 = per_node.iter().map(|p| p.progress_bytes).sum();
+                    let bytes_total: u64 = per_node.first().map(|p| p.total_bytes).unwrap_or(0);
+                    let aggregated = per_node_aggregate(&per_node);
+                    let dist_state = aggregated_to_distribution_state(aggregated);
+                    let progress = pb::AttachmentProgress {
+                        distribution_id: distribution_handle.distribution_id.clone(),
+                        blob_token: blob_token_hash.clone(),
+                        status: buffa::EnumValue::from(aggregated as i32),
+                        bytes_transferred,
+                        bytes_total,
+                        error: per_node.iter().find_map(|p| p.error.clone()),
+                        ..Default::default()
+                    };
+                    runtime.apply_progress(file_index, dist_state, progress);
+                    if status.is_complete() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+
+        maybe_finalize_bundle(&registry, &runtime, &bundle_id);
+    });
+}
+
+/// Map a per-node aggregate proto status to the runtime's
+/// `DistributionState` enum.
+fn aggregated_to_distribution_state(s: pb::DistributionStatus) -> DistributionState {
+    use pb::DistributionStatus as D;
+    match s {
+        D::DISTRIBUTION_STATUS_PENDING | D::DISTRIBUTION_STATUS_UNSPECIFIED => {
+            DistributionState::Pending
+        }
+        D::DISTRIBUTION_STATUS_IN_PROGRESS => DistributionState::InProgress,
+        D::DISTRIBUTION_STATUS_COMPLETED | D::DISTRIBUTION_STATUS_PARTIAL => {
+            DistributionState::Completed
+        }
+        D::DISTRIBUTION_STATUS_FAILED => DistributionState::Failed,
+        D::DISTRIBUTION_STATUS_CANCELLED => DistributionState::Cancelled,
+    }
+}
+
+/// Once a watcher hits a terminal state, check if every distribution in
+/// the bundle has terminated. If so, set the registry's BundleStatus to
+/// the aggregated terminal value so GetAttachmentDistribution's
+/// "terminal-precedence" branch picks the right enum.
+fn maybe_finalize_bundle(registry: &BundleRegistry, runtime: &BundleRuntime, bundle_id: &str) {
+    if !runtime.all_terminal() {
+        return;
+    }
+    let snap = runtime.per_distribution_snapshot();
+    let mut any_failed = false;
+    let mut any_cancelled = false;
+    for slot in &snap {
+        match slot.state {
+            DistributionState::Failed => any_failed = true,
+            DistributionState::Cancelled => any_cancelled = true,
+            _ => {}
+        }
+    }
+    let final_status = if any_failed {
+        BundleStatus::Failed
+    } else if any_cancelled {
+        BundleStatus::Cancelled
+    } else {
+        BundleStatus::Completed
+    };
+    registry.update_status(bundle_id, final_status);
 }
 
 // ----- helpers ---------------------------------------------------------------

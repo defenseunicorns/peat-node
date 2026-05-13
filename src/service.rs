@@ -499,8 +499,8 @@ impl pb::PeatSidecar for PeatSidecarService {
 
     async fn subscribe_attachment_bundle(
         &self,
-        _ctx: Context,
-        _request: OwnedView<pb::SubscribeAttachmentBundleRequestView<'static>>,
+        ctx: Context,
+        request: OwnedView<pb::SubscribeAttachmentBundleRequestView<'static>>,
     ) -> Result<
         (
             Pin<Box<dyn Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send>>,
@@ -508,11 +508,10 @@ impl pb::PeatSidecar for PeatSidecarService {
         ),
         ConnectError,
     > {
-        // 7b lands the late-subscribe multiplexer; until then this RPC is
-        // intentionally unimplemented even when --attachment-root is set.
-        Err(ConnectError::unimplemented(
-            "SubscribeAttachmentBundle is wired in a follow-up step",
-        ))
+        let req = request.to_owned_message();
+        let stream =
+            crate::attachments::handlers::subscribe_attachment_bundle(&self.node, req).await?;
+        Ok((stream, ctx))
     }
 
     async fn cancel_attachment_distribution(

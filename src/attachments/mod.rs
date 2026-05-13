@@ -23,4 +23,5 @@ pub mod config;
 pub mod handlers;
 pub mod ingest;
 pub mod registry;
+pub mod runtime;
 pub mod validate;

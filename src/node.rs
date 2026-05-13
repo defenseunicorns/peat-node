@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::attachments::config::AttachmentConfig;
 use crate::attachments::registry::{BundleRegistry, RegistryConfig};
+use crate::attachments::runtime::BundleRuntimeStore;
 use crate::crypto::StoreCipher;
 
 /// Configuration for the sidecar node.
@@ -63,6 +64,11 @@ pub struct SidecarNode {
     /// `attachment_config.has_roots()` — built from the backend's blob
     /// store + Automerge store, paralleling the rest of the bootstrap.
     file_distribution: Option<Arc<IrohFileDistribution>>,
+    /// PRD-006 per-bundle runtime: progress-channel fan-out + per-
+    /// distribution state for the subscribe handler. Always present even
+    /// when attachments are disabled so service handlers don't have to
+    /// branch on Option.
+    bundle_runtime: Arc<BundleRuntimeStore>,
 }
 
 /// Internal change event for the broadcast channel.
@@ -162,7 +168,14 @@ impl SidecarNode {
             attachment_config: config.attachment_config,
             bundle_registry,
             file_distribution,
+            bundle_runtime: Arc::new(BundleRuntimeStore::new()),
         })
+    }
+
+    /// PRD-006 per-bundle runtime store (progress channels + per-
+    /// distribution state for subscribe).
+    pub fn bundle_runtime(&self) -> &Arc<BundleRuntimeStore> {
+        &self.bundle_runtime
     }
 
     /// PRD-006 attachment config — used by handlers to decide whether to
