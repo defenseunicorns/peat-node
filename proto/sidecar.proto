@@ -338,13 +338,18 @@ message SubscriptionQuery {
 }
 
 message QueryEq {
-  // Dotted JSON path, e.g. "platform_type" or "location.lat".
+  // Top-level JSON field name, e.g. "platform_type". Nested paths
+  // (e.g. "location.lat") are not supported in v1; the matcher does a
+  // single-level object lookup. Dotted-path support is planned and will
+  // be additive — no wire change required.
   string field = 1;
   // JSON-encoded value (e.g. `"\"vehicle\""`, `"true"`, `"3.14"`).
   string value = 2;
 }
 
 message QueryCmp {
+  // Top-level JSON field name, e.g. "altitude_m". Same v1 restriction
+  // as `QueryEq.field`: no nested / dotted paths.
   string field = 1;
   // JSON-encoded value. Strings, integers, and floats compare; bools
   // and null do not.
