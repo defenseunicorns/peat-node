@@ -159,6 +159,32 @@ impl SidecarNode {
             None
         };
 
+        // PRD-006 retention eviction. Without this, terminal bundles
+        // linger until LRU pressure or process restart removes them —
+        // making the --attachment-handle-retention-secs knob inert. The
+        // tick interval scales with retention so tests that set short
+        // retention windows observe eviction promptly, while the default
+        // 24h retention only sweeps once a minute.
+        if config.attachment_config.has_roots()
+            && config.attachment_config.handle_retention_secs > 0
+        {
+            let registry = Arc::clone(&bundle_registry);
+            let retention_secs = config.attachment_config.handle_retention_secs;
+            let interval_secs = (retention_secs / 2).clamp(1, 60) as u64;
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Discard the immediate-first tick — there's nothing to
+                // evict on startup.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    registry.evict_expired();
+                }
+            });
+        }
+
         Ok(Self {
             node_id: config.node_id,
             backend,

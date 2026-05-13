@@ -361,3 +361,308 @@ async fn evicted_bundle_id_treated_as_fresh_request() {
         "resubmit must produce a new distribution_id"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Retention eviction wiring
+// ─────────────────────────────────────────────────────────────────────
+
+/// PRD §Configuration retention semantic — the background task wired in
+/// `SidecarNode::new` calls `bundle_registry.evict_expired()` periodically
+/// so terminal bundles age out. Earlier, `evict_expired` existed and was
+/// unit-tested but nothing actually called it from the running service;
+/// the `--attachment-handle-retention-secs` knob was operator-visible but
+/// inert. This test set retention=1s, drives a bundle to a terminal state
+/// (zero-peer scope → immediate Completed via the watcher's initial
+/// status shortcut), then waits long enough for the periodic sweep to
+/// fire AT LEAST once and verifies the prior distribution_id no longer
+/// resolves.
+#[tokio::test]
+async fn retention_eviction_fires_in_background() {
+    let server = boot_server(50114, |cfg| {
+        cfg.handle_retention_secs = 1;
+        // Concurrent cap on its own would prevent the second bundle from
+        // ingesting until the first ages out — but we only need one
+        // bundle here, so leave defaults.
+    })
+    .await;
+    let client = http_client();
+
+    let payload = b"retention candidate";
+    let hash = write_file(&server.root_path, "retain.bin", payload);
+    let (status, body) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        send_body("outbox", "retain.bin", payload.len() as u64, &hash),
+    )
+    .await;
+    assert!(status.is_success(), "send must succeed; body: {body}");
+    let dist_id = body["handles"][0]["distributionId"]
+        .as_str()
+        .expect("distribution_id must be present")
+        .to_string();
+
+    // Brief settle for the watcher's zero-peer terminal-frame fire.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Sanity: distribution_id resolves immediately after send.
+    let (_, body_now) = call_raw(
+        &client,
+        &server.base,
+        "GetAttachmentDistribution",
+        serde_json::json!({ "distributionId": dist_id }),
+    )
+    .await;
+    assert!(
+        body_now.get("code").is_none(),
+        "distribution_id must resolve immediately after send; body: {body_now}"
+    );
+
+    // Wait past retention + at least one eviction tick (interval is
+    // max(1, retention/2) = max(1, 0) = 1s for retention=1, so a 3-second
+    // wait observes at minimum two ticks past the retention cutoff).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let (status_after, body_after) = call_raw(
+        &client,
+        &server.base,
+        "GetAttachmentDistribution",
+        serde_json::json!({ "distributionId": dist_id }),
+    )
+    .await;
+    assert!(
+        !status_after.is_success(),
+        "after retention window, prior distribution_id must NOT resolve; status: {status_after}, body: {body_after}"
+    );
+    assert_eq!(
+        body_after["code"], "not_found",
+        "evicted bundle's distribution_id must now lookup as NotFound; body: {body_after}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// PRD §Validation Rule 12 — idempotent resubmit over the wire
+// ─────────────────────────────────────────────────────────────────────
+
+/// Same `bundle_id` + identical FileSpec set → identical handles. The
+/// registry's unit test confirms `check_resubmit` returns Idempotent;
+/// this drives the path over the Connect wire so a JSON-encoding mismatch
+/// between request and the registry's `BundleIdentity` cannot regress
+/// silently.
+#[tokio::test]
+async fn idempotent_resubmit_returns_same_handles_over_http() {
+    let server = boot_server(50115, |_| {}).await;
+    let client = http_client();
+
+    let payload = b"idempotency payload";
+    let hash = write_file(&server.root_path, "ide.bin", payload);
+    let req = serde_json::json!({
+        "files": [{
+            "rootName": "outbox",
+            "relativePath": "ide.bin",
+            "sizeBytes": payload.len(),
+            "sha256": b64(&hash),
+        }],
+        "scope": { "allNodes": {} },
+        "bundleId": "idem-X",
+    });
+
+    let (s1, b1) = call_raw(&client, &server.base, "SendAttachments", req.clone()).await;
+    assert!(s1.is_success(), "first send must succeed; body: {b1}");
+    let dist_1 = b1["handles"][0]["distributionId"]
+        .as_str()
+        .expect("first response must include a distribution_id")
+        .to_string();
+    let blob_1 = b1["handles"][0]["blobToken"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    let (s2, b2) = call_raw(&client, &server.base, "SendAttachments", req).await;
+    assert!(
+        s2.is_success(),
+        "second (idempotent) send must succeed; body: {b2}"
+    );
+    let dist_2 = b2["handles"][0]["distributionId"].as_str().unwrap_or("");
+    let blob_2 = b2["handles"][0]["blobToken"].as_str().unwrap_or("");
+    assert_eq!(
+        dist_1, dist_2,
+        "idempotent resubmit must return the same distribution_id"
+    );
+    assert_eq!(
+        blob_1, blob_2,
+        "idempotent resubmit must return the same blob_token"
+    );
+    assert_eq!(b1["bundleId"], b2["bundleId"]);
+}
+
+/// Same `bundle_id` + deviating FileSpec set (different size_bytes) →
+/// AlreadyExists. The conflict path in `check_resubmit` is unit-tested;
+/// here we drive the wire path to confirm the handler maps
+/// `BundleLookup::Conflict` to the right gRPC code.
+#[tokio::test]
+async fn bundle_id_reuse_with_different_files_returns_already_exists_over_http() {
+    let server = boot_server(50116, |_| {}).await;
+    let client = http_client();
+
+    let original = b"original payload";
+    let h1 = write_file(&server.root_path, "conf.bin", original);
+    let (s1, b1) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "conf.bin",
+                "sizeBytes": original.len(),
+                "sha256": b64(&h1),
+            }],
+            "scope": { "allNodes": {} },
+            "bundleId": "conflict-X",
+        }),
+    )
+    .await;
+    assert!(s1.is_success(), "first send must succeed; body: {b1}");
+
+    // Resubmit same bundle_id with a different file (different size).
+    let mutated = b"original payload extended"; // different size_bytes
+    let h2 = write_file(&server.root_path, "conf.bin", mutated);
+    let (s2, b2) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "conf.bin",
+                "sizeBytes": mutated.len(),
+                "sha256": b64(&h2),
+            }],
+            "scope": { "allNodes": {} },
+            "bundleId": "conflict-X",
+        }),
+    )
+    .await;
+    assert!(!s2.is_success(), "deviating resubmit must fail");
+    assert_eq!(
+        b2["code"], "already_exists",
+        "bundle-id conflict must map to AlreadyExists; body: {b2}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Wire-format coverage for AttachmentPriority / scope enums
+// ─────────────────────────────────────────────────────────────────────
+
+/// Proto-enum AttachmentPriority round-trips through the JSON wire. The
+/// proto3 canonical JSON for enums is the unqualified short name (e.g.
+/// "ATTACHMENT_PRIORITY_CRITICAL"). buffa accepts both the enum name and
+/// the numeric form; the test drives the explicit-priority path to
+/// confirm the BULK/LOW/ROUTINE/PRIORITY/CRITICAL mapping the handler
+/// uses (1:1 onto peat-protocol TransferPriority with BULK collapsed
+/// onto Low — see handlers::proto_priority_to_transfer's v1-honesty
+/// note) actually decodes from the wire.
+#[tokio::test]
+async fn attachment_priority_critical_round_trips_over_http() {
+    let server = boot_server(50117, |_| {}).await;
+    let client = http_client();
+
+    let payload = b"priority test";
+    let hash = write_file(&server.root_path, "pri.bin", payload);
+    let (s, b) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "pri.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "allNodes": {} },
+            "priority": "ATTACHMENT_PRIORITY_CRITICAL",
+        }),
+    )
+    .await;
+    assert!(
+        s.is_success(),
+        "request with explicit AttachmentPriority must succeed; body: {b}"
+    );
+    // The wire-side success is the primary assertion (the priority
+    // wasn't rejected as an unknown enum value). A second-order check
+    // is not directly possible without exposing the registry's stored
+    // priority through an RPC — out of scope for v1.
+    assert!(
+        b["handles"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "response must include handles; body: {b}"
+    );
+}
+
+/// PRD §Validation Rule 10 — FormationScope is rejected with
+/// FAILED_PRECONDITION in v1 (no async resolution).
+#[tokio::test]
+async fn formation_scope_rejected_over_http() {
+    let server = boot_server(50118, |_| {}).await;
+    let client = http_client();
+
+    let payload = b"x";
+    let hash = write_file(&server.root_path, "f.bin", payload);
+    let (s, b) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "f.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "formation": { "formationId": "alpha-squad" } }
+        }),
+    )
+    .await;
+    assert!(!s.is_success(), "Formation scope must be rejected in v1");
+    assert_eq!(
+        b["code"], "failed_precondition",
+        "Formation scope rejection must use FailedPrecondition; body: {b}"
+    );
+}
+
+/// PRD §Validation Rule 10 — CapableScope is rejected with
+/// FAILED_PRECONDITION; the capability vocabulary is deferred to a
+/// follow-on ADR. Mirrors the validate-unit test
+/// `validate_rejects_capable_scope_v1` over the wire.
+#[tokio::test]
+async fn capable_scope_rejected_over_http() {
+    let server = boot_server(50119, |_| {}).await;
+    let client = http_client();
+
+    let payload = b"x";
+    let hash = write_file(&server.root_path, "c.bin", payload);
+    let (s, b) = call_raw(
+        &client,
+        &server.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "c.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "capable": {} }
+        }),
+    )
+    .await;
+    assert!(!s.is_success(), "Capable scope must be rejected in v1");
+    assert_eq!(
+        b["code"], "failed_precondition",
+        "Capable scope rejection must use FailedPrecondition; body: {b}"
+    );
+}
