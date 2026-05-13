@@ -16,6 +16,7 @@ use connectrpc::Router;
 use tracing::{error, info};
 
 use peat_node::cli_validation::reject_tmp_blob_dir;
+use peat_node::deployer;
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -147,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         enable_deployer: args.enable_deployer,
-        blob_work_dir,
+        blob_work_dir: blob_work_dir.clone(),
         download_timeout_secs: args.download_timeout_secs,
     };
 
@@ -184,6 +185,23 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             watcher::run(watcher_config, watcher_node).await;
         });
+    }
+
+    // Start the deployer task if enabled (OPS-01 / RECV-01).
+    // Runs in a separate tokio task from the watcher so multi-minute blob downloads
+    // do not block the agent health poll cycle.
+    if args.enable_deployer {
+        let deployer_config = deployer::DeployerConfig {
+            poll_interval: Duration::from_secs(args.agent_poll_interval),
+            blob_work_dir: blob_work_dir.clone(),
+        };
+        let deployer_node = Arc::clone(&node);
+        tokio::spawn(async move {
+            deployer::run(deployer_config, deployer_node).await;
+        });
+        info!("deployer task spawned");
+    } else {
+        info!("deployer disabled (enable with --enable-deployer)");
     }
 
     // Build the Connect RPC service (handles Connect + gRPC + gRPC-Web)

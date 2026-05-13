@@ -61,7 +61,9 @@ async fn put_deployment_request(
         package_name: "test-pkg".to_string(),
         package_version: "0.1.0".to_string(),
         architecture: "arm64".to_string(),
-        iroh_blob_hash: "aabbccdd".to_string(),
+        // 64-char hex = 32-byte BLAKE3 hash (dummy but structurally valid)
+        iroh_blob_hash: "aa".repeat(32),
+        // 64-char hex = 32-byte Ed25519 public key (all-zero is accepted by parse_endpoint_id_hex)
         sender_endpoint_id: "00".repeat(32),
         zarf_vars: HashMap::new(),
         sender_status: DeploymentStatus::Deployed,

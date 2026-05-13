@@ -1,5 +1,6 @@
 pub mod cli_validation;
 pub mod crypto;
+pub mod deployer;
 pub mod node;
 pub mod service;
 pub mod types;
