@@ -4,13 +4,15 @@ Single-node `peat-node` with the attachment surface enabled. Sends a
 local file through `SendAttachments`, then verifies the distribution
 with `GetAttachmentDistribution`.
 
-> **Image version requirement.** This quickstart needs a `peat-node`
-> image that contains the PRD-006 attachment RPCs — i.e. the first
-> release tagged at or after the PR that lands the attachment surface.
-> The compose file pins `ghcr.io/defenseunicorns/peat-node:v0.1.1` as a
-> placeholder; bump that tag to the actual release before sharing this
-> quickstart externally. To run against a local build, uncomment the
-> `build:` block in `docker-compose.yml` and comment out `image:`.
+> **Builds from source by default.** The attachment RPCs ship with the
+> release that lands #56; the published `ghcr.io/defenseunicorns/peat-node:v0.1.1`
+> image predates this surface and fails with `unimplemented: method not
+> found` against it. The compose file defaults to `build: context: ../../..`
+> so `docker compose up -d` from this directory produces a working
+> binary from the current checkout. After the post-#56 release is
+> tagged, flip the default by commenting out the `build:` block and
+> uncommenting the `image:` line in `docker-compose.yml` (the line
+> already carries the placeholder version tag to bump).
 
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the

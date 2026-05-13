@@ -21,11 +21,18 @@
 
 services:
   peat-node:
-    # Latest published release. To run a local build, comment out `image:`
-    # and uncomment the `build:` block.
-    image: ghcr.io/defenseunicorns/peat-node:v0.1.1
-    # build:
-    #   context: ../../..
+    # Build from the repo root by default. The attachment RPCs ship with
+    # the release that lands #56 (PRD-006 v1); until that release is
+    # published, the `ghcr.io/defenseunicorns/peat-node:v0.1.1` image
+    # does NOT contain SendAttachments / GetAttachmentDistribution /
+    # SubscribeAttachmentBundle / CancelAttachmentDistribution — the
+    # quickstart fails with `unimplemented: method not found` against it.
+    #
+    # After the post-#56 release ships, flip the default: comment out the
+    # `build:` block and uncomment the `image:` line below.
+    build:
+      context: ../../..
+    # image: ghcr.io/defenseunicorns/peat-node:vX.Y.Z  # post-#56 release tag
     container_name: peat-node-attachments
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
