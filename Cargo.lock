@@ -3164,6 +3164,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iroh",
+ "libc",
  "peat-mesh",
  "peat-protocol",
  "rand 0.8.6",
