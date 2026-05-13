@@ -12,9 +12,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use peat_node::deployer::{poll_available_packages, poll_deployment_requests, DeployerConfig};
+use peat_node::deployer::{
+    poll_available_packages, poll_deployment_requests, poll_deploying_requests_with_counts,
+    DeployerConfig,
+};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::types::{AvailablePackage, DeploymentRequest, DeploymentStatus};
+use tokio::sync::Mutex;
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
@@ -44,7 +48,45 @@ fn default_config(node: &SidecarNode) -> DeployerConfig {
     DeployerConfig {
         poll_interval: Duration::from_secs(10),
         blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 3,
+        initial_backoff_secs: 0, // tests use 0 — production default 2
+        deploy_command: "uds".to_string(),
     }
+}
+
+/// Create an executable shell script that exits with the given code.
+/// Optionally records all command-line arguments (argv[1..]) to `argv_output_path`
+/// (one arg per line) before exiting. Optionally sleeps `sleep_ms` milliseconds.
+///
+/// Returns the path to the script file (inside `dir` so it lives for the test duration).
+fn make_mock_uds(
+    dir: &tempfile::TempDir,
+    exit_code: i32,
+    argv_output_path: Option<&std::path::Path>,
+    sleep_ms: u64,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script_path = dir.path().join("mock-uds");
+    let argv_line = match argv_output_path {
+        Some(p) => format!(
+            r#"printf '%s\n' "$@" > {}"#,
+            p.to_str().unwrap()
+        ),
+        None => String::new(),
+    };
+    let sleep_line = if sleep_ms > 0 {
+        format!("sleep {:.3}", sleep_ms as f64 / 1000.0)
+    } else {
+        String::new()
+    };
+    let script = format!(
+        "#!/bin/sh\n{argv_line}\n{sleep_line}\nexit {exit_code}\n"
+    );
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script_path
 }
 
 /// Write a DeploymentRequest doc to the CRDT store.
@@ -666,5 +708,423 @@ async fn test_recv_03_missing_platforms_doc_skips_validation() {
         result.receiver_status,
         DeploymentStatus::Pending,
         "RECV-03: missing platforms doc must skip validation and allow fetch to be attempted"
+    );
+}
+
+// ─── RECV-02: uds zarf deploy shell-out ──────────────────────────────────────
+
+/// Write a DeploymentRequest with receiver_status = Fetching and a real canonical
+/// blob file on disk, ready for poll_deploying_requests to pick up.
+async fn put_fetching_request(
+    node: &SidecarNode,
+    id: &str,
+    target_agent_id: &str,
+    hash_hex: &str,
+    zarf_vars: HashMap<String, String>,
+) {
+    let req = DeploymentRequest {
+        id: id.to_string(),
+        target_agent_id: target_agent_id.to_string(),
+        package_name: "deploy-test-pkg".to_string(),
+        package_version: "0.1.0".to_string(),
+        architecture: "arm64".to_string(),
+        iroh_blob_hash: hash_hex.to_string(),
+        sender_endpoint_id: "00".repeat(32),
+        zarf_vars,
+        sender_status: DeploymentStatus::Deployed,
+        receiver_status: DeploymentStatus::Fetching,
+        created_at: 1_700_000_000,
+        blob_ticket: "{}".to_string(),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    node.put_document("deployment_requests", id, &json)
+        .await
+        .unwrap();
+}
+
+/// RECV-02: poll_deploying_requests invokes the deploy command with correct argv:
+/// `<deploy_command> zarf package deploy <blob_path> --confirm
+/// --set-variables=VAR_A=value1 --set-variables=VAR_B=value2`
+/// After success (exit 0), receiver_status must be Deployed.
+#[tokio::test]
+async fn test_recv_02_deploy_command_construction() {
+    let (node, dir) = make_node("node-recv02-cmd").await;
+    let node_id = node.node_id().to_string();
+    let hash_hex = "aa".repeat(32);
+
+    // Create the canonical blob file so the deployer won't short-circuit to Failed
+    tokio::fs::create_dir_all(node.blob_work_dir()).await.unwrap();
+    let blob_path = node.blob_work_dir().join(&hash_hex);
+    tokio::fs::write(&blob_path, b"fake zarf pkg").await.unwrap();
+
+    // argv_output records the argv[1..] of the mock script
+    let argv_output = dir.path().join("argv.txt");
+    let mock_path = make_mock_uds(&dir, 0, Some(&argv_output), 0);
+
+    let mut zarf_vars = HashMap::new();
+    zarf_vars.insert("VAR_A".to_string(), "value1".to_string());
+    zarf_vars.insert("VAR_B".to_string(), "value2".to_string());
+
+    put_fetching_request(&node, "recv02-cmd-uuid", &node_id, &hash_hex, zarf_vars).await;
+
+    let config = DeployerConfig {
+        poll_interval: Duration::from_secs(10),
+        blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 3,
+        initial_backoff_secs: 0,
+        deploy_command: mock_path.to_str().unwrap().to_string(),
+    };
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    poll_deploying_requests_with_counts(&node, &config, &retry_counts)
+        .await
+        .unwrap();
+
+    // Assert receiver_status == Deployed
+    let result_json = node
+        .get_document("deployment_requests", "recv02-cmd-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(
+        result.receiver_status,
+        DeploymentStatus::Deployed,
+        "RECV-02: successful deploy must set receiver_status = Deployed"
+    );
+
+    // Assert argv contains expected subcommands and blob path
+    let argv_content = std::fs::read_to_string(&argv_output)
+        .unwrap_or_default();
+    let argv_lines: Vec<&str> = argv_content.lines().collect();
+    assert!(
+        argv_lines.contains(&"zarf"),
+        "RECV-02: argv must contain 'zarf', got: {:?}",
+        argv_lines
+    );
+    assert!(
+        argv_lines.contains(&"package"),
+        "RECV-02: argv must contain 'package', got: {:?}",
+        argv_lines
+    );
+    assert!(
+        argv_lines.contains(&"deploy"),
+        "RECV-02: argv must contain 'deploy', got: {:?}",
+        argv_lines
+    );
+    let blob_path_str = blob_path.to_str().unwrap();
+    assert!(
+        argv_lines.contains(&blob_path_str),
+        "RECV-02: argv must contain blob path '{}', got: {:?}",
+        blob_path_str,
+        argv_lines
+    );
+    assert!(
+        argv_lines.contains(&"--confirm"),
+        "RECV-02: argv must contain '--confirm', got: {:?}",
+        argv_lines
+    );
+    assert!(
+        argv_lines.iter().any(|a| *a == "--set-variables=VAR_A=value1"),
+        "RECV-02: argv must contain '--set-variables=VAR_A=value1', got: {:?}",
+        argv_lines
+    );
+    assert!(
+        argv_lines.iter().any(|a| *a == "--set-variables=VAR_B=value2"),
+        "RECV-02: argv must contain '--set-variables=VAR_B=value2', got: {:?}",
+        argv_lines
+    );
+}
+
+/// RECV-02 (Pitfall 3): receiver_status = Deploying is written to CRDT BEFORE
+/// cmd.output().await completes. The mock uds sleeps 200ms; after 50ms we read
+/// the doc mid-execution and assert it is already Deploying.
+///
+/// With max_deploy_retries = 0, the single failure immediately writes Failed.
+#[tokio::test]
+async fn test_recv_02_deploying_written_before_exec() {
+    let (node, dir) = make_node("node-recv02-pitfall3").await;
+    let node_id = node.node_id().to_string();
+    let hash_hex = "cc".repeat(32);
+
+    // Create the canonical blob file
+    tokio::fs::create_dir_all(node.blob_work_dir()).await.unwrap();
+    let blob_path = node.blob_work_dir().join(&hash_hex);
+    tokio::fs::write(&blob_path, b"fake zarf pkg").await.unwrap();
+
+    // Mock uds: exits 1, sleeps 200ms (gives us time to read mid-execution)
+    let mock_path = make_mock_uds(&dir, 1, None, 200);
+
+    put_fetching_request(&node, "recv02-pitfall3-uuid", &node_id, &hash_hex, HashMap::new()).await;
+
+    let node_clone = Arc::clone(&node);
+    let config = DeployerConfig {
+        poll_interval: Duration::from_secs(10),
+        blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 0, // 0 → immediate Failed on first non-zero exit
+        initial_backoff_secs: 0,
+        deploy_command: mock_path.to_str().unwrap().to_string(),
+    };
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let retry_counts_clone = Arc::clone(&retry_counts);
+    let config_clone = config.clone();
+
+    // Spawn poll in a separate task
+    let poll_task = tokio::spawn(async move {
+        poll_deploying_requests_with_counts(&node_clone, &config_clone, &retry_counts_clone)
+            .await
+            .unwrap();
+    });
+
+    // After 50ms — the mock is sleeping 200ms — the doc should already be Deploying
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mid_json = node
+        .get_document("deployment_requests", "recv02-pitfall3-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist mid-execution");
+    let mid: DeploymentRequest = serde_json::from_str(&mid_json).unwrap();
+    assert_eq!(
+        mid.receiver_status,
+        DeploymentStatus::Deploying,
+        "Pitfall 3: receiver_status must be Deploying BEFORE cmd.output().await completes, got {:?}",
+        mid.receiver_status
+    );
+
+    // Wait for the task to complete
+    poll_task.await.unwrap();
+
+    // After completion with max_retries=0, status must be Failed
+    let final_json = node
+        .get_document("deployment_requests", "recv02-pitfall3-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist after poll");
+    let final_req: DeploymentRequest = serde_json::from_str(&final_json).unwrap();
+    assert_eq!(
+        final_req.receiver_status,
+        DeploymentStatus::Failed,
+        "RECV-02: max_retries=0 + non-zero exit must write Failed, got {:?}",
+        final_req.receiver_status
+    );
+}
+
+/// RECV-02 (Pitfall 2): If the canonical blob file does not exist, the deployer
+/// writes receiver_status = Failed WITHOUT invoking the deploy command.
+/// The mock argv file must be absent/empty (command was never run).
+#[tokio::test]
+async fn test_recv_02_missing_blob_file_fails() {
+    let (node, dir) = make_node("node-recv02-noblobfile").await;
+    let node_id = node.node_id().to_string();
+    let hash_hex = "dd".repeat(32);
+
+    // Do NOT create the canonical blob file — that is the condition under test
+
+    let argv_output = dir.path().join("argv-noblobfile.txt");
+    let mock_path = make_mock_uds(&dir, 0, Some(&argv_output), 0);
+
+    put_fetching_request(&node, "recv02-noblobfile-uuid", &node_id, &hash_hex, HashMap::new()).await;
+
+    let config = DeployerConfig {
+        poll_interval: Duration::from_secs(10),
+        blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 3,
+        initial_backoff_secs: 0,
+        deploy_command: mock_path.to_str().unwrap().to_string(),
+    };
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    poll_deploying_requests_with_counts(&node, &config, &retry_counts)
+        .await
+        .unwrap();
+
+    // Assert receiver_status == Failed
+    let result_json = node
+        .get_document("deployment_requests", "recv02-noblobfile-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(
+        result.receiver_status,
+        DeploymentStatus::Failed,
+        "Pitfall 2: missing blob file must write Failed, got {:?}",
+        result.receiver_status
+    );
+
+    // Assert the mock command was NEVER invoked (argv file must be absent or empty)
+    let argv_content = std::fs::read_to_string(&argv_output).unwrap_or_default();
+    assert!(
+        argv_content.trim().is_empty(),
+        "Pitfall 2: deploy command must NOT be invoked when blob file is missing, but got argv: {:?}",
+        argv_content
+    );
+}
+
+// ─── RECV-04: Retry counter + exponential backoff ────────────────────────────
+
+/// RECV-04: After max_deploy_retries exhausted, receiver_status = Failed and
+/// the retry_counts map no longer contains the request_id.
+#[tokio::test]
+async fn test_recv_04_backoff_exhausts_to_failed() {
+    let (node, dir) = make_node("node-recv04-exhaust").await;
+    let node_id = node.node_id().to_string();
+    let hash_hex = "ee".repeat(32);
+
+    tokio::fs::create_dir_all(node.blob_work_dir()).await.unwrap();
+    let blob_path = node.blob_work_dir().join(&hash_hex);
+    tokio::fs::write(&blob_path, b"fake zarf pkg").await.unwrap();
+
+    // Mock uds always fails
+    let mock_path = make_mock_uds(&dir, 1, None, 0);
+
+    put_fetching_request(&node, "recv04-exhaust-uuid", &node_id, &hash_hex, HashMap::new()).await;
+
+    let config = DeployerConfig {
+        poll_interval: Duration::from_secs(10),
+        blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 3,
+        initial_backoff_secs: 0, // 0 → no real sleep; loop completes in milliseconds
+        deploy_command: mock_path.to_str().unwrap().to_string(),
+    };
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    poll_deploying_requests_with_counts(&node, &config, &retry_counts)
+        .await
+        .unwrap();
+
+    // Assert receiver_status == Failed
+    let result_json = node
+        .get_document("deployment_requests", "recv04-exhaust-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(
+        result.receiver_status,
+        DeploymentStatus::Failed,
+        "RECV-04: exhausted retries must write Failed, got {:?}",
+        result.receiver_status
+    );
+
+    // Assert retry_counts no longer contains the request_id (cleared on terminal failure)
+    let counts = retry_counts.lock().await;
+    assert!(
+        !counts.contains_key("recv04-exhaust-uuid"),
+        "RECV-04: retry_counts must be cleared after terminal failure, got: {:?}",
+        counts
+    );
+}
+
+/// RECV-04: A pre-existing retry count is cleared when deploy succeeds.
+#[tokio::test]
+async fn test_recv_04_success_clears_retry_counter() {
+    let (node, dir) = make_node("node-recv04-success").await;
+    let node_id = node.node_id().to_string();
+    let hash_hex = "ff".repeat(32);
+
+    tokio::fs::create_dir_all(node.blob_work_dir()).await.unwrap();
+    let blob_path = node.blob_work_dir().join(&hash_hex);
+    tokio::fs::write(&blob_path, b"fake zarf pkg").await.unwrap();
+
+    // Mock uds succeeds (exit 0)
+    let mock_path = make_mock_uds(&dir, 0, None, 0);
+
+    put_fetching_request(&node, "recv04-success-uuid", &node_id, &hash_hex, HashMap::new()).await;
+
+    let config = DeployerConfig {
+        poll_interval: Duration::from_secs(10),
+        blob_work_dir: node.blob_work_dir().to_path_buf(),
+        kubeconfig: None,
+        max_deploy_retries: 3,
+        initial_backoff_secs: 0,
+        deploy_command: mock_path.to_str().unwrap().to_string(),
+    };
+
+    // Pre-populate retry_counts with {req.id → 2} (simulate prior partial failure)
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    retry_counts
+        .lock()
+        .await
+        .insert("recv04-success-uuid".to_string(), 2);
+
+    poll_deploying_requests_with_counts(&node, &config, &retry_counts)
+        .await
+        .unwrap();
+
+    // Assert receiver_status == Deployed
+    let result_json = node
+        .get_document("deployment_requests", "recv04-success-uuid")
+        .await
+        .unwrap()
+        .expect("doc must still exist");
+    let result: DeploymentRequest = serde_json::from_str(&result_json).unwrap();
+    assert_eq!(
+        result.receiver_status,
+        DeploymentStatus::Deployed,
+        "RECV-04: successful deploy must write Deployed, got {:?}",
+        result.receiver_status
+    );
+
+    // Assert retry_counts no longer contains the request_id
+    let counts = retry_counts.lock().await;
+    assert!(
+        !counts.contains_key("recv04-success-uuid"),
+        "RECV-04: retry_counts must be cleared on success, got: {:?}",
+        counts
+    );
+}
+
+/// RECV-04: ResetDeployment path — when a Pending doc is promoted to Fetching
+/// by poll_deployment_requests, the retry counter for that request_id is cleared.
+/// This gives the operator a fresh retry budget after ResetDeployment.
+#[tokio::test]
+async fn test_recv_04_reset_clears_retry_counter() {
+    let (node, _dir) = make_node("node-recv04-reset").await;
+    let node_id = node.node_id().to_string();
+
+    // Write a Pending doc (simulating state after ResetDeployment)
+    let req_id = "recv04-reset-uuid";
+    let req = DeploymentRequest {
+        id: req_id.to_string(),
+        target_agent_id: node_id.clone(),
+        package_name: "reset-test-pkg".to_string(),
+        package_version: "0.1.0".to_string(),
+        architecture: "arm64".to_string(),
+        iroh_blob_hash: "bb".repeat(32),
+        sender_endpoint_id: "00".repeat(32),
+        zarf_vars: HashMap::new(),
+        sender_status: DeploymentStatus::Deployed,
+        receiver_status: DeploymentStatus::Pending, // Pending after reset
+        created_at: 1_700_000_000,
+        blob_ticket: "{}".to_string(),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    node.put_document("deployment_requests", req_id, &json)
+        .await
+        .unwrap();
+
+    let config = default_config(&node);
+
+    // Pre-populate retry_counts with {req.id → 5} (simulating prior exhaustion)
+    let retry_counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+    retry_counts
+        .lock()
+        .await
+        .insert(req_id.to_string(), 5);
+
+    // Call poll_deployment_requests — the Pending handler clears the counter on Pending → Fetching
+    poll_deployment_requests(&node, &config).await.unwrap();
+
+    // Assert retry_counts no longer contains the request_id
+    let counts = retry_counts.lock().await;
+    assert!(
+        !counts.contains_key(req_id),
+        "RECV-04: poll_deployment_requests must clear retry_counts on Pending → Fetching, got: {:?}",
+        counts
     );
 }
