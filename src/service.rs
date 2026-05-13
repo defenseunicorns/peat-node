@@ -467,6 +467,60 @@ impl pb::PeatSidecar for PeatSidecarService {
             ctx,
         ))
     }
+
+    // --- Attachments (PRD-006) ---
+    //
+    // v1 safety default: all four RPCs return Unimplemented until
+    // --attachment-root is configured. The real handlers land in a later
+    // step; these stubs satisfy the generated trait so the build proceeds
+    // while the supporting modules (config / validate / ingest / registry)
+    // are written.
+
+    async fn send_attachments(
+        &self,
+        _ctx: Context,
+        _request: OwnedView<pb::SendAttachmentsRequestView<'static>>,
+    ) -> Result<(pb::SendAttachmentsResponse, Context), ConnectError> {
+        Err(ConnectError::unimplemented(
+            "SendAttachments requires --attachment-root to be configured",
+        ))
+    }
+
+    async fn get_attachment_distribution(
+        &self,
+        _ctx: Context,
+        _request: OwnedView<pb::GetAttachmentDistributionRequestView<'static>>,
+    ) -> Result<(pb::GetAttachmentDistributionResponse, Context), ConnectError> {
+        Err(ConnectError::unimplemented(
+            "GetAttachmentDistribution requires --attachment-root to be configured",
+        ))
+    }
+
+    async fn subscribe_attachment_bundle(
+        &self,
+        _ctx: Context,
+        _request: OwnedView<pb::SubscribeAttachmentBundleRequestView<'static>>,
+    ) -> Result<
+        (
+            Pin<Box<dyn Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send>>,
+            Context,
+        ),
+        ConnectError,
+    > {
+        Err(ConnectError::unimplemented(
+            "SubscribeAttachmentBundle requires --attachment-root to be configured",
+        ))
+    }
+
+    async fn cancel_attachment_distribution(
+        &self,
+        _ctx: Context,
+        _request: OwnedView<pb::CancelAttachmentDistributionRequestView<'static>>,
+    ) -> Result<(pb::CancelAttachmentDistributionResponse, Context), ConnectError> {
+        Err(ConnectError::unimplemented(
+            "CancelAttachmentDistribution requires --attachment-root to be configured",
+        ))
+    }
 }
 
 // --- Proto ↔ JSON conversion helpers ---
