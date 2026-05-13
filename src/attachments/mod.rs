@@ -21,4 +21,5 @@
 
 pub mod config;
 pub mod ingest;
+pub mod registry;
 pub mod validate;
