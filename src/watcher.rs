@@ -42,8 +42,6 @@ pub struct WatcherConfig {
     pub node_id: String,
     /// Optional mTLS configuration for agent communication.
     pub tls: TlsConfig,
-    /// Optional CV inference service address, e.g. "http://localhost:30080"
-    pub cv_addr: Option<String>,
 }
 
 /// Build the HTTP client, optionally with mTLS.
@@ -103,7 +101,7 @@ pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
 
         // Poll all data and write a single combined document per agent.
         // This ensures one CRDT sync operation transfers all health data.
-        if let Err(e) = poll_all(&client, &config.agent_addr, config.cv_addr.as_deref(), &agent_id, &node).await {
+        if let Err(e) = poll_all(&client, &config.agent_addr, &agent_id, &node).await {
             warn!("poll cycle failed: {e}");
         }
     }
@@ -114,7 +112,6 @@ pub async fn run(config: WatcherConfig, node: Arc<SidecarNode>) {
 async fn poll_all(
     client: &reqwest::Client,
     agent_addr: &str,
-    cv_addr: Option<&str>,
     agent_id: &str,
     node: &SidecarNode,
 ) -> anyhow::Result<()> {
@@ -129,12 +126,15 @@ async fn poll_all(
     // 3. Pod health
     let pod_health = poll_pods_data(client, agent_addr).await.ok();
 
-    // 4. CV inference metrics (optional)
-    let cv_metrics = if let Some(addr) = cv_addr {
-        poll_cv_metrics_data(client, addr).await.ok()
-    } else {
-        None
-    };
+    // 4. CV metrics — forwarded from the cv_metrics collection into the platforms document.
+    //    The iOS peat FFI only reliably surfaces documents written internally by the watcher,
+    //    so we read what the cv-inference pod PUT and forward it here.
+    let cv_metrics_value: Option<serde_json::Value> = node
+        .get_document("cv_metrics", agent_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok());
 
     // Build combined document
     let mut pkg_array = Vec::new();
@@ -147,15 +147,6 @@ async fn poll_all(
             "namespace_override": pkg.namespace_override,
         }));
     }
-
-    let cv_json = cv_metrics.as_ref().map(|cv| serde_json::json!({
-        "fps": cv.fps,
-        "detections_per_second": cv.detections_per_second,
-        "avg_confidence": cv.avg_confidence,
-        "last_class_counts": cv.last_class_counts,
-        "camera_source": cv.camera_source,
-        "status": cv.status,
-    }));
 
     let platform_json = serde_json::json!({
         "agent_id": agent_id,
@@ -173,7 +164,7 @@ async fn poll_all(
         "error_pods": pod_health.as_ref().map(|p| p.errors),
         "error_pod_names": pod_health.as_ref().map(|p| &p.error_names),
         "namespaces": pod_health.as_ref().map(|p| &p.namespace_counts),
-        "cv_metrics": cv_json,
+        "cv_metrics": cv_metrics_value,
         "last_seen": now,
     });
 
@@ -184,7 +175,6 @@ async fn poll_all(
         agent_id,
         packages = packages.len(),
         pods = pod_health.as_ref().map(|p| p.total).unwrap_or(0),
-        cv_fps = cv_metrics.as_ref().map(|c| c.fps).unwrap_or(0.0),
         "synced all agent data to mesh"
     );
     Ok(())
@@ -641,48 +631,3 @@ async fn poll_pods(
     Ok(())
 }
 
-// --- CV Inference Metrics ---
-
-/// CV metrics returned by the cv-inference service /stats endpoint.
-#[derive(Debug, Deserialize)]
-struct CvMetricsResponse {
-    fps: Option<f64>,
-    detections_per_second: Option<f64>,
-    avg_confidence: Option<f64>,
-    #[serde(default)]
-    last_class_counts: serde_json::Value,
-    camera_source: Option<String>,
-    status: Option<String>,
-}
-
-struct CvMetrics {
-    fps: f64,
-    detections_per_second: f64,
-    avg_confidence: f64,
-    last_class_counts: serde_json::Value,
-    camera_source: String,
-    status: String,
-}
-
-async fn poll_cv_metrics_data(
-    client: &reqwest::Client,
-    cv_addr: &str,
-) -> anyhow::Result<CvMetrics> {
-    let url = format!("{cv_addr}/stats");
-    let resp = client.get(&url).send().await?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("CV /stats returned {}", resp.status());
-    }
-
-    let body: CvMetricsResponse = resp.json().await?;
-
-    Ok(CvMetrics {
-        fps: body.fps.unwrap_or(0.0),
-        detections_per_second: body.detections_per_second.unwrap_or(0.0),
-        avg_confidence: body.avg_confidence.unwrap_or(0.0),
-        last_class_counts: body.last_class_counts,
-        camera_source: body.camera_source.unwrap_or_else(|| "unknown".to_string()),
-        status: body.status.unwrap_or_else(|| "unknown".to_string()),
-    })
-}

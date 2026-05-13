@@ -15,6 +15,7 @@ use clap::Parser;
 use connectrpc::Router;
 use tracing::{error, info};
 
+use peat_node::cli_validation::reject_tmp_blob_dir;
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -79,6 +80,23 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_AGENT_TLS_CA")]
     agent_tls_ca: Option<PathBuf>,
 
+    // --- P2P Package Distribution (Phase 1 OPS flags) ---
+
+    /// Enable the deployer task. Disabled by default — receiver nodes must
+    /// explicitly opt in. (Per D-07: default false.)
+    #[arg(long, env = "PEAT_NODE_ENABLE_DEPLOYER", default_value = "false")]
+    enable_deployer: bool,
+
+    /// Directory for blob storage and .meta.json sidecars.
+    /// Defaults to `{data_dir}/blobs`.
+    /// Must NOT be under `/tmp` or `/var/tmp` (K8s-tmpfs memory-backed; blobs disappear on restart).
+    #[arg(long, env = "PEAT_NODE_BLOB_WORK_DIR")]
+    blob_work_dir: Option<PathBuf>,
+
+    /// Timeout in seconds for blob download operations. (Per D-07: default 30.)
+    #[arg(long, env = "PEAT_NODE_DOWNLOAD_TIMEOUT_SECS", default_value = "30")]
+    download_timeout_secs: u64,
+
 }
 
 #[tokio::main]
@@ -95,10 +113,25 @@ async fn main() -> anyhow::Result<()> {
         .node_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    // Resolve effective blob_work_dir: user-supplied or default to {data_dir}/blobs.
+    // (Per Pitfall 4 / D-07 — clap cannot express cross-flag defaults, so we compute here.)
+    let blob_work_dir = args
+        .blob_work_dir
+        .clone()
+        .unwrap_or_else(|| args.data_dir.join("blobs"));
+
+    // D-06 /tmp guard: reject /tmp and /var/tmp at startup.
+    if let Err(e) = reject_tmp_blob_dir(&blob_work_dir) {
+        error!(path = %blob_work_dir.display(), "{e}");
+        std::process::exit(1);
+    }
+
     info!(
         node_id = %node_id,
         listen = %args.listen,
         data_dir = %args.data_dir.display(),
+        blob_work_dir = %blob_work_dir.display(),
+        enable_deployer = args.enable_deployer,
         agent_addr = ?args.agent_addr,
         "starting peat-node"
     );
@@ -106,9 +139,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&args.data_dir).await?;
 
     // Bootstrap the mesh node
-    // TODO(Plan 03): wire --enable-deployer, --blob-work-dir, --download-timeout-secs
-    // clap flags here. Temporary defaults satisfy the compiler until Plan 03 lands.
-    let blob_work_dir = args.data_dir.join("blobs");
     let config = SidecarConfig {
         node_id: node_id.clone(),
         app_id: args.app_id,
@@ -116,9 +146,9 @@ async fn main() -> anyhow::Result<()> {
         data_dir: args.data_dir,
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
-        enable_deployer: false,
+        enable_deployer: args.enable_deployer,
         blob_work_dir,
-        download_timeout_secs: 30,
+        download_timeout_secs: args.download_timeout_secs,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
