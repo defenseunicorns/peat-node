@@ -3,17 +3,27 @@ name: Cross-cluster sync
 # Heavy integration test — spins up two k3d clusters on a shared
 # Docker network, helm-installs peat-node to each, and verifies
 # bidirectional CRDT sync over direct UDP (no relay). Takes ~5-10
-# minutes end-to-end, so it doesn't run on every PR.
+# minutes end-to-end.
 #
 # Triggers:
 #   - on push of any `v*` tag (gates releases on real-K8s deployment)
-#   - manually via the Actions UI (workflow_dispatch) for substantial
-#     PRs touching chart/sync code
+#   - on PRs that touch the high-risk surface (sync source, deps, chart,
+#     the script itself, this workflow). Doc/test/CI-config changes are
+#     skipped via the paths filter to keep PR CI fast.
+#   - manually via the Actions UI (workflow_dispatch) for any PR or branch
 
 on:
   push:
     tags:
       - "v*"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "chart/**"
+      - "test/cross-cluster-sync.sh"
+      - ".github/workflows/cross-cluster-sync.yml"
   workflow_dispatch:
     inputs:
       ref:
