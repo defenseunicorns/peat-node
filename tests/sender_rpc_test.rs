@@ -253,3 +253,41 @@ async fn test_get_deployment_requests_includes_status_fields() {
         "receiver_status field present"
     );
 }
+
+#[tokio::test]
+async fn test_publish_deployment_populates_architecture_and_version() {
+    let (client, base) = boot_server(50088, None).await;
+    let (_tmp, pkg_path) = fake_package();
+
+    call(
+        &client,
+        &base,
+        "PublishDeployment",
+        serde_json::json!({
+            "packagePath": pkg_path,
+            "targetAgentId": "receiver-arch-test",
+            "zarfVars": {},
+            "packageVersion": "1.2.3",
+            "architecture": "arm64",
+        }),
+    )
+    .await;
+
+    let list = call(&client, &base, "GetDeploymentRequests", serde_json::json!({})).await;
+    let reqs = list["requests"].as_array().expect("requests array");
+    assert_eq!(reqs.len(), 1, "exactly one request after one PublishDeployment");
+
+    let doc = &reqs[0];
+    assert_eq!(
+        doc["packageVersion"].as_str(),
+        Some("1.2.3"),
+        "package_version must round-trip through the CRDT doc, got {:?}",
+        doc["packageVersion"]
+    );
+    assert_eq!(
+        doc["architecture"].as_str(),
+        Some("arm64"),
+        "architecture must round-trip through the CRDT doc, got {:?}",
+        doc["architecture"]
+    );
+}
