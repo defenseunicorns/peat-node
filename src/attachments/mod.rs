@@ -20,3 +20,4 @@
 //! handlers land in Step 7.
 
 pub mod config;
+pub mod validate;

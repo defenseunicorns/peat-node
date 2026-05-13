@@ -49,6 +49,10 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
 
+# Hashing (PRD-006 attachment ingest streams sha256 alongside blob ingest;
+# also exercised by validate.rs unit tests for hash equality).
+sha2 = "0.10"
+
 # Encryption at rest
 aes-gcm = "0.10"
 base64 = "0.22"
