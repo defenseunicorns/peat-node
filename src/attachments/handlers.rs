@@ -181,10 +181,22 @@ pub async fn get_attachment_distribution(
     };
 
     let bytes_transferred: u64 = per_node.iter().map(|p| p.progress_bytes).sum();
+    // Fall back to the ingested file's size_bytes from the bundle
+    // identity — peat-protocol's per_node entries don't appear until a
+    // peer starts fetching, and a callerasking right after SendAttachments
+    // would otherwise see bytes_total=0 (or worse, the hex hash length —
+    // an earlier draft used that fallback and reported ~64 for every
+    // pre-fetch query).
+    let fallback_total = bundle
+        .identity
+        .files
+        .get(handle_rec.file_index)
+        .map(|f| f.size_bytes)
+        .unwrap_or(0);
     let bytes_total: u64 = per_node
         .first()
         .map(|p| p.total_bytes)
-        .unwrap_or(handle_rec.distribution_handle.blob_hash.0.len() as u64);
+        .unwrap_or(fallback_total);
 
     Ok(pb::GetAttachmentDistributionResponse {
         status: buffa::EnumValue::from(proto_status as i32),
