@@ -44,19 +44,13 @@ use crate::node::SidecarNode;
 use crate::pb;
 
 /// PRD §Validation Rule 11 concurrency cap. Counted as the number of
-/// resident bundles whose status is non-terminal — a partial proxy for
-/// "in flight" that's correct under the v1 sender-side-only status model
-/// (no v2 observer hooks fold receiver state in).
+/// resident bundles whose status is non-terminal — terminal bundles
+/// within the retention window do not count against the cap. Uses
+/// `BundleRegistry::non_terminal_count` so the meaning of "in flight"
+/// matches the docs (an earlier draft used `registry.len()` which
+/// over-counted at the boundary; the PRD-006 QA review flagged the drift).
 fn in_flight_count(registry: &BundleRegistry) -> usize {
-    // Iterating the registry would require additional API surface. For
-    // v1 we don't have a direct count helper, so we approximate via
-    // registry.len() — which counts all resident bundles, terminal or
-    // not. That over-counts in_flight at the boundary (terminal bundles
-    // still in the retention window are charged), making the limit
-    // *stricter* than spec. v2 should add a `non_terminal_count()`
-    // helper to the registry once the status broadcast (Step 7b) wires
-    // up terminal transitions reliably.
-    registry.len()
+    registry.non_terminal_count()
 }
 
 pub async fn send_attachments(

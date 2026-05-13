@@ -12,7 +12,12 @@ verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, the c
 - A Rust binary (`src/main.rs`) implementing the sidecar.
 - The wire contract in `proto/sidecar.proto`, compiled via `connectrpc_build` (build.rs) for the in-tree server.
 - A Helm chart in `chart/peat-node/` and a Zarf manifest for Kubernetes deployment.
-- A cross-cluster functional test (`test/cross-cluster-sync.sh`) plus in-tree Rust integration tests (`tests/grpc_test.rs`, `tests/node_test.rs`, `tests/sync_test.rs`).
+- A cross-cluster functional test (`test/cross-cluster-sync.sh`) plus in-tree Rust integration tests under `tests/`. The canonical test files map to RPC surfaces:
+  - `tests/grpc_test.rs` — generic Connect HTTP+JSON coverage for the document / peer / sync / typed-collection RPCs
+  - `tests/attachments_*_test.rs` — PRD-006 attachment surface (smoke, acceptance, subscribe, multi-peer, deferred)
+  - `tests/subscribe_test.rs`, `tests/subscribe_query_test.rs` — document Subscribe streaming RPC
+  - `tests/sync_test.rs`, `tests/cross_peer_encryption_test.rs`, `tests/formation_isolation_test.rs`, `tests/partition_test.rs` — multi-node CRDT scenarios
+  - `tests/node_test.rs`, `tests/uds_test.rs`, `tests/typed_collections_test.rs`, `tests/sync_control_test.rs` — in-process unit-ish integration tests against `SidecarNode`
 
 Consumers in other languages talk to the sidecar directly over the Connect-RPC wire — no in-repo SDK. The `examples/compose/` quickstart shows the bash+curl+jq path. For typed clients, generate from `proto/sidecar.proto` in the consumer's own repo (or front it with `peat-gateway` per ADR-043).
 
@@ -39,7 +44,7 @@ Consumers in other languages talk to the sidecar directly over the Connect-RPC w
 - BLE transport → `peat-btle/SKILL.md`
 - OCI registry sync → `peat-registry/SKILL.md`
 - Typed-client SDKs in other languages → consumer's repo, or `peat-gateway` for protocol-bridge adapters (ADR-043)
-- Top-level shared types/traits — consider whether the change belongs in `peat/peat-protocol` or `peat/peat-schema`
+- Top-level shared types/traits — consider whether the change belongs in `peat/peat-protocol` or `peat/peat-schema`. **Dependency direction:** peat-node depends on `peat-mesh` (always) and `peat-protocol` (for the attachment substrate — `FileDistribution`, `IrohFileDistribution`, `DistributionHandle`, `TransferPriority`). `peat-protocol` is the layer *beneath* `peat-mesh` in the workspace, not a sibling; the two-dep arrangement is intentional. Sibling repos (`peat-btle`, `peat-registry`, `peat-gateway`) remain out-of-bounds — those still route through their own skills.
 - Production cluster operations / GitOps configs that consume this chart — separate ops repos
 
 ## Workflow

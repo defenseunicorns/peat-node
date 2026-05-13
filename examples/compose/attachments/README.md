@@ -4,6 +4,14 @@ Single-node `peat-node` with the attachment surface enabled. Sends a
 local file through `SendAttachments`, then verifies the distribution
 with `GetAttachmentDistribution`.
 
+> **Image version requirement.** This quickstart needs a `peat-node`
+> image that contains the PRD-006 attachment RPCs — i.e. the first
+> release tagged at or after the PR that lands the attachment surface.
+> The compose file pins `ghcr.io/defenseunicorns/peat-node:v0.1.1` as a
+> placeholder; bump that tag to the actual release before sharing this
+> quickstart externally. To run against a local build, uncomment the
+> `build:` block in `docker-compose.yml` and comment out `image:`.
+
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the
 smallest possible attachment-only example.

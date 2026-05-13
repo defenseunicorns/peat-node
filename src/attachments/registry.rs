@@ -239,26 +239,58 @@ impl BundleRegistry {
     }
 
     /// PRD Rule 12 lookup. See [`BundleLookup`] variants.
+    ///
+    /// Two-phase locking: a read lock for the common case (bundle absent,
+    /// or present-and-non-terminal-and-conflicting — both pure reads),
+    /// then upgrade to a write lock only when state actually mutates
+    /// (idempotent `last_touched_at` bump, terminal-reuse drop). The
+    /// read→write upgrade re-fetches the bundle entry in case it changed
+    /// between the lock releases.
     pub fn check_resubmit(&self, bundle_id: &str, identity: &BundleIdentity) -> BundleLookup {
-        let mut inner = self
-            .inner
-            .write()
-            .expect("BundleRegistry RwLock poisoned (no thread panicked while holding it)");
+        // Phase 1: read-only probe.
+        {
+            let inner = self
+                .inner
+                .read()
+                .expect("BundleRegistry RwLock poisoned (no thread panicked while holding it)");
+            match inner.bundles.get(bundle_id) {
+                None => return BundleLookup::NotFound,
+                Some(existing) => {
+                    if !existing.status.allows_reuse_with_different_files()
+                        && existing.identity != *identity
+                    {
+                        // Pure read path: a non-terminal-reusable bundle
+                        // with a conflicting identity returns Conflict
+                        // without touching state. No write lock needed.
+                        return BundleLookup::Conflict {
+                            created_at: existing.created_at,
+                        };
+                    }
+                    // Falls through to the write-lock path for the
+                    // mutating branches (terminal-reuse drop, idempotent
+                    // `last_touched_at` bump).
+                }
+            }
+        }
+
+        // Phase 2: write lock for the mutating branches. Re-fetch in case
+        // a concurrent caller mutated state between phases. Race: if the
+        // bundle was evicted between phases, treat as NotFound (the
+        // caller will run a fresh ingest, which is the correct semantic).
+        let mut inner = self.inner.write().expect("BundleRegistry RwLock poisoned");
         match inner.bundles.get(bundle_id) {
             None => BundleLookup::NotFound,
             Some(existing) => {
                 if existing.status.allows_reuse_with_different_files() {
-                    // Terminal-reusable (Failed / Cancelled). The caller
-                    // will run a fresh ingest and call `insert` — clearing
-                    // this stale entry's distribution_ids from the lookup
-                    // index NOW guarantees that `GetAttachmentDistribution`
-                    // against the old IDs returns NotFound the instant we
+                    // Terminal-reusable (Failed / Cancelled). Clear the
+                    // stale entry's distribution_ids from the lookup
+                    // index NOW so `GetAttachmentDistribution` against
+                    // the old IDs returns NotFound the instant we
                     // return (PRD test 17 acceptance).
                     let stale = existing.clone();
                     drop_record(&mut inner, &stale);
-                    return BundleLookup::NotFound;
-                }
-                if existing.identity == *identity {
+                    BundleLookup::NotFound
+                } else if existing.identity == *identity {
                     let mut rec = existing.clone();
                     rec.last_touched_at = SystemTime::now();
                     if let Some(live) = inner.bundles.get_mut(bundle_id) {
@@ -266,6 +298,9 @@ impl BundleRegistry {
                     }
                     BundleLookup::Idempotent(rec)
                 } else {
+                    // Conflict observed under the write lock — phase 1's
+                    // read may have raced an idempotent-bump under
+                    // another caller; the answer is still Conflict.
                     BundleLookup::Conflict {
                         created_at: existing.created_at,
                     }
@@ -362,6 +397,20 @@ impl BundleRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Number of resident bundles whose status is non-terminal — the
+    /// honest "in flight" count for PRD §Validation Rule 11. Distinct
+    /// from `len()` (which includes terminal bundles still within the
+    /// retention window). O(N) over a bounded N (default 4096 from
+    /// `max_known_bundles`), called only on `SendAttachments`.
+    pub fn non_terminal_count(&self) -> usize {
+        let inner = self.inner.read().expect("BundleRegistry RwLock poisoned");
+        inner
+            .bundles
+            .values()
+            .filter(|r| !r.status.is_terminal())
+            .count()
     }
 }
 

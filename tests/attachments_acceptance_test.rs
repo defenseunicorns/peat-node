@@ -27,6 +27,11 @@ struct BootedServer {
     base: String,
     _root_dir: tempfile::TempDir,
     root_path: PathBuf,
+    /// Direct handle to the SidecarNode behind the HTTP server — used by
+    /// tests that need to seed registry state past the wire layer
+    /// (PRD test 26 in particular, where the only way to deterministically
+    /// keep a bundle non-terminal is to insert it directly).
+    node: Arc<SidecarNode>,
 }
 
 /// Boot a peat-node with attachments enabled and the supplied config
@@ -68,7 +73,7 @@ async fn boot_server(port: u16, cfg_override: impl FnOnce(&mut AttachmentConfig)
         .unwrap(),
     );
 
-    let service = Arc::new(PeatSidecarService::new(node));
+    let service = Arc::new(PeatSidecarService::new(Arc::clone(&node)));
     let router = service.register(connectrpc::Router::new());
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     tokio::spawn(async move {
@@ -80,6 +85,7 @@ async fn boot_server(port: u16, cfg_override: impl FnOnce(&mut AttachmentConfig)
         base: format!("http://127.0.0.1:{port}"),
         _root_dir: root_dir,
         root_path,
+        node,
     }
 }
 
@@ -144,51 +150,78 @@ fn send_body(root_name: &str, rel: &str, size: u64, sha256: &[u8; 32]) -> serde_
 // PRD test 26 — concurrent_cap_returns_resource_exhausted
 // ─────────────────────────────────────────────────────────────────────
 
-/// With `max_concurrent_distributions = 1` and `queue_when_full = false`,
-/// the second SendAttachments must fail `ResourceExhausted` because the
-/// first bundle is still resident in the registry. The handler counts
-/// resident bundles via the registry as the v1 in-flight proxy (the
-/// PRD-006 docs note this over-counts at the boundary but errs on the
-/// stricter side, which is what we assert here).
+/// `max_concurrent_distributions = 1` plus a non-terminal bundle resident
+/// in the registry must cause SendAttachments to reject with
+/// `ResourceExhausted`. The earlier HTTP-driven version of this test
+/// exploited an over-count bug (`registry.len()` instead of
+/// `non_terminal_count`) — flagged by the PRD-006 QA review and fixed in
+/// the same commit. With the honest counter, two sequential HTTP Sends
+/// don't both stay in-flight because the watcher's zero-peer short-
+/// circuit drives the first bundle to Completed before the second
+/// arrives. The test is now in-process so it can seed a Pending bundle
+/// directly via the registry — deterministic, and exercises the same
+/// `in_flight_count`-vs-cap path the original HTTP test was reaching.
 #[tokio::test]
 async fn concurrent_cap_returns_resource_exhausted() {
+    use peat_node::attachments::handlers;
+    use peat_node::attachments::registry::{
+        BundleIdentity, BundleRecord, BundleStatus, FileIdentity,
+    };
+    use peat_node::pb;
+
     let server = boot_server(50111, |cfg| {
         cfg.max_concurrent_distributions = 1;
         cfg.queue_when_full = false;
     })
     .await;
-    let client = http_client();
+    // Reach past the HTTP layer for direct-Arc access to the node so we
+    // can seed a Pending bundle into the registry. The HTTP path stays
+    // in scope below (the real send_attachments call goes through it).
+    let node = server.node.clone();
 
-    let bytes = b"first";
-    let h1 = write_file(&server.root_path, "f1.bin", bytes);
-    let (status1, _b1) = call_raw(
-        &client,
-        &server.base,
-        "SendAttachments",
-        send_body("outbox", "f1.bin", bytes.len() as u64, &h1),
-    )
-    .await;
-    assert!(
-        status1.is_success(),
-        "first SendAttachments must succeed; got {status1}"
-    );
+    // Seed a non-terminal bundle. `BundleRecord::new` defaults to
+    // `BundleStatus::Pending`, which the in_flight_count helper picks up
+    // because it filters by `!is_terminal()`.
+    let identity = BundleIdentity {
+        files: vec![FileIdentity {
+            root_name: "synthetic".into(),
+            relative_path: "synthetic.bin".into(),
+            size_bytes: 1,
+            sha256: [0u8; 32],
+        }],
+    };
+    let synthetic = BundleRecord::new("synthetic-in-flight".into(), identity, vec![]);
+    assert!(!synthetic.status.is_terminal()); // Pending — counts against the cap
+    let _ = BundleStatus::Pending; // silence unused-import in the test
+    node.bundle_registry().insert(synthetic);
+    assert_eq!(node.bundle_registry().non_terminal_count(), 1);
 
-    let bytes2 = b"second";
-    let h2 = write_file(&server.root_path, "f2.bin", bytes2);
-    let (status2, body2) = call_raw(
-        &client,
-        &server.base,
-        "SendAttachments",
-        send_body("outbox", "f2.bin", bytes2.len() as u64, &h2),
-    )
-    .await;
-    assert!(
-        !status2.is_success(),
-        "second SendAttachments must hit the concurrency cap"
-    );
+    // Now a real SendAttachments must hit the cap. Going through the
+    // in-process handler exercises the same in_flight_count call the
+    // HTTP path uses; the only thing skipped is buffa wire encoding,
+    // which the smoke test already covers.
+    let payload = b"would have been the second send";
+    let hash = write_file(&server.root_path, "second.bin", payload);
+    let req = pb::SendAttachmentsRequest {
+        files: vec![pb::FileSpec {
+            root_name: "outbox".into(),
+            relative_path: "second.bin".into(),
+            size_bytes: payload.len() as u64,
+            sha256: hash.to_vec(),
+            ..Default::default()
+        }],
+        scope: buffa::MessageField::some(pb::DistributionScopeSpec {
+            scope: Some(pb::distribution_scope_spec::Scope::AllNodes(Box::default())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let err = handlers::send_attachments(&node, req).await.unwrap_err();
     assert_eq!(
-        body2["code"], "resource_exhausted",
-        "concurrency-cap rejection must be ResourceExhausted; got body: {body2}"
+        err.code,
+        connectrpc::ErrorCode::ResourceExhausted,
+        "non-terminal bundle resident + max_concurrent=1 must reject ResourceExhausted; got: {err}"
     );
 }
 
