@@ -91,7 +91,6 @@ async fn poll_for_doc(
 }
 
 #[tokio::test]
-#[ignore = "DDIL reconnect path doesn't reliably restore sync in same-process peat-mesh =0.9.0-rc.7; tracked separately"]
 async fn sync_resumes_after_disconnect_and_reconnect() {
     let (client_a, base_a) = boot(50141, 51241).await;
     let (client_b, base_b) = boot(50142, 51242).await;
