@@ -90,6 +90,41 @@ Usage in a parent chart:
     - name: RUST_LOG
       value: "peat_node=debug,peat_mesh=debug"
     {{- end }}
+    {{- /* PRD-006 attachment distribution. Roots map renders as
+           `name=path,name2=path2,...` for PEAT_NODE_ATTACHMENT_ROOT.
+           Empty roots → env var omitted → RPCs return Unimplemented. */}}
+    {{- if .Values.attachment.roots }}
+    - name: PEAT_NODE_ATTACHMENT_ROOT
+      value: "{{- $first := true -}}
+        {{- range $name, $path := .Values.attachment.roots -}}
+          {{- if not $first -}},{{- end -}}{{- $name -}}={{- $path -}}{{- $first = false -}}
+        {{- end -}}"
+    {{- /* int64 coercion before quote — YAML-parsed numbers come in as
+           float64 in Helm/Sprig, and `quote` on a float produces
+           scientific notation (`2.68435456e+08`) which clap rejects. */}}
+    - name: PEAT_NODE_ATTACHMENT_MAX_FILE_BYTES
+      value: {{ .Values.attachment.maxFileBytes | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_MAX_BUNDLE_BYTES
+      value: {{ .Values.attachment.maxBundleBytes | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_MAX_FILES_PER_BUNDLE
+      value: {{ .Values.attachment.maxFilesPerBundle | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_MAX_NODE_LIST_LEN
+      value: {{ .Values.attachment.maxNodeListLen | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_MAX_CONCURRENT_DISTRIBUTIONS
+      value: {{ .Values.attachment.maxConcurrentDistributions | int64 | quote }}
+    {{- if .Values.attachment.queueWhenFull }}
+    - name: PEAT_NODE_ATTACHMENT_QUEUE_WHEN_FULL
+      value: "true"
+    {{- end }}
+    - name: PEAT_NODE_ATTACHMENT_DEFAULT_PRIORITY
+      value: {{ .Values.attachment.defaultPriority | quote }}
+    - name: PEAT_NODE_ATTACHMENT_DISCOVERY_GRACE_SECS
+      value: {{ .Values.attachment.discoveryGraceSecs | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS
+      value: {{ .Values.attachment.handleRetentionSecs | int64 | quote }}
+    - name: PEAT_NODE_ATTACHMENT_MAX_KNOWN_BUNDLES
+      value: {{ .Values.attachment.maxKnownBundles | int64 | quote }}
+    {{- end }}
   ports:
     {{- if hasPrefix "tcp://" .Values.listen }}
     - name: grpc
@@ -138,6 +173,12 @@ Usage in a parent chart:
       mountPath: /etc/peat-node/agent-tls
       readOnly: true
     {{- end }}
+    {{- /* PRD-006 attachment-root mounts. Operator-supplied — the chart
+           just appends them. Each mount path should match the
+           corresponding `attachment.roots` value. */}}
+    {{- with .Values.attachment.extraVolumeMounts }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
 {{- end -}}
 
 {{/*
@@ -163,5 +204,9 @@ Usage:
 - name: peat-node-agent-tls
   secret:
     secretName: {{ .Values.agentTls.secretName }}
+{{- end }}
+{{- /* PRD-006 attachment-root volumes (operator-supplied). */}}
+{{- with .Values.attachment.extraVolumes }}
+{{- toYaml . | nindent 0 }}
 {{- end }}
 {{- end -}}
