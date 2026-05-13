@@ -452,13 +452,13 @@ impl SidecarNode {
 
         self.store.put(&key, &doc)?;
 
-        // Local change notification
-        let _ = self.change_tx.send(ChangeEvent {
-            collection: collection.to_string(),
-            doc_id: doc_id.to_string(),
-            change_type: ChangeType::Upsert,
-            json_data: Some(json_data.to_string()),
-        });
+        // `store.put` fires the AutomergeStore observer, which the
+        // `forward_store_changes` task re-emits as a `ChangeEvent` on
+        // `change_tx`. Emitting a second event directly here would
+        // duplicate every local upsert on the broadcast channel and
+        // make subscribe-with-filter behavior non-deterministic for
+        // counting subscribers. The forwarder is the single source of
+        // truth for upsert events — local and remote-sync alike.
 
         Ok(())
     }
