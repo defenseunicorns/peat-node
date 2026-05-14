@@ -15,7 +15,7 @@ graph TB
     subgraph pod["Kubernetes Pod"]
         app["Your Application<br/>(any language)"]
         subgraph sidecar["peat-node"]
-            grpc["gRPC API :50051<br/>21 RPCs: documents, peers,<br/>subscriptions, sync control"]
+            grpc["gRPC API :50051<br/>25 RPCs: documents, peers,<br/>subscriptions, sync control,<br/>attachments"]
             crdt["CRDT Store<br/>(Automerge)"]
             transport["P2P Transport<br/>(Iroh QUIC)"]
             grpc --> crdt --> transport
@@ -103,7 +103,7 @@ Every CLI flag has a `PEAT_NODE_*` environment variable equivalent — see [`doc
 
 ## gRPC API
 
-The sidecar exposes `peat.sidecar.v1.PeatSidecar` with 21 RPCs:
+The sidecar exposes `peat.sidecar.v1.PeatSidecar` with 25 RPCs:
 
 | Category | RPCs |
 |----------|------|
@@ -113,6 +113,9 @@ The sidecar exposes `peat.sidecar.v1.PeatSidecar` with 21 RPCs:
 | **Typed Collections** | `PutPlatform`, `GetPlatforms`, `PutCell`, `GetCells`, `PutTrack`, `GetTracks`, `PutCommand`, `GetCommands` |
 | **Subscriptions** | `Subscribe` (server-streaming) |
 | **Sync Control** | `StartSync`, `StopSync`, `GetSyncStats` |
+| **Attachments** (PRD-006) | `SendAttachments`, `GetAttachmentDistribution`, `SubscribeAttachmentBundle` (server-streaming), `CancelAttachmentDistribution` |
+
+The attachment RPCs are disabled by default (return `Unimplemented`) until at least one `--attachment-root` is configured. See [docs/CONFIGURATION.md#attachment-distribution-prd-006](docs/CONFIGURATION.md#attachment-distribution-prd-006) for the wiring and the [examples/compose/attachments](examples/compose/attachments) quickstart.
 
 Proto definition: [`proto/sidecar.proto`](proto/sidecar.proto)
 

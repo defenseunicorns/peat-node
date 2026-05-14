@@ -60,6 +60,61 @@ h2c; the unmatched TLS env vars are ignored. If cert + key are both set
 but either PEM is malformed, startup panics. See
 `src/watcher.rs::build_client` ([#37](https://github.com/defenseunicorns/peat-node/issues/37) tracks hardening this to error on partial TLS config).
 
+## Attachment distribution (PRD-006)
+
+Path-based attachment submission over gRPC. A co-located application
+hands `peat-node` a list of file paths plus their declared sha256 + size;
+the sidecar validates, content-hashes via iroh-blobs (BLAKE3), and
+queues them for distribution to other mesh peers.
+
+**Safety default:** with no `--attachment-root` configured, the four
+attachment RPCs (`SendAttachments`, `GetAttachmentDistribution`,
+`SubscribeAttachmentBundle`, `CancelAttachmentDistribution`) return
+`Unimplemented`. Operators must explicitly name the directory roots the
+RPC may read.
+
+| Env var | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `PEAT_NODE_ATTACHMENT_ROOT` | `--attachment-root` | `name=path` (repeatable, comma-delimited) | *empty (RPC disabled)* | Allowlisted roots, e.g. `outbox=/var/lib/peat/outbox,media=/var/lib/peat/media`. Each path is canonicalised at startup; bad inputs (missing dir, non-directory, malformed name) fail the process before the mesh starts. |
+| `PEAT_NODE_ATTACHMENT_MAX_FILE_BYTES` | `--attachment-max-file-bytes` | u64 | `268435456` (256 MiB) | Per-file size cap. Larger files reject `ResourceExhausted`. |
+| `PEAT_NODE_ATTACHMENT_MAX_BUNDLE_BYTES` | `--attachment-max-bundle-bytes` | u64 | `1073741824` (1 GiB) | Per-request total-bytes cap (`Σ size_bytes`). |
+| `PEAT_NODE_ATTACHMENT_MAX_FILES_PER_BUNDLE` | `--attachment-max-files-per-bundle` | u32 | `64` | Per-request file-count cap. |
+| `PEAT_NODE_ATTACHMENT_MAX_NODE_LIST_LEN` | `--attachment-max-node-list-len` | u32 | `256` | Cap on `NodeListScope.node_ids.len()`. |
+| `PEAT_NODE_ATTACHMENT_MAX_CONCURRENT_DISTRIBUTIONS` | `--attachment-max-concurrent-distributions` | u32 | `4` | In-flight cap. Over-cap requests reject `ResourceExhausted` unless `--attachment-queue-when-full` is set. |
+| `PEAT_NODE_ATTACHMENT_QUEUE_WHEN_FULL` | `--attachment-queue-when-full` | bool | `false` | When true, accept beyond the in-flight cap. v1 honors the knob but the queue wait itself is deferred — accepts pass through immediately. |
+| `PEAT_NODE_ATTACHMENT_DEFAULT_PRIORITY` | `--attachment-default-priority` | enum | `routine` | Default `AttachmentPriority` when the caller leaves it `UNSPECIFIED`. Values: `bulk` \| `low` \| `routine` \| `priority` \| `critical`. v1 records the classification on the distribution document but does NOT enforce wire-level preemption between classes — that needs PRD-004 (bandwidth allocation). |
+| `PEAT_NODE_ATTACHMENT_DISCOVERY_GRACE_SECS` | `--attachment-discovery-grace-secs` | u32 | `30` | Grace window for unknown node IDs in `NodeListScope` before they're marked `FAILED` in per-node status. **Recognised but inert in v1** — the background promoter task is not yet implemented. |
+| `PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS` | `--attachment-handle-retention-secs` | u32 | `86400` (24h) | How long a terminal bundle's handle table is retained for `bundle_id` lookups, `SubscribeAttachmentBundle` late-attach, and `AlreadyExists` enforcement. `0` disables retention (no idempotency, no late-subscribe — discouraged). A background sweep evicts terminal bundles past the window; non-terminal bundles only age out under LRU pressure. |
+| `PEAT_NODE_ATTACHMENT_MAX_KNOWN_BUNDLES` | `--attachment-max-known-bundles` | u32 | `4096` | Hard cap on the handle-table size; LRU eviction triggers before the retention window expires when exceeded. Protects long-running edge nodes from unbounded growth proportional to lifetime send volume. |
+
+### Scope variants
+
+`SendAttachmentsRequest.scope` accepts:
+
+- `AllNodesScope` — distribute to every reachable peer.
+- `NodeListScope { node_ids: [...] }` — distribute to the listed IDs. Unknown IDs aren't a request-time error; they record in per-node status and (when the discovery-grace task ships) age to FAILED after `--attachment-discovery-grace-secs`.
+- `FormationScope { formation_id }` — **rejected `FailedPrecondition` in v1.** Formation membership resolution awaits a live data source.
+- `CapableScope {}` — **rejected `FailedPrecondition` in v1.** Reserved-but-empty variant; the capability vocabulary is deferred to a follow-on ADR. The empty marker exists so the oneof can grow without renumbering once the schema lands.
+
+An unset scope (oneof or the `scope` field omitted entirely) is rejected `InvalidArgument` — there is no silent fallback to `AllNodes`.
+
+### Handle-table durability
+
+The bundle handle table is **in-memory only** in v1. A `peat-node` restart drops every `bundle_id` lookup. Consequences:
+
+- `SubscribeAttachmentBundle(bundle_id)` returns `NotFound` for any `bundle_id` whose subscriber re-attaches after a *server-side* restart, even within the retention window.
+- `AlreadyExists` enforcement resets — a `bundle_id` ingested before the restart can be resubmitted with a different `FileSpec` set immediately after.
+- Iroh content-addressed blobs and in-flight Automerge distribution documents are unaffected.
+
+Consumers should not build durable-bundle assumptions against this surface. Durable handle tables would be a separate v2 spec.
+
+### Deployment example
+
+Two operator wiring patterns:
+
+- **Docker Compose** — see [`examples/compose/attachments`](../examples/compose/attachments) for the simplest possible quickstart: one `peat-node` container with an `outbox` volume mounted at `/var/lib/peat/outbox` and the attachment env vars set.
+- **Helm** — see the `attachment:` section in [`chart/peat-node/values.yaml`](../chart/peat-node/values.yaml). Operators provide the volumes via `attachment.extraVolumes` / `attachment.extraVolumeMounts` and map `attachment.roots` entries to the matching mount paths. The chart only wires env vars and threads the mounts — volume provisioning (PVC, hostPath, emptyDir, configMap, CSI, etc.) is operator-supplied.
+
 ## Logging
 
 `peat-node` uses `tracing` with an env filter. Set `RUST_LOG` directly:

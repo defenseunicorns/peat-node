@@ -467,6 +467,63 @@ impl pb::PeatSidecar for PeatSidecarService {
             ctx,
         ))
     }
+
+    // --- Attachments (PRD-006) ---
+    //
+    // v1 safety default: all four RPCs return Unimplemented until
+    // --attachment-root is configured. The real handlers land in a later
+    // step; these stubs satisfy the generated trait so the build proceeds
+    // while the supporting modules (config / validate / ingest / registry)
+    // are written.
+
+    async fn send_attachments(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::SendAttachmentsRequestView<'static>>,
+    ) -> Result<(pb::SendAttachmentsResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
+        let resp = crate::attachments::handlers::send_attachments(&self.node, req).await?;
+        Ok((resp, ctx))
+    }
+
+    async fn get_attachment_distribution(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::GetAttachmentDistributionRequestView<'static>>,
+    ) -> Result<(pb::GetAttachmentDistributionResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
+        let resp =
+            crate::attachments::handlers::get_attachment_distribution(&self.node, req).await?;
+        Ok((resp, ctx))
+    }
+
+    async fn subscribe_attachment_bundle(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::SubscribeAttachmentBundleRequestView<'static>>,
+    ) -> Result<
+        (
+            Pin<Box<dyn Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send>>,
+            Context,
+        ),
+        ConnectError,
+    > {
+        let req = request.to_owned_message();
+        let stream =
+            crate::attachments::handlers::subscribe_attachment_bundle(&self.node, req).await?;
+        Ok((stream, ctx))
+    }
+
+    async fn cancel_attachment_distribution(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::CancelAttachmentDistributionRequestView<'static>>,
+    ) -> Result<(pb::CancelAttachmentDistributionResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
+        let resp =
+            crate::attachments::handlers::cancel_attachment_distribution(&self.node, req).await?;
+        Ok((resp, ctx))
+    }
 }
 
 // --- Proto ↔ JSON conversion helpers ---

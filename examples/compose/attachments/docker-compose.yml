@@ -1,0 +1,71 @@
+# Single-node peat-node with attachment distribution enabled (PRD-006).
+#
+# Quickstart:
+#   docker compose up -d
+#   ./send.sh              # ingests outbox/hello.txt via SendAttachments
+#   docker compose down -v
+#
+# The outbox/ directory on the host is bind-mounted into the container at
+# /var/lib/peat/outbox, which is the path peat-node has been told is the
+# allowlisted "outbox" attachment root. Any file dropped into outbox/ on
+# the host is reachable to SendAttachments by its relative_path inside
+# the root.
+#
+# Single-node is sufficient for the quickstart because the attachment
+# RPCs work end-to-end without peers: the watcher's zero-peer
+# short-circuit immediately reports COMPLETED, blob ingest produces a
+# BLAKE3 content-address, and Get / Subscribe / Cancel all function.
+# For two-node distribution, layer this onto the existing two-peer
+# `examples/compose/docker-compose.yml` by adding the same attachment
+# env vars and a shared outbox volume.
+
+services:
+  peat-node:
+    # Build from the repo root by default. The attachment RPCs ship with
+    # the release that lands #56 (PRD-006 v1); until that release is
+    # published, the `ghcr.io/defenseunicorns/peat-node:v0.1.1` image
+    # does NOT contain SendAttachments / GetAttachmentDistribution /
+    # SubscribeAttachmentBundle / CancelAttachmentDistribution — the
+    # quickstart fails with `unimplemented: method not found` against it.
+    #
+    # After the post-#56 release ships, flip the default: comment out the
+    # `build:` block and uncomment the `image:` line below.
+    build:
+      context: ../../..
+    # image: ghcr.io/defenseunicorns/peat-node:vX.Y.Z  # post-#56 release tag
+    container_name: peat-node-attachments
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_NODE_ID: attach-demo
+      PEAT_NODE_APP_ID: attach-demo
+      # Demo formation key (32 zero bytes). Generate your own for any
+      # non-demo use: `head -c 32 /dev/urandom | base64`
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_AUTO_SYNC: "true"
+
+      # PRD-006 attachment surface. One root, "outbox", at the in-container
+      # path the volume below mounts. With no roots, the four attachment
+      # RPCs return Unimplemented — this is the safety default the
+      # operator opts out of by setting this env var.
+      PEAT_NODE_ATTACHMENT_ROOT: outbox=/var/lib/peat/outbox
+
+      # All other --attachment-* knobs are accepting defaults
+      # (256 MiB per file, 1 GiB per bundle, 64 files per bundle,
+      # 4 concurrent distributions, routine priority, 24h retention).
+      # Override here if needed:
+      # PEAT_NODE_ATTACHMENT_MAX_FILE_BYTES: "104857600"
+      # PEAT_NODE_ATTACHMENT_DEFAULT_PRIORITY: "priority"
+
+      RUST_LOG: peat_node=info,peat_mesh=warn
+    ports:
+      - "50051:50051"
+    volumes:
+      - peat-node-data:/data/peat-node
+      # Bind-mount the host outbox/ directory into the in-container root.
+      # Files dropped here on the host are addressable from
+      # SendAttachments via root_name=outbox + relative_path.
+      - ./outbox:/var/lib/peat/outbox:ro
+
+volumes:
+  peat-node-data: {}

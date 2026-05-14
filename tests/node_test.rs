@@ -18,6 +18,7 @@ async fn test_node_with_encryption(
         peers: vec![],
         encryption_key,
         iroh_udp_port: None,
+        attachment_config: Default::default(),
     })
     .await
     .expect("failed to create node")

@@ -37,6 +37,7 @@ async fn fresh_service() -> (Arc<SidecarNode>, PeatSidecarService) {
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: None,
+            attachment_config: Default::default(),
         })
         .await
         .expect("boot node"),

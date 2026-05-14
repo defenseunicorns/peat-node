@@ -15,6 +15,9 @@ path = "src/main.rs"
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer)
 peat-mesh = { version = "=0.9.0-rc.9", features = ["automerge-backend"] }
 
+# File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
+peat-protocol = { version = ">=0.9.0-rc.6, <0.9.1", features = ["automerge-backend"] }
+
 # P2P networking
 iroh = "0.97"
 
@@ -45,6 +48,15 @@ thiserror = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+
+# Hashing (PRD-006 attachment ingest streams sha256 alongside blob ingest;
+# also exercised by validate.rs unit tests for hash equality).
+sha2 = "0.10"
+
+# O_NOFOLLOW for the attachment-ingest open path (PRD-006 §Validation Rule 5
+# TOCTOU mitigation). libc is already transitively pulled by iroh / tokio —
+# making it a direct dep just gives us the constant without surprise.
+libc = "0.2"
 
 # Encryption at rest
 aes-gcm = "0.10"

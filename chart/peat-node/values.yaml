@@ -77,6 +77,86 @@ resources:
     cpu: 500m
     memory: 256Mi
 
+# -- Attachment distribution (PRD-006).
+#
+# Safety default: with `roots` empty, the four attachment RPCs
+# (SendAttachments / GetAttachmentDistribution / SubscribeAttachmentBundle
+# / CancelAttachmentDistribution) return Unimplemented. Operators must
+# explicitly name the directory roots that may be read by setting one or
+# more `roots` entries AND providing the matching volume mounts via
+# `extraVolumes` / `extraVolumeMounts`.
+#
+# Example wiring (uncomment to enable an "outbox" root backed by a PVC):
+#
+#   attachment:
+#     roots:
+#       outbox: /var/lib/peat/outbox
+#     extraVolumes:
+#       - name: peat-attachment-outbox
+#         persistentVolumeClaim:
+#           claimName: peat-attachment-outbox
+#     extraVolumeMounts:
+#       - name: peat-attachment-outbox
+#         mountPath: /var/lib/peat/outbox
+#         readOnly: true
+#
+# Any volume source is supported (emptyDir, hostPath, configMap, csi,
+# etc.) — the chart only wires the env var and threads the mounts; the
+# volume provisioning is operator-supplied.
+attachment:
+  # Allowlisted root name → in-container mount path. Empty means the
+  # attachment RPCs return Unimplemented.
+  roots: {}
+
+  # Additional volumes for the attachment roots. Items are appended to
+  # the pod's `volumes` list verbatim.
+  extraVolumes: []
+
+  # Additional volume mounts for the peat-node container. Items are
+  # appended to `volumeMounts` verbatim.
+  extraVolumeMounts: []
+
+  # Per-file size cap (bytes). Files larger than this are rejected
+  # ResourceExhausted at validation. Default 256 MiB.
+  maxFileBytes: 268435456
+
+  # Per-request total-bytes cap. Bundles whose `Σ size_bytes` exceeds
+  # this are rejected ResourceExhausted. Default 1 GiB.
+  maxBundleBytes: 1073741824
+
+  # Per-request file-count cap.
+  maxFilesPerBundle: 64
+
+  # Cap on `NodeListScope.node_ids.len()`.
+  maxNodeListLen: 256
+
+  # In-flight distribution cap. Requests beyond this are rejected
+  # ResourceExhausted unless queueWhenFull is true.
+  maxConcurrentDistributions: 4
+
+  # If true, accept and queue requests beyond the in-flight cap; else
+  # reject. (The queue path itself is deferred to v2; v1 honors the knob
+  # but does not yet wait for in-flight slots.)
+  queueWhenFull: false
+
+  # Default AttachmentPriority when caller leaves it UNSPECIFIED.
+  # Values: bulk | low | routine | priority | critical.
+  defaultPriority: routine
+
+  # Grace window (seconds) for unknown node IDs in NodeListScope before
+  # they are marked FAILED. (v1 records the knob; the background
+  # promoter is deferred — see attachments_deferred_test.rs test 25.)
+  discoveryGraceSecs: 30
+
+  # How long terminal bundles' handle tables are retained for bundle_id
+  # lookups, SubscribeAttachmentBundle late-attach, and AlreadyExists
+  # enforcement. 0 disables retention (discouraged). Default 24h.
+  handleRetentionSecs: 86400
+
+  # Hard cap on handle-table size; LRU eviction triggers before the
+  # retention window expires when exceeded.
+  maxKnownBundles: 4096
+
 # -- Verbose logging
 verbose: false
 

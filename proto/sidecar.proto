@@ -73,6 +73,53 @@ service PeatSidecar {
 
   // GetSyncStats returns current synchronization statistics.
   rpc GetSyncStats(GetSyncStatsRequest) returns (GetSyncStatsResponse);
+
+  // --- Attachments (PRD-006) ---
+
+  // SendAttachments ingests one or more local files and queues them for
+  // distribution to the specified scope. Each file is validated (size, hash,
+  // path inside an allowlisted root) before any blob is created — partial
+  // ingestion is not allowed. Returns synchronously with handles; transfer
+  // happens asynchronously.
+  //
+  // Safety default: with no `--attachment-root` configured on peat-node, this
+  // RPC returns UNIMPLEMENTED. Operators must consciously opt in by naming
+  // the roots that may be read.
+  rpc SendAttachments(SendAttachmentsRequest) returns (SendAttachmentsResponse);
+
+  // GetAttachmentDistribution returns the current status of a single
+  // distribution by its ID. Returns NOT_FOUND with the offending
+  // distribution_id in the error detail when the ID is unknown.
+  rpc GetAttachmentDistribution(GetAttachmentDistributionRequest)
+      returns (GetAttachmentDistributionResponse);
+
+  // SubscribeAttachmentBundle streams progress updates for every distribution
+  // in a bundle until all reach a terminal state or the client disconnects.
+  //
+  // Late-subscribe semantics (for crash-recovery):
+  //   * All-terminal at subscribe time (every distribution already in
+  //     COMPLETED / FAILED / CANCELLED): the server emits exactly one
+  //     AttachmentProgress snapshot per distribution carrying that terminal
+  //     state, then closes the stream.
+  //   * Mixed state at subscribe time (some distributions already terminal,
+  //     others still PENDING / IN_PROGRESS): the server emits one snapshot
+  //     for each already-terminal distribution first, then streams live
+  //     progress updates for the in-flight distributions, then closes once
+  //     every distribution has reached a terminal state.
+  //   * All-live at subscribe time (no terminal distributions yet): live
+  //     streaming only — no synthetic snapshots — until terminal close.
+  //
+  // The late-subscribe contract covers *client* crashes. A *server*
+  // (peat-node) restart drops the in-memory handle table; resubscribing to
+  // a pre-restart bundle_id returns NOT_FOUND.
+  rpc SubscribeAttachmentBundle(SubscribeAttachmentBundleRequest)
+      returns (stream AttachmentProgress);
+
+  // CancelAttachmentDistribution requests cancellation of an in-flight
+  // distribution. Best-effort; already-transferred bytes on receivers are
+  // not rolled back. Returns NOT_FOUND when distribution_id is unknown.
+  rpc CancelAttachmentDistribution(CancelAttachmentDistributionRequest)
+      returns (CancelAttachmentDistributionResponse);
 }
 
 // --- Lifecycle Messages ---
@@ -397,4 +444,216 @@ message GetSyncStatsResponse {
   uint32 connected_peers = 2;
   uint64 bytes_sent = 3;
   uint64 bytes_received = 4;
+}
+
+// --- Attachment Messages (PRD-006) ---
+
+// FileSpec describes one file in a SendAttachments bundle. The caller asserts
+// size_bytes and sha256; peat-node verifies both in the same I/O pass as
+// blob ingest. Any mismatch deletes the partial blob — no orphans.
+message FileSpec {
+  // Name of an allowlisted root configured on peat-node (see Configuration).
+  // Must exist in --attachment-root; unknown roots → INVALID_ARGUMENT.
+  string root_name = 1;
+
+  // Path relative to the named root. Must not be empty, must not start with
+  // `/`, must not contain `..` as a path component. After canonicalisation
+  // the resolved path must still be a descendant of the canonicalised root.
+  // Files are opened with O_NOFOLLOW (where supported) to mitigate
+  // TOCTOU symlink swaps between path check and open.
+  string relative_path = 2;
+
+  // Expected file size in bytes. Must match on-disk size exactly.
+  // Subject to --attachment-max-file-bytes per-file cap.
+  uint64 size_bytes = 3;
+
+  // Expected sha256 of file contents — exactly 32 raw bytes (NOT hex-encoded).
+  // A bytes field of any other length is rejected INVALID_ARGUMENT with
+  // `files[i].sha256` field path in the error detail before the file is
+  // opened. Hex callers must decode to raw bytes themselves.
+  bytes sha256 = 4;
+
+  // Optional MIME type, forwarded to receivers in the distribution doc.
+  // Not part of the bundle-id idempotency identity check.
+  optional string content_type = 5;
+
+  // Optional display name presented to receivers; defaults to relative_path's
+  // basename. Not part of the bundle-id idempotency identity check.
+  optional string display_name = 6;
+}
+
+// DistributionScopeSpec targets a SendAttachments bundle. An unset oneof
+// (including a SendAttachmentsRequest that omits `scope` entirely) is
+// rejected INVALID_ARGUMENT — there is no silent fallback to AllNodes.
+message DistributionScopeSpec {
+  oneof scope {
+    AllNodesScope all_nodes = 1;
+    NodeListScope node_list = 2;
+    FormationScope formation = 3;
+    // Capable is a reserved-but-rejected variant in v1: an empty CapableScope
+    // marker. peat-node always rejects it with FAILED_PRECONDITION until the
+    // capability vocabulary is decided in a follow-on ADR. Senders MAY
+    // include it so the oneof can grow without renumbering when the ADR
+    // ships.
+    CapableScope capable = 4;
+  }
+}
+
+// AllNodesScope distributes to every reachable mesh peer. Always accepted.
+message AllNodesScope {}
+
+// NodeListScope distributes only to the listed node IDs. Unknown IDs are not
+// a request-time error — a node may not yet be known to this peat-node — but
+// they are recorded and surface in per-node status as FAILED after the
+// configurable peer-discovery grace period (--attachment-discovery-grace-secs).
+// Subject to --attachment-max-node-list-len cap.
+message NodeListScope {
+  repeated string node_ids = 1;
+}
+
+// FormationScope distributes to a named formation. v1: if formation_id is
+// not resolvable, fails FAILED_PRECONDITION (no async resolution).
+message FormationScope {
+  string formation_id = 1;
+}
+
+// CapableScope is an intentionally-empty reserved variant in v1. The
+// capability vocabulary (device-runtime vs. model-capability axes, and the
+// exact predicate fields) is deferred to a follow-on ADR — pinning fields
+// into the wire format before that decision would force either a breaking
+// migration or a parallel CapableV2Scope when the schema lands. v1 senders
+// MAY include CapableScope; peat-node always rejects it FAILED_PRECONDITION.
+message CapableScope {}
+
+// AttachmentPriority records the QoS classification of an attachment bundle.
+// Each value maps 1:1 onto `peat_protocol::qos::QoSClass`:
+//   BULK     → QoSClass::Bulk     (P5) — opportunistic; aging-eligible source
+//   LOW      → QoSClass::Low      (P4) — intermediate aging tier
+//   ROUTINE  → QoSClass::Normal   (P3) — default
+//   PRIORITY → QoSClass::High     (P2) — preempts BULK/LOW once PRD-004 lands
+//   CRITICAL → QoSClass::Critical (P1) — preempts everything once PRD-004 lands
+//
+// All five tiers (including LOW/P4) are exposed because peat-protocol's
+// aging-promotion path is `Bulk → Low → Normal` (sync_queue.rs:118-119);
+// collapsing P4 out of the wire surface would skip the intermediate aging
+// tier or silently drop the aging promotion.
+//
+// v1-honesty: peat-node records the classification on the distribution
+// document and uses it for ordering within its own queues, but does NOT
+// enforce wire-level preemption between classes — a CRITICAL bundle will
+// not actually pause an in-flight BULK transfer in v1. Cross-class
+// preemption requires PRD-004 (Bandwidth Allocation to Sync Transport).
+// Parallels the v1-honesty pattern on DistributionStatus.PARTIAL and
+// NodeTransferState.
+enum AttachmentPriority {
+  ATTACHMENT_PRIORITY_UNSPECIFIED = 0;
+  ATTACHMENT_PRIORITY_BULK = 1;
+  ATTACHMENT_PRIORITY_LOW = 2;
+  ATTACHMENT_PRIORITY_ROUTINE = 3;
+  ATTACHMENT_PRIORITY_PRIORITY = 4;
+  ATTACHMENT_PRIORITY_CRITICAL = 5;
+}
+
+message SendAttachmentsRequest {
+  // 1..=--attachment-max-files-per-bundle entries. Empty or over-cap →
+  // INVALID_ARGUMENT (empty) or RESOURCE_EXHAUSTED (over-cap).
+  repeated FileSpec files = 1;
+
+  // Required. An unset oneof (or an omitted `scope` field, which decodes to
+  // a default-constructed DistributionScopeSpec with no variant set) is
+  // rejected INVALID_ARGUMENT with `scope` in the field path — no silent
+  // fallback to AllNodes.
+  DistributionScopeSpec scope = 2;
+
+  // Defaults to ROUTINE when ATTACHMENT_PRIORITY_UNSPECIFIED.
+  AttachmentPriority priority = 3;
+
+  // Optional client-supplied bundle ID for idempotency. If omitted, peat-node
+  // assigns a UUIDv4. Re-submitting the same bundle_id with an identical
+  // FileSpec identity set (root_name, relative_path, size_bytes, sha256, in
+  // order — content_type and display_name are NOT part of the identity
+  // check) is a no-op that returns the existing handles; re-submitting with
+  // any identity-set deviation is rejected ALREADY_EXISTS. Resubmission
+  // against a FAILED or CANCELLED bundle is accepted as a fresh ingest.
+  optional string bundle_id = 4;
+}
+
+message SendAttachmentsResponse {
+  string bundle_id = 1;
+  // One handle per FileSpec, in the request's `files` order.
+  repeated AttachmentHandle handles = 2;
+}
+
+message AttachmentHandle {
+  // Index into the request's `files` list — matches caller's submission order.
+  uint32 file_index = 1;
+  // Iroh blob token (BLAKE3-based content address). Stable across retries.
+  string blob_token = 2;
+  // Distribution-doc ID for status lookup / subscription.
+  string distribution_id = 3;
+}
+
+message GetAttachmentDistributionRequest {
+  string distribution_id = 1;
+}
+
+message GetAttachmentDistributionResponse {
+  DistributionStatus status = 1;
+  uint64 bytes_transferred = 2;
+  uint64 bytes_total = 3;
+  repeated NodeTransferState per_node = 4;
+  optional string error = 5;
+}
+
+// NodeTransferState reflects the sender's outbound view of a transfer in v1.
+// Because iroh-blobs is pull-based, `status` records whether the targeted
+// peer connected to fetch the blob and how many bytes the sender served —
+// not whether the receiver's local write succeeded. Receive-side completion
+// reporting requires the observer hooks deferred to v2.
+message NodeTransferState {
+  string node_id = 1;
+  DistributionStatus status = 2;
+  uint64 bytes_transferred = 3;
+}
+
+// DistributionStatus is the sender-side view of a distribution in v1.
+// COMPLETED means every targeted peer connected and pulled all bytes from
+// this sender. PARTIAL is RESERVED for v2 — until receive-side observer
+// hooks land it cannot fire reliably from sender-side state alone, so v1
+// implementations emit COMPLETED on full sender-side success and FAILED on
+// explicit transfer failure, leaving PARTIAL for the v2 contract.
+enum DistributionStatus {
+  DISTRIBUTION_STATUS_UNSPECIFIED = 0;
+  DISTRIBUTION_STATUS_PENDING = 1;
+  DISTRIBUTION_STATUS_IN_PROGRESS = 2;
+  DISTRIBUTION_STATUS_COMPLETED = 3;
+  DISTRIBUTION_STATUS_PARTIAL = 4;
+  DISTRIBUTION_STATUS_FAILED = 5;
+  DISTRIBUTION_STATUS_CANCELLED = 6;
+}
+
+message SubscribeAttachmentBundleRequest {
+  string bundle_id = 1;
+}
+
+message AttachmentProgress {
+  string distribution_id = 1;
+  string blob_token = 2;
+  DistributionStatus status = 3;
+  uint64 bytes_transferred = 4;
+  uint64 bytes_total = 5;
+  // Set when this update was triggered by a single-peer state change.
+  optional NodeTransferState changed_node = 6;
+  optional string error = 7;
+}
+
+message CancelAttachmentDistributionRequest {
+  string distribution_id = 1;
+}
+
+message CancelAttachmentDistributionResponse {
+  // True iff cancellation was applied; false if the distribution was already
+  // in a terminal state (COMPLETED / FAILED / CANCELLED) when the request
+  // arrived.
+  bool was_cancelled = 1;
 }

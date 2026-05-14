@@ -15,6 +15,7 @@ use clap::Parser;
 use connectrpc::Router;
 use tracing::{error, info};
 
+use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -93,6 +94,116 @@ struct Args {
     /// Path to PEM-encoded CA certificate for verifying the agent's server certificate.
     #[arg(long, env = "PEAT_NODE_AGENT_TLS_CA")]
     agent_tls_ca: Option<PathBuf>,
+
+    // --- Attachment Distribution (PRD-006) ---
+    //
+    // Safety default: with no `--attachment-root` entries, the four
+    // attachment RPCs return `Unimplemented`. Operators must consciously opt
+    // in by naming the roots that may be read.
+    /// Allowlisted attachment root, in `name=path` form. Repeatable; comma-
+    /// separated in `PEAT_NODE_ATTACHMENT_ROOT`. Each `path` must exist and
+    /// be a directory at startup; it is canonicalised once and stored as the
+    /// canonical form. Example: `outbox=/var/lib/peat/outbox,media=/var/lib/peat/media`.
+    #[arg(
+        long = "attachment-root",
+        env = "PEAT_NODE_ATTACHMENT_ROOT",
+        value_delimiter = ','
+    )]
+    attachment_root: Vec<String>,
+
+    /// Per-file size cap (bytes). Files larger than this are rejected
+    /// `ResourceExhausted` at validation.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_FILE_BYTES",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_FILE_BYTES
+    )]
+    attachment_max_file_bytes: u64,
+
+    /// Per-request total-bytes cap. Bundles whose `Σ size_bytes` exceeds
+    /// this are rejected `ResourceExhausted`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_BUNDLE_BYTES",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_BUNDLE_BYTES
+    )]
+    attachment_max_bundle_bytes: u64,
+
+    /// Per-request file-count cap. Bundles with more files than this are
+    /// rejected `ResourceExhausted`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_FILES_PER_BUNDLE",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_FILES_PER_BUNDLE
+    )]
+    attachment_max_files_per_bundle: u32,
+
+    /// Cap on `NodeListScope.node_ids.len()`. Over-cap requests rejected
+    /// `ResourceExhausted`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_NODE_LIST_LEN",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_NODE_LIST_LEN
+    )]
+    attachment_max_node_list_len: u32,
+
+    /// In-flight distribution cap. Requests beyond this are rejected
+    /// `ResourceExhausted` unless `--attachment-queue-when-full` is set.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_CONCURRENT_DISTRIBUTIONS",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_CONCURRENT_DISTRIBUTIONS
+    )]
+    attachment_max_concurrent_distributions: u32,
+
+    /// If true, accept and queue requests beyond the in-flight cap; else
+    /// reject `ResourceExhausted`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_QUEUE_WHEN_FULL",
+        default_value_t = peat_node::attachments::config::DEFAULT_QUEUE_WHEN_FULL
+    )]
+    attachment_queue_when_full: bool,
+
+    /// Default `AttachmentPriority` when caller leaves it `UNSPECIFIED`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_DEFAULT_PRIORITY",
+        value_enum,
+        default_value_t = AttachmentPriorityCli::Routine
+    )]
+    attachment_default_priority: AttachmentPriorityCli,
+
+    /// Grace window (seconds) for unknown node IDs in `NodeListScope` before
+    /// they are marked `FAILED` in per-node status. A node may not yet be
+    /// known to this peat-node at request time.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_DISCOVERY_GRACE_SECS",
+        default_value_t = peat_node::attachments::config::DEFAULT_DISCOVERY_GRACE_SECS
+    )]
+    attachment_discovery_grace_secs: u32,
+
+    /// How long terminal bundles' handle tables are retained for `bundle_id`
+    /// lookups, `SubscribeAttachmentBundle` late-attach, and `AlreadyExists`
+    /// enforcement. `0` disables retention entirely (no idempotency, no
+    /// late-subscribe — discouraged).
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS",
+        default_value_t = peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS
+    )]
+    attachment_handle_retention_secs: u32,
+
+    /// Hard cap on handle-table size. LRU eviction kicks in before the
+    /// retention window expires when exceeded. Bounds memory growth on
+    /// long-running edge nodes.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_MAX_KNOWN_BUNDLES",
+        default_value_t = peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES
+    )]
+    attachment_max_known_bundles: u32,
 }
 
 #[tokio::main]
@@ -119,6 +230,36 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
 
+    // Build the attachment configuration. Canonicalises every --attachment-root
+    // and fails fast on bad inputs (missing dir, duplicate name, malformed name).
+    let attachment_config = AttachmentConfig::from_raw(
+        &args.attachment_root,
+        args.attachment_max_file_bytes,
+        args.attachment_max_bundle_bytes,
+        args.attachment_max_files_per_bundle,
+        args.attachment_max_node_list_len,
+        args.attachment_max_concurrent_distributions,
+        args.attachment_queue_when_full,
+        args.attachment_default_priority,
+        args.attachment_discovery_grace_secs,
+        args.attachment_handle_retention_secs,
+        args.attachment_max_known_bundles,
+    )?;
+    if attachment_config.has_roots() {
+        let names: Vec<&str> = attachment_config.roots.keys().map(String::as_str).collect();
+        info!(
+            roots = ?names,
+            max_file_bytes = attachment_config.max_file_bytes,
+            max_bundle_bytes = attachment_config.max_bundle_bytes,
+            max_files_per_bundle = attachment_config.max_files_per_bundle,
+            max_concurrent = attachment_config.max_concurrent_distributions,
+            default_priority = attachment_config.default_priority.as_str(),
+            "attachment distribution enabled"
+        );
+    } else {
+        info!("attachment distribution disabled — no --attachment-root configured");
+    }
+
     // Bootstrap the mesh node
     let config = SidecarConfig {
         node_id: node_id.clone(),
@@ -128,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
+        attachment_config,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
