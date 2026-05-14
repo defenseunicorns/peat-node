@@ -1,8 +1,17 @@
 # Attachment distribution quickstart (PRD-006)
 
-Single-node `peat-node` with the attachment surface enabled. Sends a
-local file through `SendAttachments`, then verifies the distribution
-with `GetAttachmentDistribution`.
+Two compose files live here:
+
+- **`docker-compose.yml`** — single node. Demonstrates sender-side
+  ingest + status lookup. `DISTRIBUTION_STATUS_COMPLETED` here is the
+  vacuous-zero-peer case (no targets, no real transfer).
+- **`docker-compose.two-node.yml`** — A and B peered together.
+  Demonstrates **actual file delivery**: files sent from A appear on
+  B's filesystem inbox. This is the flow operators care about.
+
+The single-node setup below is the per-size benchmark for sender-side
+ingest. **For the real delivery demo, jump to "Two-node delivery"
+below.**
 
 > **Builds from source by default.** The attachment RPCs ship with the
 > release that lands #56; the published `ghcr.io/defenseunicorns/peat-node:v0.1.1`
@@ -72,12 +81,37 @@ roots.
   `PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS` if you want to see the
   bundle age out before `docker compose down -v`.
 
-## Multi-peer
+## Two-node delivery
 
-Receiving peers can't auto-pull blobs in v1 — the receive-side observer
-hooks in `peat-protocol` are a v2 follow-up. The substrate works
-(`NetworkedIrohBlobStore::fetch_blob` resolves across connected peers),
-but the trigger that would call it on receivers from a synced
-distribution document is deferred. See
-[`../../tests/attachments_deferred_test.rs`](../../../tests/attachments_deferred_test.rs)
-for the test inventory tracking that gap.
+Real cross-peer file delivery (PRD-006 v1.1, post the inbox-watcher
+landing).
+
+```bash
+docker compose -f docker-compose.two-node.yml up -d --build
+./peer.sh                                  # bidirectional ConnectPeer
+ENDPOINT=http://127.0.0.1:50061 OUTBOX_DIR=outbox-a ./send.sh
+ls inbox-b/                                # files appear here per distribution_id
+docker compose -f docker-compose.two-node.yml down -v
+```
+
+What the two-node setup wires:
+
+- `peat-node-a` (`127.0.0.1:50061`) — sender. `./outbox-a` bind-mounted
+  read-only at `/var/lib/peat/outbox`. `--attachment-root outbox=...`
+  set; no inbox.
+- `peat-node-b` (`127.0.0.1:50062`) — receiver. `./inbox-b`
+  bind-mounted read-write at `/var/lib/peat/inbox`. `--attachment-inbox`
+  set; the receive-side watcher polls the synced `file_distributions`
+  collection every 1s and fetches anything targeting B's iroh endpoint.
+
+`peer.sh` issues `ConnectPeer` in both directions, which is required
+for `AllNodes`-scoped distributions: A's `resolve_targets` builds
+`target_nodes` from `A.blob_store.known_peers()`, which is populated
+only by `ConnectPeer` *into* A. Without A → B as well, A's
+distribution doc carries an empty `target_nodes` and B correctly
+concludes "not for me."
+
+When `send.sh` is pointed at A, B's inbox accumulates
+`inbox-b/{distribution_id}/{filename}` for each successful delivery.
+Apps watching the inbox can correlate a `distribution_id` back to the
+sender via `GetAttachmentDistribution`.

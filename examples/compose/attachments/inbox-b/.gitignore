@@ -1,0 +1,5 @@
+# Received files land here at {distribution_id}/{filename}. Ignore the
+# contents but check this .gitignore in so the directory itself is
+# tracked — the two-node compose's bind mount expects it to exist.
+*
+!.gitignore

@@ -1,0 +1,74 @@
+# Two-node attachment-delivery quickstart (PRD-006 v1.1).
+#
+# This is the compose that actually demonstrates files arriving on a
+# remote peer. The single-node `docker-compose.yml` next to this file
+# only exercises sender-side ingest — useful for the per-size benchmark
+# but doesn't prove cross-peer delivery.
+#
+# Quickstart:
+#   docker compose -f docker-compose.two-node.yml up -d --build
+#   ./peer.sh         # peer the two nodes (B → A and A → B)
+#   ./send.sh         # send hello.txt + the 1/10/100 MiB suite from A
+#   ls ./inbox-b/     # watch files appear on B's filesystem
+#   docker compose -f docker-compose.two-node.yml down -v
+#
+# Layout:
+#
+#   ./outbox-a/  → A's --attachment-root "outbox" (read-only into A)
+#   ./inbox-b/   → B's --attachment-inbox          (read-write into B)
+#
+# B writes received files at:
+#   ./inbox-b/{distribution_id}/{filename}
+#
+# A has no inbox configured (it's the sender). B has no outbox
+# configured (it's the receiver). For a real bidirectional setup
+# operators would mount both on both nodes.
+
+services:
+  peat-node-a:
+    build:
+      context: ../../..
+    container_name: peat-node-attachments-a
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_NODE_ID: attach-a
+      PEAT_NODE_APP_ID: attach-demo
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_AUTO_SYNC: "true"
+      # Pin iroh UDP port so peer-b can reach a stable address. The
+      # outbound peer URL in peer.sh hardcodes :51071.
+      PEAT_NODE_IROH_UDP_PORT: "51071"
+      PEAT_NODE_ATTACHMENT_ROOT: outbox=/var/lib/peat/outbox
+      RUST_LOG: peat_node=info,peat_node::attachments::inbox=warn
+    ports:
+      - "50061:50051"
+    volumes:
+      - peat-node-a-data:/data/peat-node
+      - ./outbox-a:/var/lib/peat/outbox:ro
+
+  peat-node-b:
+    build:
+      context: ../../..
+    container_name: peat-node-attachments-b
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_NODE_ID: attach-b
+      PEAT_NODE_APP_ID: attach-demo
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_AUTO_SYNC: "true"
+      PEAT_NODE_IROH_UDP_PORT: "51072"
+      # B has no outbox (it's the receiver). Inbox enables the receive-
+      # side watcher.
+      PEAT_NODE_ATTACHMENT_INBOX: /var/lib/peat/inbox
+      RUST_LOG: peat_node=info,peat_node::attachments::inbox=info
+    ports:
+      - "50062:50051"
+    volumes:
+      - peat-node-b-data:/data/peat-node
+      - ./inbox-b:/var/lib/peat/inbox
+
+volumes:
+  peat-node-a-data: {}
+  peat-node-b-data: {}
