@@ -41,7 +41,10 @@ set -euo pipefail
 
 ENDPOINT="${ENDPOINT:-http://127.0.0.1:50051}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUTBOX="${SCRIPT_DIR}/outbox"
+# OUTBOX_DIR defaults to ./outbox for the single-node compose. The
+# two-node demo (docker-compose.two-node.yml) uses ./outbox-a; export
+# OUTBOX_DIR=outbox-a (or set explicitly) before running.
+OUTBOX="${SCRIPT_DIR}/${OUTBOX_DIR:-outbox}"
 POLL_INTERVAL_SECS="${POLL_INTERVAL_SECS:-0.05}"
 # Cap so a stuck distribution doesn't hang the benchmark forever.
 POLL_TIMEOUT_SECS="${POLL_TIMEOUT_SECS:-120}"

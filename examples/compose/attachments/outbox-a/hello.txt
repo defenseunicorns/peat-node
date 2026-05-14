@@ -1,0 +1,3 @@
+Hello from the peat-node attachment quickstart. Drop this file into
+SendAttachments and it'll be content-addressed, hashed, and queued for
+distribution across the mesh.

@@ -74,6 +74,16 @@ pub enum ConfigError {
 
     #[error("--attachment-root `{name}` resolved to `{path}` which is not a directory")]
     RootNotDirectory { name: String, path: PathBuf },
+
+    #[error("--attachment-inbox `{path}`: {source}")]
+    InboxBadPath {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("--attachment-inbox `{path}` resolved to `{resolved}` which is not a directory")]
+    InboxNotDirectory { path: PathBuf, resolved: PathBuf },
 }
 
 /// Parsed, canonicalised attachment configuration.
@@ -88,6 +98,11 @@ pub enum ConfigError {
 pub struct AttachmentConfig {
     /// `name → canonicalised absolute root path`. Empty map → RPC disabled.
     pub roots: HashMap<String, PathBuf>,
+    /// Where to drop incoming attachments fetched by the receive-side
+    /// watcher. `None` disables the watcher; attachments synced from
+    /// other peers' distributions are observable only via the
+    /// `file_distributions` Automerge collection.
+    pub inbox_path: Option<PathBuf>,
     pub max_file_bytes: u64,
     pub max_bundle_bytes: u64,
     pub max_files_per_bundle: u32,
@@ -98,6 +113,9 @@ pub struct AttachmentConfig {
     pub discovery_grace_secs: u32,
     pub handle_retention_secs: u32,
     pub max_known_bundles: u32,
+    /// Inbox watcher poll interval (seconds). Smaller = faster delivery
+    /// but more `file_distributions` scans. Default 1s.
+    pub inbox_poll_secs: u32,
 }
 
 impl Default for AttachmentConfig {
@@ -105,6 +123,7 @@ impl Default for AttachmentConfig {
     fn default() -> Self {
         Self {
             roots: HashMap::new(),
+            inbox_path: None,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_bundle_bytes: DEFAULT_MAX_BUNDLE_BYTES,
             max_files_per_bundle: DEFAULT_MAX_FILES_PER_BUNDLE,
@@ -115,9 +134,13 @@ impl Default for AttachmentConfig {
             discovery_grace_secs: DEFAULT_DISCOVERY_GRACE_SECS,
             handle_retention_secs: DEFAULT_HANDLE_RETENTION_SECS,
             max_known_bundles: DEFAULT_MAX_KNOWN_BUNDLES,
+            inbox_poll_secs: DEFAULT_INBOX_POLL_SECS,
         }
     }
 }
+
+/// Default inbox watcher poll interval (seconds).
+pub const DEFAULT_INBOX_POLL_SECS: u32 = 1;
 
 #[allow(clippy::too_many_arguments)]
 impl AttachmentConfig {
@@ -125,6 +148,7 @@ impl AttachmentConfig {
     /// fails fast on bad inputs (missing dir, duplicate name, bad name format).
     pub fn from_raw(
         raw_roots: &[String],
+        inbox_path: Option<PathBuf>,
         max_file_bytes: u64,
         max_bundle_bytes: u64,
         max_files_per_bundle: u32,
@@ -135,6 +159,7 @@ impl AttachmentConfig {
         discovery_grace_secs: u32,
         handle_retention_secs: u32,
         max_known_bundles: u32,
+        inbox_poll_secs: u32,
     ) -> Result<Self, ConfigError> {
         let mut roots = HashMap::new();
         for spec in raw_roots {
@@ -151,8 +176,17 @@ impl AttachmentConfig {
             roots.insert(name, path);
         }
 
+        // Canonicalise the inbox path if set; create the directory if
+        // missing so operators don't have to remember a separate
+        // `mkdir -p` step.
+        let inbox_path = match inbox_path {
+            Some(p) => Some(canonicalise_or_create_inbox(&p)?),
+            None => None,
+        };
+
         Ok(Self {
             roots,
+            inbox_path,
             max_file_bytes,
             max_bundle_bytes,
             max_files_per_bundle,
@@ -163,6 +197,7 @@ impl AttachmentConfig {
             discovery_grace_secs,
             handle_retention_secs,
             max_known_bundles,
+            inbox_poll_secs,
         })
     }
 
@@ -209,6 +244,32 @@ fn parse_root_spec(spec: &str) -> Result<(String, PathBuf), ConfigError> {
     Ok((name.to_string(), canonical))
 }
 
+/// Canonicalise the inbox path, creating the directory if missing. The
+/// inbox is operator-supplied state, not validated against an allowlist
+/// (unlike `--attachment-root`), so `mkdir -p` semantics keep the
+/// `docker compose up` flow ergonomic — a fresh container with a
+/// bind-mounted empty inbox directory just works.
+fn canonicalise_or_create_inbox(raw_path: &Path) -> Result<PathBuf, ConfigError> {
+    if !raw_path.exists() {
+        std::fs::create_dir_all(raw_path).map_err(|source| ConfigError::InboxBadPath {
+            path: raw_path.to_path_buf(),
+            source,
+        })?;
+    }
+    let canonical =
+        std::fs::canonicalize(raw_path).map_err(|source| ConfigError::InboxBadPath {
+            path: raw_path.to_path_buf(),
+            source,
+        })?;
+    if !canonical.is_dir() {
+        return Err(ConfigError::InboxNotDirectory {
+            path: raw_path.to_path_buf(),
+            resolved: canonical,
+        });
+    }
+    Ok(canonical)
+}
+
 fn is_valid_root_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -225,6 +286,7 @@ mod tests {
         let raw: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
         AttachmentConfig::from_raw(
             &raw,
+            None, // inbox_path
             DEFAULT_MAX_FILE_BYTES,
             DEFAULT_MAX_BUNDLE_BYTES,
             DEFAULT_MAX_FILES_PER_BUNDLE,
@@ -235,6 +297,7 @@ mod tests {
             DEFAULT_DISCOVERY_GRACE_SECS,
             DEFAULT_HANDLE_RETENTION_SECS,
             DEFAULT_MAX_KNOWN_BUNDLES,
+            DEFAULT_INBOX_POLL_SECS,
         )
     }
 

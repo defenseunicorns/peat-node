@@ -31,6 +31,7 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
 
     let attachment_config = AttachmentConfig::from_raw(
         &[format!("outbox={}", root_path.display())],
+        None, // inbox_path
         peat_node::attachments::config::DEFAULT_MAX_FILE_BYTES,
         peat_node::attachments::config::DEFAULT_MAX_BUNDLE_BYTES,
         peat_node::attachments::config::DEFAULT_MAX_FILES_PER_BUNDLE,
@@ -41,6 +42,7 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
         peat_node::attachments::config::DEFAULT_DISCOVERY_GRACE_SECS,
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
+        peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
     )
     .unwrap();
 
