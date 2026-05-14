@@ -418,7 +418,9 @@ mod tests {
         let dir = tmp.path().join("dist-X");
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let payload = vec![0u8; 1024];
-        tokio::fs::write(dir.join("got.bin"), &payload).await.unwrap();
+        tokio::fs::write(dir.join("got.bin"), &payload)
+            .await
+            .unwrap();
         assert!(already_delivered(tmp.path(), "dist-X", 1024).await);
     }
 
@@ -432,7 +434,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dist-X");
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("got.bin"), b"shorter").await.unwrap();
+        tokio::fs::write(dir.join("got.bin"), b"shorter")
+            .await
+            .unwrap();
         assert!(!already_delivered(tmp.path(), "dist-X", 1024).await);
     }
 
@@ -444,7 +448,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("dist-X");
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join(".got.bin.partial"), vec![0u8; 1024]).await.unwrap();
+        tokio::fs::write(dir.join(".got.bin.partial"), vec![0u8; 1024])
+            .await
+            .unwrap();
         assert!(!already_delivered(tmp.path(), "dist-X", 1024).await);
     }
 }
