@@ -185,6 +185,24 @@ impl SidecarNode {
             });
         }
 
+        // PRD-006 v1.1 receive-side watcher. Spawned only when
+        // --attachment-inbox is configured. Pulls blobs from
+        // distribution documents targeting this node's iroh endpoint
+        // and writes them to the inbox.
+        if let Some(ref inbox_path) = config.attachment_config.inbox_path {
+            let endpoint_short = backend.blob_store().endpoint_id().fmt_short().to_string();
+            crate::attachments::inbox::spawn_inbox_watcher(
+                Arc::clone(backend.store()),
+                Arc::clone(backend.blob_store()),
+                Arc::clone(&bundle_registry),
+                inbox_path.clone(),
+                endpoint_short,
+                std::time::Duration::from_secs(
+                    config.attachment_config.inbox_poll_secs.max(1) as u64
+                ),
+            );
+        }
+
         Ok(Self {
             node_id: config.node_id,
             backend,
@@ -460,6 +478,19 @@ impl SidecarNode {
         self.backend
             .transport()
             .start_sync_connection(connection, Arc::clone(self.backend.coordinator()));
+
+        // PRD-006: register the peer with the blob store so it shows up
+        // in `known_peers()`. `IrohFileDistribution::resolve_targets`
+        // reads from this list for `AllNodes` scope, and the receive-
+        // side fetch path in `NetworkedIrohBlobStore::fetch_blob`
+        // iterates it when the BlobPeerIndex doesn't yet know which
+        // peer holds a given blob. The two lists (iroh connection /
+        // blob-store peer index) are tracked separately upstream —
+        // before this commit `connect_peer` only populated the former,
+        // which silently broke the attachment-delivery end-to-end path
+        // (target_nodes resolved to `[]` for AllNodes distributions
+        // unless the operator called add_peer through a private API).
+        self.backend.blob_store().add_peer(peer_id).await;
 
         info!(peer = endpoint_id_str, "connected to peer");
         Ok(())

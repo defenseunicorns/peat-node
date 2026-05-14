@@ -332,6 +332,7 @@ mod tests {
     fn cfg_with(roots: HashMap<String, PathBuf>) -> AttachmentConfig {
         AttachmentConfig {
             roots,
+            inbox_path: None,
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             max_bundle_bytes: DEFAULT_MAX_BUNDLE_BYTES,
             max_files_per_bundle: DEFAULT_MAX_FILES_PER_BUNDLE,
@@ -342,6 +343,7 @@ mod tests {
             discovery_grace_secs: 0,
             handle_retention_secs: DEFAULT_HANDLE_RETENTION_SECS,
             max_known_bundles: DEFAULT_MAX_KNOWN_BUNDLES,
+            inbox_poll_secs: crate::attachments::config::DEFAULT_INBOX_POLL_SECS,
         }
     }
 

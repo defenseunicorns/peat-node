@@ -204,6 +204,26 @@ struct Args {
         default_value_t = peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES
     )]
     attachment_max_known_bundles: u32,
+
+    /// Receive-side attachment inbox (PRD-006 v1.1). When set, peat-node
+    /// spawns a background watcher that polls the synced
+    /// `file_distributions` collection, fetches any blob whose
+    /// distribution doc targets this node's iroh endpoint, and writes
+    /// the bytes to `{inbox}/{distribution_id}/{filename}`. Unset
+    /// (default) disables receive-side delivery — peers still see the
+    /// sender's distribution doc via Automerge sync but no auto-pull
+    /// happens. Created if missing.
+    #[arg(long, env = "PEAT_NODE_ATTACHMENT_INBOX")]
+    attachment_inbox: Option<PathBuf>,
+
+    /// Inbox watcher poll interval in seconds. Smaller = faster
+    /// delivery, more `file_distributions` scans. Default 1s.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS",
+        default_value_t = peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS
+    )]
+    attachment_inbox_poll_secs: u32,
 }
 
 #[tokio::main]
@@ -234,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
     // and fails fast on bad inputs (missing dir, duplicate name, malformed name).
     let attachment_config = AttachmentConfig::from_raw(
         &args.attachment_root,
+        args.attachment_inbox.clone(),
         args.attachment_max_file_bytes,
         args.attachment_max_bundle_bytes,
         args.attachment_max_files_per_bundle,
@@ -244,6 +265,7 @@ async fn main() -> anyhow::Result<()> {
         args.attachment_discovery_grace_secs,
         args.attachment_handle_retention_secs,
         args.attachment_max_known_bundles,
+        args.attachment_inbox_poll_secs,
     )?;
     if attachment_config.has_roots() {
         let names: Vec<&str> = attachment_config.roots.keys().map(String::as_str).collect();

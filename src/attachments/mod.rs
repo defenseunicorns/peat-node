@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod handlers;
+pub mod inbox;
 pub mod ingest;
 pub mod registry;
 pub mod runtime;
