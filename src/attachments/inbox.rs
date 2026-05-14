@@ -39,12 +39,28 @@
 //!
 //! # Idempotency + retry
 //!
-//! Successfully-handled distribution IDs go into an in-memory
-//! `HashSet<String>`. A fetch failure (peer not yet reachable, blob not
-//! yet replicated to a connected peer) is *not* recorded — the watcher
-//! retries on the next tick. Bytes-on-disk write failures behave the
-//! same (retry). Malformed JSON or non-targeting docs are recorded as
-//! handled so the watcher doesn't reparse them every tick.
+//! Two layers of "already handled" tracking:
+//!
+//! 1. An in-memory `HashSet<String>` per process scoped to one watcher
+//!    instance. Records distribution_ids that succeeded, were malformed,
+//!    or didn't target this node, so subsequent sweeps don't re-parse
+//!    them. Fetch / write failures are NOT recorded — they retry on the
+//!    next tick.
+//! 2. A filesystem check before every fetch: if
+//!    `{inbox}/{distribution_id}/` already contains a file matching the
+//!    declared blob_size, treat the distribution as already-delivered
+//!    and short-circuit. This is the durable source of truth — the
+//!    in-memory set gets cleared on restart, the filesystem doesn't.
+//!    Without this, a peat-node restart would re-fetch and re-write
+//!    every historical delivery (idempotent under atomic rename, but
+//!    wasteful disk I/O linear in lifetime delivery count).
+//!
+//! The in-memory set grows with the number of unique distribution_ids
+//! observed in `file_distributions` over a single process's lifetime
+//! — bounded practically by the formation's distribution count. For
+//! very long-running sidecars on busy formations a future commit may
+//! add explicit LRU bounding; today the per-entry cost (one
+//! `String`) keeps the memory footprint negligible.
 //!
 //! # Inbox layout
 //!
@@ -188,6 +204,20 @@ async fn scan_once(
             continue;
         }
 
+        // Filesystem-based "already delivered" gate. Distinct from the
+        // in-memory `handled` set: this survives process restart, so
+        // a long-running receiver that restarts doesn't re-fetch and
+        // re-write every historical delivery (caught by the PRD-006
+        // v1.1 QA review on PR #65).
+        if already_delivered(inbox_root, &doc.distribution_id, doc.blob_size).await {
+            debug!(
+                distribution_id = %doc.distribution_id,
+                "inbox: filesystem already has the delivered file, skipping fetch"
+            );
+            handled.insert(doc_id);
+            continue;
+        }
+
         // Fetch the blob. `NetworkedIrohBlobStore::fetch_blob` iterates
         // known iroh peers internally and tries each via the
         // iroh-blobs downloader. If the sender isn't yet reachable
@@ -233,6 +263,45 @@ async fn scan_once(
         }
     }
     Ok(())
+}
+
+/// Check whether the inbox already contains a delivered file for this
+/// distribution. The "matching-size + non-hidden" rule treats the
+/// existence of any regular file with the declared blob_size in
+/// `{inbox}/{distribution_id}/` as proof of prior delivery — the
+/// filesystem layout's distribution-id-namespaced directory is the
+/// durable source of truth, while the in-memory `handled` set is just
+/// a per-process parse-cost optimisation.
+///
+/// Returns false on any I/O error so the caller falls through to the
+/// fetch path and retries — better to re-deliver than to silently
+/// skip a file that ought to land.
+async fn already_delivered(inbox_root: &Path, distribution_id: &str, expected_size: u64) -> bool {
+    let dir = inbox_root.join(distribution_id);
+    if !dir.is_dir() {
+        return false;
+    }
+    let mut iter = match tokio::fs::read_dir(&dir).await {
+        Ok(i) => i,
+        Err(_) => return false,
+    };
+    while let Ok(Some(entry)) = iter.next_entry().await {
+        let path = entry.path();
+        // Skip our own in-flight `.{name}.partial` markers.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|s| s.starts_with('.'))
+        {
+            continue;
+        }
+        if let Ok(md) = entry.metadata().await {
+            if md.is_file() && md.len() == expected_size {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Compute the final inbox path for a distribution and copy the blob
@@ -335,5 +404,47 @@ mod tests {
         // "..." has file_name "..." → strip leading dots → empty →
         // fallback to distribution_id-based name.
         assert_eq!(inbox_filename(&m, "dist-X"), "dist-X.bin");
+    }
+
+    #[tokio::test]
+    async fn already_delivered_false_when_dir_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!already_delivered(tmp.path(), "never-delivered", 100).await);
+    }
+
+    #[tokio::test]
+    async fn already_delivered_true_when_matching_size_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dist-X");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let payload = vec![0u8; 1024];
+        tokio::fs::write(dir.join("got.bin"), &payload).await.unwrap();
+        assert!(already_delivered(tmp.path(), "dist-X", 1024).await);
+    }
+
+    #[tokio::test]
+    async fn already_delivered_false_when_size_differs() {
+        // PRD §Validation Rule 9 guarantees content+size match before
+        // ingest; this is the conservative case where the previous
+        // delivery exists but was for a different blob (e.g.
+        // distribution_id collision across formations or a manual
+        // file drop). Re-fetching with the new size is the safe move.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dist-X");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("got.bin"), b"shorter").await.unwrap();
+        assert!(!already_delivered(tmp.path(), "dist-X", 1024).await);
+    }
+
+    #[tokio::test]
+    async fn already_delivered_ignores_partial_marker() {
+        // `.{filename}.partial` is the in-flight tmp file the watcher
+        // writes before atomic rename. If a crash leaves one behind
+        // it must NOT count as a successful delivery.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dist-X");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join(".got.bin.partial"), vec![0u8; 1024]).await.unwrap();
+        assert!(!already_delivered(tmp.path(), "dist-X", 1024).await);
     }
 }
