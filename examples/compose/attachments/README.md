@@ -13,15 +13,15 @@ The single-node setup below is the per-size benchmark for sender-side
 ingest. **For the real delivery demo, jump to "Two-node delivery"
 below.**
 
-> **Builds from source by default.** The attachment RPCs ship with the
-> release that lands #56; the published `ghcr.io/defenseunicorns/peat-node:v0.1.1`
-> image predates this surface and fails with `unimplemented: method not
-> found` against it. The compose file defaults to `build: context: ../../..`
-> so `docker compose up -d` from this directory produces a working
-> binary from the current checkout. After the post-#56 release is
-> tagged, flip the default by commenting out the `build:` block and
-> uncommenting the `image:` line in `docker-compose.yml` (the line
-> already carries the placeholder version tag to bump).
+> **Builds from source by default.** The PRD-006 attachment surface
+> first shipped in `v0.2.0` (the `v0.1.x` images predate it and fail
+> with `unimplemented: method not found`). The compose file defaults to
+> `build: context: ../../..` so `docker compose up -d` from this
+> directory works against the current checkout regardless of which
+> registry tag is available. For published-image use, comment out the
+> `build:` block and uncomment the
+> `image: ghcr.io/defenseunicorns/peat-node:v0.2.0` line in
+> `docker-compose.yml`.
 
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the
