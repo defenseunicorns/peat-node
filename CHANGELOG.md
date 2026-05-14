@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-14
+
+### Added
+
+- **PRD-006 path-based attachment distribution API (#64).** Four new
+  RPCs on `peat.sidecar.v1.PeatSidecar`: `SendAttachments`,
+  `GetAttachmentDistribution`, `SubscribeAttachmentBundle`
+  (server-streaming), `CancelAttachmentDistribution`. Disabled by
+  default — operators opt in by setting `--attachment-root name=path`
+  (one or more). With no root configured, all four RPCs return
+  `Unimplemented`. Full validation pipeline (PRD §Validation Rules
+  1-12 minus the rule-11 queue path and rule-25 discovery-grace
+  promoter, both deferred), atomic-on-failure ingest with
+  content-address-safe rollback, single-pass `O_NOFOLLOW` open +
+  tee-style sha256 hashing, bundle handle table with retention + LRU,
+  per-bundle progress fan-out, late-subscribe contract (snapshot
+  already-terminal + live for in-flight). See
+  [docs/CONFIGURATION.md#attachment-distribution-prd-006](docs/CONFIGURATION.md#attachment-distribution-prd-006).
+- **Receive-side attachment delivery (#65).** New
+  `--attachment-inbox <path>` config spawns a background watcher that
+  polls the synced `file_distributions` Automerge collection and
+  fetches blobs targeting this node into
+  `{inbox}/{distribution_id}/{filename}`. Closes the silent gap left
+  by #64 (sender-side ingest worked, but no automated path actually
+  delivered files to peers). The polling watcher in peat-node is a
+  documented stopgap — the long-term home is peat-protocol's
+  receive-side observer hooks (`file_distribution.rs:617-621` TODO).
+- 11 `--attachment-*` CLI flags / `PEAT_NODE_ATTACHMENT_*` env vars
+  surfaced through `chart/peat-node/values.yaml` (with
+  `extraVolumes` / `extraVolumeMounts` for operator-supplied volume
+  sources).
+- New `peat-protocol` direct dependency for `FileDistribution` /
+  `IrohFileDistribution` / `DistributionHandle` / `TransferPriority`.
+  `peat-mesh` does not re-export these. SKILL.md acknowledges the
+  two-dep arrangement as permitted.
+- Two-node compose quickstart at
+  `examples/compose/attachments/docker-compose.two-node.yml` +
+  `peer.sh` + per-size `send.sh` benchmark (1 / 10 / 100 MiB from
+  `/dev/urandom`). Demonstrates actual cross-peer file delivery
+  end-to-end.
+- `tests/attachments_e2e_test.rs` — boots two `SidecarNode`s, peers
+  them bidirectionally, sends from A, asserts byte-for-byte +
+  sha256-match arrival on B's filesystem inbox. Runs in default
+  `cargo test`; not `#[ignore]`'d. The acceptance gate that #64
+  should have shipped with.
+
+### Fixed
+
+- **`SidecarNode::connect_peer` now calls
+  `blob_store.add_peer(peer_id)`** after `start_sync_connection`. The
+  iroh transport's connection list and the blob store's peer index are
+  tracked separately upstream; before this fix the blob-store list
+  stayed empty, so `IrohFileDistribution::resolve_targets(AllNodesScope)`
+  always returned `target_nodes=[]`. Net: every multi-peer attachment
+  scenario silently failed, which is also why the original deferred
+  multi-peer test hit "no peers configured for remote fetch."
+- Retention-eviction background task now runs. The
+  `--attachment-handle-retention-secs` knob was operator-visible but
+  inert in 0.1.x — `evict_expired()` was unit-tested but nothing in the
+  running service called it. Terminal bundles lingered until LRU
+  pressure removed them.
+- `bytes_total` in `GetAttachmentDistributionResponse` falls back to
+  the bundle identity's `size_bytes` when no per-peer state has been
+  reported yet. Was returning the hex hash length (~64) for every
+  pre-fetch query.
+- `BundleRegistry::check_resubmit` uses two-phase locking — read lock
+  for absent / conflicting branches, write lock only for the mutating
+  branches (terminal-reuse drop, idempotent `last_touched_at` bump).
+  Matches the module's documented concurrency contract.
+- `handlers::in_flight_count` uses `BundleRegistry::non_terminal_count()`
+  instead of `len()`. Terminal bundles within the retention window no
+  longer count against `--attachment-max-concurrent-distributions`.
+- Receive-side watcher's `already_delivered()` filesystem check
+  short-circuits `fetch_blob` when `{inbox}/{distribution_id}/`
+  already contains a matching-size file. Restart cost is now ~zero
+  instead of re-fetching + re-writing every historical delivery.
+- `send.sh` quickstart driver uses `openssl dgst -sha256 -binary`
+  instead of `sha256sum | xxd`. xxd isn't installed by default on
+  minimal Linux images.
+- Compose quickstart at `examples/compose/attachments/docker-compose.yml`
+  defaults to `build:` from the repo root instead of pinning a
+  registry tag. The pre-0.2.0 image didn't have the attachment
+  surface and operators following the pinned tag hit
+  `unimplemented: method not found`.
+
+### Changed
+
+- `SidecarConfig` gained `attachment_config: AttachmentConfig`. Existing
+  callers should pass `AttachmentConfig::default()` when not using the
+  attachment surface (defaults are operator-safe — empty roots disable
+  the RPCs).
+- README API table: 21 → 25 RPCs with the new Attachments row.
+
+### Notes
+
+- **v1.1-honesty caveats** (intentional, documented in proto
+  doc-comments and `docs/CONFIGURATION.md`):
+  - `AttachmentPriority` is recorded on the distribution document but
+    v1 does NOT enforce wire-level preemption between priority classes
+    — that needs PRD-004 bandwidth allocation.
+  - `DISTRIBUTION_STATUS_PARTIAL` is reserved for v2 (needs receive-
+    side observer hooks); v1 senders emit `COMPLETED` on full
+    sender-side success and `FAILED` on explicit transfer failure.
+  - `DISTRIBUTION_STATUS_COMPLETED` reported by
+    `GetAttachmentDistribution` never advances naturally against a real
+    peer mesh — the sender's `is_complete()` check needs receiver-side
+    state propagation. Files DO arrive within ~1s of `SendAttachments`
+    returning; sender-side status just doesn't know.
+  - `FormationScope` rejects `FailedPrecondition` (no async formation
+    resolution in v1). `CapableScope` rejects `FailedPrecondition`
+    (capability vocabulary deferred to a follow-on ADR).
+  - The bundle handle table is in-memory only. A peat-node restart
+    drops every `bundle_id`; subscribers re-attaching to pre-restart
+    IDs receive `NotFound`. iroh content-addressed blobs and synced
+    distribution documents are unaffected.
+
 ## [0.1.1] - 2026-05-11
 
 ### Changed
