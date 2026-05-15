@@ -6,28 +6,14 @@
 //! Tests covered by other files:
 //!
 //! - 20 → `attachments_smoke_test::attachments_disabled_when_no_root`
-//! - 21 → `attachments_multi_peer_test` (also #[ignore]'d, different gap)
+//! - 21 → `attachments_multi_peer_test::receiver_can_fetch_blob_pushed_by_sender`
+//!   covers the substrate; `attachments_e2e_test::end_to_end_attachment_delivery_two_nodes`
+//!   covers the full sender→inbox path
+//! - 22 → `attachments_e2e_test::node_list_scope_only_delivers_to_listed_nodes`
 //! - 26, 27, 30 → `attachments_acceptance_test`
 //! - 28 → `attachments_subscribe_test`
 //!
-//! Tests deferred here: 22, 23, 24, 25, 29.
-
-/// PRD test 22 — `send_node_list_only_delivers_to_listed`.
-///
-/// Three-node cluster; scope = `NodeList{[node_b]}`. After sender reports
-/// COMPLETED, assert node_b has the blob and node_c does not.
-///
-/// **Gap:** the receive-side pull (PRD test 21 commentary) is required
-/// for `blob_exists_locally` to return true on node_b without an explicit
-/// manual fetch_blob call. Without it, neither node_b nor node_c sees
-/// the blob — the test would pass vacuously on node_c but fail on
-/// node_b. Once receive-side observer hooks ship, the NodeList filter
-/// in `IrohFileDistribution::resolve_targets` (already implemented)
-/// constrains which receivers attempt the pull, and this test asserts
-/// the filter behavior end-to-end.
-#[tokio::test]
-#[ignore = "needs peat-protocol receive-side observer hooks (same gap as test 21)"]
-async fn send_node_list_only_delivers_to_listed() {}
+//! Tests deferred here: 23, 24, 25, 29.
 
 /// PRD test 23 — `subscribe_emits_progress_then_terminal`.
 ///

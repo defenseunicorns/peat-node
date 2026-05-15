@@ -336,3 +336,169 @@ async fn end_to_end_attachment_delivery_two_nodes() {
     // touching them; tempfile cleans up on drop after the test exits.
     drop((a, b));
 }
+
+/// `iroh::EndpointId::fmt_short` emits the first 10 hex chars of the
+/// full 64-char endpoint id. `IrohFileDistribution::resolve_targets`
+/// formats peers this way when building `target_nodes`, and the inbox
+/// watcher compares this form against its own endpoint, so a
+/// `NodeListScope` caller must use the same 10-char prefix.
+fn short_endpoint(full: &str) -> String {
+    full.chars().take(10).collect()
+}
+
+/// PRD §Testing Plan test 22 — `send_node_list_only_delivers_to_listed`.
+///
+/// Three-node mesh A / B / C, all peered. A sends with
+/// `NodeListScope{[B_short]}`. The acceptance contract has two halves:
+///
+///   1. B receives the file on its filesystem inbox.
+///   2. C does NOT receive — its `target_nodes` exclusion is honoured
+///      by the inbox watcher's targeting check (the doc still syncs to
+///      C, but C's short endpoint id isn't in `target_nodes`, so it
+///      records the doc as handled and short-circuits before fetch).
+///
+/// "C does not receive" is asserted after B's delivery completes — by
+/// that point the distribution doc has flowed through Automerge sync
+/// to every connected peer (including C), and C's watcher has had
+/// enough sweeps to act on it. Then we wait an extra 3 watcher
+/// intervals as a buffer before asserting C's inbox is still empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_list_scope_only_delivers_to_listed_nodes() {
+    init_test_tracing();
+    const A_GRPC: u16 = 50141;
+    const A_IROH: u16 = 51241;
+    const B_GRPC: u16 = 50142;
+    const B_IROH: u16 = 51242;
+    const C_GRPC: u16 = 50143;
+    const C_IROH: u16 = 51243;
+
+    let a = boot(A_GRPC, A_IROH, "sender", false).await;
+    let b = boot(B_GRPC, B_IROH, "receiver-listed", true).await;
+    let c = boot(C_GRPC, C_IROH, "receiver-excluded", true).await;
+    let http = http_client();
+
+    let endpoint_a = call(&http, &a.base, "GetStatus", serde_json::json!({})).await["endpointAddr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_b = call(&http, &b.base, "GetStatus", serde_json::json!({})).await["endpointAddr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let endpoint_c = call(&http, &c.base, "GetStatus", serde_json::json!({})).await["endpointAddr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Bidirectional peering: A needs B and C in its known_peers for
+    // resolve_targets to include them; B and C need A so they can
+    // pull blobs from it (and so Automerge sync flows the
+    // file_distributions doc into their store).
+    for (from_base, peer_id, peer_iroh_port) in [
+        (&b.base, &endpoint_a, A_IROH),
+        (&a.base, &endpoint_b, B_IROH),
+        (&c.base, &endpoint_a, A_IROH),
+        (&a.base, &endpoint_c, C_IROH),
+    ] {
+        call(
+            &http,
+            from_base,
+            "ConnectPeer",
+            serde_json::json!({
+                "endpointId": peer_id,
+                "addresses": [format!("127.0.0.1:{peer_iroh_port}")],
+            }),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for node_base in [&a.base, &b.base, &c.base] {
+        call(&http, node_base, "StartSync", serde_json::json!({})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let payload = b"NodeList test - only B is in the target list".to_vec();
+    let hash = sha256_of(&payload);
+    std::fs::write(a.root_path.join("listed.bin"), &payload).unwrap();
+
+    let b_short = short_endpoint(&endpoint_b);
+
+    let resp = call(
+        &http,
+        &a.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "listed.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "nodeList": { "nodeIds": [b_short.clone()] } }
+        }),
+    )
+    .await;
+    let distribution_id = resp["handles"][0]["distributionId"]
+        .as_str()
+        .expect("SendAttachments must return a distribution_id")
+        .to_string();
+
+    // B receives.
+    let b_path = await_inbox_file(
+        &b.inbox_path,
+        &distribution_id,
+        &payload,
+        Duration::from_secs(30),
+    )
+    .await;
+    let b_bytes = tokio::fs::read(&b_path).await.unwrap();
+    assert_eq!(
+        sha256_of(&b_bytes),
+        hash,
+        "B's content must match sender's sha256"
+    );
+
+    // Buffer past B's delivery so we're not racing C's watcher. 3
+    // watcher intervals (default 1s) is enough headroom for C to act
+    // on the synced doc if it were going to.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // C does NOT receive.
+    let c_dist_dir = c.inbox_path.join(&distribution_id);
+    let c_has_payload = if c_dist_dir.is_dir() {
+        // Allow the directory to exist but assert no non-hidden file of
+        // the payload's size lives there. The watcher's `already_delivered`
+        // gate uses size-matching, and a sender-controlled empty dir
+        // wouldn't be a delivery anyway. Inspecting size is more direct
+        // than relying on the absence of the dir itself.
+        let mut iter = tokio::fs::read_dir(&c_dist_dir).await.unwrap();
+        let mut found_payload = false;
+        while let Ok(Some(entry)) = iter.next_entry().await {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with('.'))
+            {
+                continue;
+            }
+            if let Ok(md) = entry.metadata().await {
+                if md.is_file() && md.len() == payload.len() as u64 {
+                    found_payload = true;
+                    break;
+                }
+            }
+        }
+        found_payload
+    } else {
+        false
+    };
+    assert!(
+        !c_has_payload,
+        "C must NOT receive the file — NodeListScope was [{b_short}] only. \
+         C's endpoint short is {} and was not in target_nodes.",
+        short_endpoint(&endpoint_c)
+    );
+
+    drop((a, b, c));
+}
