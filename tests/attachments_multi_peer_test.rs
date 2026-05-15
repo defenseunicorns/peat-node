@@ -137,20 +137,24 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// PRD test 21 (and 22) require receive-side blob pulls, which need the
-/// receiver's `BlobPeerIndex` to know which peer holds the blob. The
-/// index is populated by the receive-side observer hooks flagged at
-/// `peat-protocol::storage::file_distribution.rs:617-621` as deferred to
-/// v2. An empirical attempt to run this test (commit history) hits
-/// `"no peers configured for remote fetch"` — exactly that gap.
+/// Substrate-level test: B can pull a blob A ingested.
 ///
-/// Left compiling-but-ignored so the moment peat-protocol ships the
-/// observer pattern, dropping `#[ignore]` exercises the full path. The
-/// substrate the receive-side pull will eventually trigger is sound
-/// (iroh-blobs fetch_blob is content-addressed and works once a peer is
-/// indexed), so this is purely an upstream-coordination block.
+/// Previously `#[ignore]`'d because the receiver hit
+/// `"no peers configured for remote fetch"` — `BlobPeerIndex` was empty.
+/// PR #65 fixed the underlying cause: `SidecarNode::connect_peer` now
+/// calls `blob_store.add_peer(peer_id)` after `start_sync_connection`,
+/// so the blob store's known-peers list is populated alongside iroh's
+/// transport-layer connection list. With both populated,
+/// `NetworkedIrohBlobStore::fetch_blob` iterates known_peers and tries
+/// iroh-blobs' downloader against each — exactly the path this test
+/// exercises.
+///
+/// Distinct from `attachments_e2e_test.rs`: that one drives the full
+/// SendAttachments → inbox watcher → filesystem path. This one bypasses
+/// the watcher and calls `fetch_blob` directly to prove the underlying
+/// substrate works for any future consumer that wants targeted blob
+/// pulls without the document watcher in the loop.
 #[tokio::test]
-#[ignore = "needs peat-protocol receive-side observer (BlobPeerIndex population). Tracked separately as a v2 follow-up."]
 async fn receiver_can_fetch_blob_pushed_by_sender() {
     const A_GRPC: u16 = 50121;
     const A_IROH: u16 = 51221;
