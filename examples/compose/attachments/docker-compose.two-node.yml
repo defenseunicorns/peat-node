@@ -6,7 +6,7 @@
 # but doesn't prove cross-peer delivery.
 #
 # Quickstart:
-#   docker compose -f docker-compose.two-node.yml up -d --build
+#   docker compose -f docker-compose.two-node.yml up -d
 #   ./peer.sh         # peer the two nodes (B → A and A → B)
 #   ./send.sh         # send hello.txt + the 1/10/100 MiB suite from A
 #   ls ./inbox-b/     # watch files appear on B's filesystem
@@ -26,8 +26,12 @@
 
 services:
   peat-node-a:
-    build:
-      context: ../../..
+    # Published v0.2.0 — first release with PRD-006 attachments + the
+    # receive-side inbox watcher. For testing local changes, comment
+    # out `image:` and uncomment the `build:` block.
+    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    # build:
+    #   context: ../../..
     container_name: peat-node-attachments-a
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
@@ -48,8 +52,9 @@ services:
       - ./outbox-a:/var/lib/peat/outbox:ro
 
   peat-node-b:
-    build:
-      context: ../../..
+    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    # build:
+    #   context: ../../..
     container_name: peat-node-attachments-b
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
