@@ -21,14 +21,13 @@
 
 services:
   peat-node:
-    # `build:` is the default so this quickstart works against the
-    # current checkout. For published-image use, comment out the
-    # `build:` block and uncomment the `image:` line below — v0.2.0 is
-    # the first release containing the PRD-006 attachment surface +
-    # receive-side delivery.
-    build:
-      context: ../../..
-    # image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    # Published v0.2.0 — first release with the PRD-006 attachment
+    # surface + receive-side delivery. For testing changes ahead of a
+    # release, comment out the `image:` line and uncomment the `build:`
+    # block to build from the repo root.
+    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    # build:
+    #   context: ../../..
     container_name: peat-node-attachments
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051

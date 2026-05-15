@@ -13,15 +13,13 @@ The single-node setup below is the per-size benchmark for sender-side
 ingest. **For the real delivery demo, jump to "Two-node delivery"
 below.**
 
-> **Builds from source by default.** The PRD-006 attachment surface
-> first shipped in `v0.2.0` (the `v0.1.x` images predate it and fail
-> with `unimplemented: method not found`). The compose file defaults to
-> `build: context: ../../..` so `docker compose up -d` from this
-> directory works against the current checkout regardless of which
-> registry tag is available. For published-image use, comment out the
-> `build:` block and uncomment the
-> `image: ghcr.io/defenseunicorns/peat-node:v0.2.0` line in
-> `docker-compose.yml`.
+> **Uses published `v0.2.0` image by default.** The PRD-006 attachment
+> surface first shipped in `v0.2.0`; earlier `v0.1.x` images predate
+> it and fail with `unimplemented: method not found`. To test local
+> changes ahead of a release, comment out the `image:` line and
+> uncomment the `build:` block in `docker-compose.yml` (or
+> `docker-compose.two-node.yml` for the cross-peer demo) to build from
+> the repo root.
 
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the
@@ -87,12 +85,16 @@ Real cross-peer file delivery (PRD-006 v1.1, post the inbox-watcher
 landing).
 
 ```bash
-docker compose -f docker-compose.two-node.yml up -d --build
+docker compose -f docker-compose.two-node.yml up -d
 ./peer.sh                                  # bidirectional ConnectPeer
 ENDPOINT=http://127.0.0.1:50061 OUTBOX_DIR=outbox-a ./send.sh
 ls inbox-b/                                # files appear here per distribution_id
 docker compose -f docker-compose.two-node.yml down -v
 ```
+
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.2.0`. For testing local
+changes, swap the `image:` line for the commented `build:` block in
+both services.)
 
 What the two-node setup wires:
 
