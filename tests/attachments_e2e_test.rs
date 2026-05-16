@@ -28,6 +28,7 @@ use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
+use peat_protocol::storage::{DistributionDocument, TransferState, IROH_DISTRIBUTION_COLLECTION};
 use sha2::{Digest, Sha256};
 
 struct BootedNode {
@@ -501,4 +502,178 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
     );
 
     drop((a, b, c));
+}
+
+/// Receiver-side regression for the `attachments::inbox` node-status
+/// writes (the contract this PR introduces in `src/attachments/inbox.rs`).
+///
+/// The end-to-end byte-delivery test (`end_to_end_attachment_delivery_two_nodes`)
+/// only proves bytes-on-disk; it can't fail if a future refactor silently
+/// drops the `write_node_status(Transferring)` or `_(Completed)` call sites
+/// — `serde_json::to_vec` errors are best-effort-logged-and-skipped, an
+/// early-return added to the fetch path before the second write would go
+/// undetected, and the cargo-test suite would still pass green.
+///
+/// PRD-006 test 23 (`subscribe_emits_progress_then_terminal` in
+/// `attachments_deferred_test.rs`) IS that contract test from the
+/// **sender's** observation perspective — assert ≥1 IN_PROGRESS + 1
+/// terminal frame on `SubscribeAttachmentBundle`. But test 23 is blocked
+/// on an upstream peat-mesh substrate race that drops the second of two
+/// back-to-back receiver doc writes when they fire within the 100ms
+/// sync_cooldown (defenseunicorns/peat#864). So we cannot rely on test 23
+/// today to catch a regression in *this* PR.
+///
+/// This test verifies the receiver-local half of the contract — by the
+/// time the inbox file is on disk, the receiver MUST have written both
+/// `Transferring` (before fetch) and `Completed` (after atomic rename
+/// inbox write) into its local copy of the distribution document. We
+/// read the receiver's `AutomergeStore` directly, bypassing the sync
+/// path that the upstream race affects. A regression that silently
+/// drops the Completed write (or both) fails this test deterministically.
+///
+/// Once peat#864 lands and test 23 un-ignores, the two tests cover
+/// complementary halves: this one pins the receiver's local doc state,
+/// test 23 pins the sender's observable broadcast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiver_writes_node_status_into_distribution_doc() {
+    init_test_tracing();
+    const A_GRPC: u16 = 50151;
+    const A_IROH: u16 = 51251;
+    const B_GRPC: u16 = 50152;
+    const B_IROH: u16 = 51252;
+
+    let a = boot(A_GRPC, A_IROH, "sender", false).await;
+    let b = boot(B_GRPC, B_IROH, "receiver", true).await;
+    let http = http_client();
+
+    let status_a = call(&http, &a.base, "GetStatus", serde_json::json!({})).await;
+    let status_b = call(&http, &b.base, "GetStatus", serde_json::json!({})).await;
+    let endpoint_a = status_a["endpointAddr"].as_str().unwrap().to_string();
+    let endpoint_b = status_b["endpointAddr"].as_str().unwrap().to_string();
+    let b_short = b.node.endpoint_short_id();
+
+    call(
+        &http,
+        &b.base,
+        "ConnectPeer",
+        serde_json::json!({
+            "endpointId": endpoint_a,
+            "addresses": [format!("127.0.0.1:{A_IROH}")],
+        }),
+    )
+    .await;
+    call(
+        &http,
+        &a.base,
+        "ConnectPeer",
+        serde_json::json!({
+            "endpointId": endpoint_b,
+            "addresses": [format!("127.0.0.1:{B_IROH}")],
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    call(&http, &a.base, "StartSync", serde_json::json!({})).await;
+    call(&http, &b.base, "StartSync", serde_json::json!({})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let payload = b"receiver-node-status: this exact byte sequence must arrive on B and B must record its delivery into the distribution doc".to_vec();
+    let hash = sha256_of(&payload);
+    let file_path = a.root_path.join("recv-status.bin");
+    std::fs::write(&file_path, &payload).unwrap();
+
+    let resp = call(
+        &http,
+        &a.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "recv-status.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "allNodes": {} }
+        }),
+    )
+    .await;
+    let distribution_id = resp["handles"][0]["distributionId"]
+        .as_str()
+        .expect("SendAttachments must return a distribution_id")
+        .to_string();
+
+    // First, wait for byte-on-disk delivery — that's the sync point
+    // after which both node-status writes must have run.
+    let _ = await_inbox_file(
+        &b.inbox_path,
+        &distribution_id,
+        &payload,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Poll the receiver's local distribution doc until `node_statuses`
+    // for this node reaches `Completed`, with a 15-second timeout. The
+    // delivery-complete signal (`await_inbox_file`) returns when the
+    // atomic-rename inbox write lands; the `Completed` node-status
+    // write fires *immediately after* — so on a quiet local run the
+    // very next poll sees `Completed`. CI runs on shared hardware where
+    // the inbox-watcher task can be preempted between the rename and
+    // the `write_node_status(Completed)` site by minutes of other
+    // work, and inbound automerge-sync round-trips may overwrite the
+    // local doc's `"data"` scalar before the second write lands.
+    // Polling pins the contract on the *eventual* state rather than
+    // exact timing, and surfaces the pre-Completed snapshot in the
+    // failure message so a regression that *drops* the write is
+    // distinguishable from sheer slowness.
+    let collection = b
+        .node
+        .document_store()
+        .collection(IROH_DISTRIBUTION_COLLECTION);
+    let poll_deadline = Instant::now() + Duration::from_secs(15);
+    let entry = loop {
+        let bytes = collection
+            .get(&distribution_id)
+            .expect("collection.get must succeed")
+            .expect("distribution doc must exist on the receiver after delivery");
+        let doc: DistributionDocument = serde_json::from_slice(&bytes).expect(
+            "receiver's distribution doc must deserialize as the typed DistributionDocument",
+        );
+        if let Some(entry) = doc.node_statuses.get(&b_short) {
+            if entry.status == TransferState::Completed {
+                break entry.clone();
+            }
+        }
+        if Instant::now() >= poll_deadline {
+            panic!(
+                "receiver's local node_status never reached Completed within 15s of \
+                 byte-on-disk delivery. b_short={b_short}. Last-seen \
+                 doc.node_statuses: {:?}. A regression here means the Completed write \
+                 site in `attachments::inbox::scan_once` was dropped, its `?` chain \
+                 swallowed an error, or the local doc is being overwritten by \
+                 inbound sync after the write.",
+                doc.node_statuses
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    assert_eq!(
+        entry.node_id, b_short,
+        "node_id in the written NodeTransferStatus must match the receiver's \
+         own short endpoint id (peer.fmt_short())"
+    );
+    assert_eq!(
+        entry.total_bytes,
+        payload.len() as u64,
+        "receiver should have stamped total_bytes from the distribution doc's \
+         blob_size, not from a hardcoded zero or the wrong field"
+    );
+    assert!(
+        entry.completed_at.is_some(),
+        "receiver should have stamped completed_at on the Completed write"
+    );
+
+    drop((a, b));
 }

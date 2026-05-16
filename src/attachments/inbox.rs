@@ -80,27 +80,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use peat_mesh::storage::blob_traits::{BlobHash, BlobMetadata, BlobStore, BlobToken};
 use peat_mesh::storage::{AutomergeStore, NetworkedIrohBlobStore};
-use serde::Deserialize;
+use peat_protocol::storage::{
+    DistributionDocument, NodeTransferStatus, TransferState, IROH_DISTRIBUTION_COLLECTION,
+};
 use tracing::{debug, info, warn};
 
 use crate::attachments::registry::BundleRegistry;
-
-const DISTRIBUTION_COLLECTION: &str = "file_distributions";
-
-/// Shape of the distribution document peat-protocol writes. Mirrors
-/// `IrohFileDistribution::store_distribution_document`'s JSON layout.
-/// Only the fields the watcher needs are extracted.
-#[derive(Debug, Deserialize)]
-struct DistributionDoc {
-    distribution_id: String,
-    blob_hash: String,
-    blob_size: u64,
-    #[serde(default)]
-    blob_metadata: BlobMetadata,
-    target_nodes: Vec<String>,
-}
 
 /// Spawn the inbox watcher task. Returns immediately. The task runs for
 /// the lifetime of the process (or until `document_store` / `blob_store`
@@ -153,7 +141,7 @@ async fn scan_once(
     own_endpoint_short: &str,
     handled: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
-    let collection = document_store.collection(DISTRIBUTION_COLLECTION);
+    let collection = document_store.collection(IROH_DISTRIBUTION_COLLECTION);
     let docs = collection.scan()?;
     debug!(
         doc_count = docs.len(),
@@ -165,7 +153,7 @@ async fn scan_once(
             continue;
         }
 
-        let doc: DistributionDoc = match serde_json::from_slice(&bytes) {
+        let doc: DistributionDocument = match serde_json::from_slice(&bytes) {
             Ok(d) => d,
             Err(e) => {
                 warn!(
@@ -218,6 +206,26 @@ async fn scan_once(
             continue;
         }
 
+        // Write a Transferring status into the distribution doc's
+        // node_statuses map before fetching. The sender's progress
+        // watcher (peat#864 / peat-protocol 0.9.0-rc.7) re-reads the doc
+        // on each observer event and emits an IN_PROGRESS frame to
+        // `subscribe_progress` subscribers. Best-effort: a failure here
+        // does not block the fetch itself — the worst case is the sender
+        // never observes our in-flight state.
+        if let Err(e) = write_node_status(
+            document_store,
+            &doc,
+            own_endpoint_short,
+            TransferStateWrite::Transferring,
+        ) {
+            warn!(
+                distribution_id = %doc.distribution_id,
+                error = %e,
+                "failed to write Transferring node status; sender will see no in-progress frame"
+            );
+        }
+
         // Fetch the blob. `NetworkedIrohBlobStore::fetch_blob` iterates
         // known iroh peers internally and tries each via the
         // iroh-blobs downloader. If the sender isn't yet reachable
@@ -250,6 +258,22 @@ async fn scan_once(
                     target = %target.display(),
                     "attachment received and written to inbox"
                 );
+                // Write Completed terminal status — the sender's watcher
+                // observes this, emits one final DistributionStatus frame
+                // with completed=total_targets, and drops the broadcast
+                // sender so subscribers see RecvError::Closed.
+                if let Err(e) = write_node_status(
+                    document_store,
+                    &doc,
+                    own_endpoint_short,
+                    TransferStateWrite::Completed,
+                ) {
+                    warn!(
+                        distribution_id = %doc.distribution_id,
+                        error = %e,
+                        "failed to write Completed node status; sender will see no terminal frame for this node"
+                    );
+                }
                 handled.insert(doc_id);
             }
             Err(e) => {
@@ -258,10 +282,107 @@ async fn scan_once(
                     error = %e,
                     "inbox write failed; will retry next tick"
                 );
-                // No `handled.insert` — retry on next tick.
+                // No `handled.insert` — retry on next tick. No Failed
+                // node-status write either: retries are intentional and
+                // a Failed flip would prematurely close the sender's
+                // broadcast channel for this distribution.
             }
         }
     }
+    Ok(())
+}
+
+/// Receiver-side node-status writes the watcher emits into
+/// `DistributionDocument::node_statuses`. Only the two states the
+/// receiver observes from its own perspective — `Transferring` once
+/// fetch begins, `Completed` once the inbox write lands atomically.
+///
+/// The `Failed` variant of [`TransferState`] is intentionally not
+/// modelled here: the v1 inbox watcher retries fetch and write failures
+/// on the next tick rather than treating them as permanent, so the
+/// receiver has no "give up" event to map to `Failed`. A future
+/// give-up mechanism (e.g. retry-budget exhaustion) would extend this
+/// enum.
+enum TransferStateWrite {
+    Transferring,
+    Completed,
+}
+
+/// Read-modify-write the distribution document so the sender's
+/// progress watcher (peat-protocol 0.9.0-rc.7+) can observe this
+/// receiver's state. The watcher subscribes to `AutomergeStore`
+/// observer events and re-reads the doc on each change, so this is
+/// the channel that drives `subscribe_progress` frames on the sender.
+///
+/// Concurrent writes between sender (cancel path) and receiver
+/// (this function) race at the `Collection::upsert` boundary —
+/// `AutomergeCollection` replaces the JSON `"data"` scalar wholesale.
+/// Automerge convergence guarantees no permanent loss; the sender's
+/// watcher reconciles within one tick on either side. A proper
+/// per-key map shape on `node_statuses` is deferred upstream
+/// (peat-protocol).
+fn write_node_status(
+    document_store: &Arc<AutomergeStore>,
+    doc: &DistributionDocument,
+    own_endpoint_short: &str,
+    state: TransferStateWrite,
+) -> anyhow::Result<()> {
+    let collection = document_store.collection(IROH_DISTRIBUTION_COLLECTION);
+    // Re-read the doc to RMW the latest committed state; the `doc`
+    // argument is the scan-tick snapshot and may be stale relative to
+    // a concurrent sender cancel.
+    let Some(existing) = collection.get(&doc.distribution_id)? else {
+        // Doc was deleted between scan and here — nothing to update.
+        return Ok(());
+    };
+    let mut latest: DistributionDocument = serde_json::from_slice(&existing)?;
+
+    let now = Utc::now();
+    let ns = match state {
+        TransferStateWrite::Transferring => NodeTransferStatus {
+            node_id: own_endpoint_short.to_string(),
+            status: TransferState::Transferring,
+            progress_bytes: 0,
+            total_bytes: latest.blob_size,
+            started_at: Some(now),
+            completed_at: None,
+            error: None,
+        },
+        TransferStateWrite::Completed => {
+            // Preserve started_at if the sender already saw our
+            // Transferring write; otherwise stamp now so the doc has
+            // some timing signal at all.
+            let started_at = latest
+                .node_statuses
+                .get(own_endpoint_short)
+                .and_then(|s| s.started_at)
+                .or(Some(now));
+            NodeTransferStatus {
+                node_id: own_endpoint_short.to_string(),
+                status: TransferState::Completed,
+                progress_bytes: latest.blob_size,
+                total_bytes: latest.blob_size,
+                started_at,
+                completed_at: Some(now),
+                error: None,
+            }
+        }
+    };
+    latest
+        .node_statuses
+        .insert(own_endpoint_short.to_string(), ns);
+
+    let bytes = serde_json::to_vec(&latest)?;
+    collection.upsert(&doc.distribution_id, bytes)?;
+    debug!(
+        distribution_id = %doc.distribution_id,
+        node = %own_endpoint_short,
+        new_status = ?match state {
+            TransferStateWrite::Transferring => "Transferring",
+            TransferStateWrite::Completed => "Completed",
+        },
+        "wrote receiver node_status into distribution doc"
+    );
     Ok(())
 }
 
@@ -309,7 +430,7 @@ async fn already_delivered(inbox_root: &Path, distribution_id: &str, expected_si
 /// partial file.
 async fn write_to_inbox(
     inbox_root: &Path,
-    doc: &DistributionDoc,
+    doc: &DistributionDocument,
     blob_local_path: &Path,
 ) -> std::io::Result<PathBuf> {
     let dir = inbox_root.join(&doc.distribution_id);
