@@ -535,7 +535,6 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
 /// complementary halves: this one pins the receiver's local doc state,
 /// test 23 pins the sender's observable broadcast.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "blocked on peat-mesh#118 (sync_cooldown defer-not-drop) shipping as 0.9.0-rc.10 and reaching this repo via peat-protocol; against published peat-mesh 0.9.0-rc.9 the receiver's local doc gets stuck at Transferring due to the silent-drop sync race"]
 async fn receiver_writes_node_status_into_distribution_doc() {
     init_test_tracing();
     const A_GRPC: u16 = 50151;
@@ -633,7 +632,6 @@ async fn receiver_writes_node_status_into_distribution_doc() {
         .document_store()
         .collection(IROH_DISTRIBUTION_COLLECTION);
     let poll_deadline = Instant::now() + Duration::from_secs(15);
-    let mut last_seen: Option<DistributionDocument> = None;
     let entry = loop {
         let bytes = collection
             .get(&distribution_id)
@@ -647,7 +645,6 @@ async fn receiver_writes_node_status_into_distribution_doc() {
                 break entry.clone();
             }
         }
-        last_seen = Some(doc);
         if Instant::now() >= poll_deadline {
             panic!(
                 "receiver's local node_status never reached Completed within 15s of \
@@ -656,7 +653,7 @@ async fn receiver_writes_node_status_into_distribution_doc() {
                  site in `attachments::inbox::scan_once` was dropped, its `?` chain \
                  swallowed an error, or the local doc is being overwritten by \
                  inbound sync after the write.",
-                last_seen.map(|d| d.node_statuses).unwrap_or_default()
+                doc.node_statuses
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
