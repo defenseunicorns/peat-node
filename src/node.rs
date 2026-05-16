@@ -246,6 +246,30 @@ impl SidecarNode {
         self.backend.blob_store()
     }
 
+    /// The Automerge document store the backend holds.
+    ///
+    /// Exposed for the attachment subsystem's inbox watcher (which writes
+    /// receiver-side `NodeTransferStatus` into the `file_distributions`
+    /// collection so the sender's `IrohFileDistribution` progress watcher
+    /// sees real cross-peer state — see `attachments/inbox.rs`), and for
+    /// integration tests that need to read the local document state
+    /// directly rather than through the gRPC surface.
+    pub fn document_store(&self) -> &Arc<AutomergeStore> {
+        self.backend.store()
+    }
+
+    /// The short-form id of this node's iroh endpoint, the same string the
+    /// sender's `IrohFileDistribution::resolve_targets` produces in the
+    /// distribution document's `target_nodes` and the receiver writes back
+    /// in `node_statuses`. Cached lookup; cheap.
+    pub fn endpoint_short_id(&self) -> String {
+        self.backend
+            .blob_store()
+            .endpoint_id()
+            .fmt_short()
+            .to_string()
+    }
+
     /// React to local document changes by syncing them with all connected peers.
     async fn sync_on_change(
         mut rx: broadcast::Receiver<String>,
