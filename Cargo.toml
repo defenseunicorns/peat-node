@@ -80,3 +80,11 @@ connectrpc-build = "0.2"
 tempfile = "3.10"
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
+# Serial test execution for the two-node integration tests that bind real
+# iroh endpoints — running them under cargo's default per-binary
+# parallelism contends for CPU (each `#[tokio::test(flavor =
+# "multi_thread", worker_threads = 4)]` spins up its own runtime), and
+# the receiver-side sync round-trip in PRD-006 test 23 can stall past
+# its budget under that load. `#[serial]` pins those specific tests to
+# one-at-a-time execution while leaving the rest of the suite parallel.
+serial_test = "3"

@@ -183,6 +183,7 @@ fn is_in_progress(progress: &pb::AttachmentProgress) -> bool {
 /// (giving the contract a real IN_PROGRESS frame to assert on), but
 /// small enough that a successful run lands in well under 30 seconds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
 async fn subscribe_emits_progress_then_terminal() {
     const A_GRPC: u16 = 50141;
     const A_IROH: u16 = 51241;
