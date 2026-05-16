@@ -14,37 +14,49 @@
 //! - 28 → `attachments_subscribe_test`
 //!
 //! Tests deferred here: 23, 24, 25, 29.
-//!
-//! # Upstream gaps
-//!
-//! Tests 23 and 24 share a single upstream gap: peat-protocol's
-//! `IrohFileDistribution` creates the `subscribe_progress` broadcast
-//! channel but never publishes to it — `broadcast_progress()` in
-//! `peat-protocol/src/storage/file_distribution.rs` is `#[allow(dead_code)]`
-//! and has no callers. Tracked at
-//! <https://github.com/defenseunicorns/peat/issues/864>. Once that lands,
-//! the receive-side already in `attachments::inbox` (peat-node #65)
-//! drives real per-peer progress, and both tests un-ignore.
 
 /// PRD test 23 — `subscribe_emits_progress_then_terminal`.
 ///
 /// Send a 4 MiB file, subscribe, assert at least one IN_PROGRESS frame
 /// and exactly one terminal frame.
 ///
-/// **Gap:** peat-protocol's `IrohFileDistribution::distribute` creates
-/// the `subscribe_progress` broadcast channel but never publishes to
-/// it (`broadcast_progress()` is `#[allow(dead_code)]`). Receive-side
-/// auto-pull works (peat-node `attachments::inbox`, #65), so receivers
-/// do fetch — but their fetch progress is invisible to the sender's
-/// subscribe stream. Tracked upstream at
-/// <https://github.com/defenseunicorns/peat/issues/864>.
+/// **Status after peat-protocol 0.9.0-rc.7 + peat-node receiver-side
+/// node-status writes**: the IN_PROGRESS half is unblocked and lands
+/// reliably end-to-end (the sender's progress watcher fires on the
+/// receiver's first `Transferring` write into the distribution doc).
+/// The exactly-one-terminal-frame half remains blocked on a separate
+/// substrate-level race in peat-mesh:
 ///
-/// The zero-peer terminal-frame half of the contract is already
-/// covered by
-/// `attachments_subscribe_test::subscribe_zero_peer_distribution_closes_after_terminal_frame`
-/// via the watcher's initial-status short-circuit.
+/// The inbox watcher writes `Transferring` and (after a sub-second
+/// 4 MiB local fetch) `Completed` into the same distribution doc back
+/// to back. peat-mesh's automerge sync delivers the first change to
+/// the sender's observer reliably, but the second update — when it
+/// lands ~60 ms after the first — appears to be coalesced or
+/// observer-debounced before the sender's watcher polls the doc
+/// again. Direct probe at stall: the receiver's local doc has
+/// `node_statuses[receiver] = Completed`, but the sender's
+/// `IrohFileDistribution::status()` and the underlying doc on the
+/// sender both still read `Transferring`. So the sender's
+/// `subscribe_progress` stream stalls one frame short of terminal.
+///
+/// This race is below the peat-node layer: peat-mesh decides when to
+/// fire observer events on inbound document deltas. A clean fix lives
+/// upstream (separate-key Automerge map on `node_statuses` so each
+/// receiver write produces a distinct change set, observer fan-out
+/// guarantees per-change firing, or sender-side polling of the doc
+/// independent of observer events). Tracking work continues outside
+/// peat-node #75.
+///
+/// What this PR did still accomplish for this test:
+///   1. peat-protocol `0.9.0-rc.7` ships the sender-side watcher that
+///      consumes the receiver's writes (closes peat#864 — confirmed
+///      via the peat-protocol e2e suite).
+///   2. peat-node's `attachments::inbox` now writes Transferring +
+///      Completed into the distribution doc on every delivery
+///      (confirmed via `RUST_LOG=peat_node::attachments=debug` —
+///      both writes complete, sender observes Transferring frame).
 #[tokio::test]
-#[ignore = "blocked on peat#864: IrohFileDistribution::broadcast_progress is dead code, no peer-side updates emit"]
+#[ignore = "blocked on peat-mesh substrate observer/sync coalescing for back-to-back receiver doc writes (the Transferring → Completed gap)"]
 async fn subscribe_emits_progress_then_terminal() {}
 
 /// PRD test 24 — `cancel_in_flight_stops_transfer`.
@@ -52,19 +64,19 @@ async fn subscribe_emits_progress_then_terminal() {}
 /// Start a large transfer, cancel mid-flight, assert status flips to
 /// CANCELLED within 1s.
 ///
-/// **Gap:** auto-pull on receivers landed in peat-node #65, but the
-/// sender-observable in-flight state still doesn't exist — same root
-/// cause as test 23 (peat#864). Without sender-side progress frames
-/// landing on the subscribe stream, the watcher idles in
-/// subscribe_progress waiting for events that never come. Cancel on
-/// the registry side does work today (unit-tested via the
-/// `BundleStatus::Cancelled` path), but the proto status surfacing the
-/// transition observably requires real progress frames to interrupt.
-///
-/// Once peat#864 lands, this test sends a 100+ MiB blob to a peer
-/// throttled to a few Mbps and verifies Cancel within 1s.
+/// **Status after peat-protocol 0.9.0-rc.7**: the sender-side
+/// observability piece of this contract works in isolation — `cancel()`
+/// flips the doc to "cancelled", `broadcast_progress` emits a terminal
+/// CANCELLED frame, and the channel drops. The remaining blocker is a
+/// **bandwidth-controlled receiver fixture**: no in-tree way to throttle
+/// a single peer's iroh-blob fetch to keep the transfer in-flight long
+/// enough to issue Cancel and verify the flip within 1s. A real fixture
+/// needs either a mock `NetworkedIrohBlobStore` implementing throttled
+/// fetch, OS-level traffic shaping (`tc netem`, brittle in CI), or a
+/// tokio sleep injection into the receiver's `BlobStore::fetch_blob` path.
+/// All three are non-trivial design decisions deferred from this PR.
 #[tokio::test]
-#[ignore = "blocked on peat#864 (sender-observable in-flight state) + bandwidth-controlled receiver fixture"]
+#[ignore = "needs a bandwidth-controlled receiver fixture (peat-node-only design decision)"]
 async fn cancel_in_flight_stops_transfer() {}
 
 /// PRD test 25 — `unknown_node_id_marked_failed_after_grace`.
@@ -94,12 +106,14 @@ async fn unknown_node_id_marked_failed_after_grace() {}
 /// while a second is still IN_PROGRESS; subscribe; assert snapshot
 /// frame for the terminal one then live frames for the in-flight one.
 ///
-/// **Gap:** two pieces are missing. (1) The IN_PROGRESS half needs
-/// sender-observable progress frames — same upstream block as test 23
-/// (peat#864). (2) The FAILED half needs a deterministic way to drive
-/// a single distribution to FAILED. peat-protocol's
-/// `IrohFileDistribution::distribute` doesn't expose fault injection;
-/// a clean v2 mechanism is needed (test-only hook or a deterministic
+/// **Status after peat-protocol 0.9.0-rc.7 + this PR**: the
+/// IN_PROGRESS half is partially driveable (sender observes at least
+/// one IN_PROGRESS frame from the receiver's Transferring write,
+/// modulo the back-to-back-write race documented on test 23). The
+/// FAILED half still needs a deterministic way to drive a single
+/// distribution to FAILED — peat-protocol's
+/// `IrohFileDistribution::distribute` does not expose fault injection.
+/// A clean v2 mechanism is needed (test-only hook or a deterministic
 /// timeout flag on the distribution document).
 ///
 /// `attachments_subscribe_test::subscribe_after_terminal_emits_snapshot_then_eof`
@@ -108,5 +122,5 @@ async fn unknown_node_id_marked_failed_after_grace() {}
 /// (snapshot before live) is exercised in unit tests on the
 /// `StreamCloser` adapter and `BundleRuntime::per_distribution_snapshot`.
 #[tokio::test]
-#[ignore = "blocked on peat#864 (IN_PROGRESS frames) + fault-injection hook for FAILED"]
+#[ignore = "needs a fault-injection hook to drive a single distribution to FAILED"]
 async fn subscribe_mixed_state_emits_snapshot_for_terminal_then_live_for_inflight() {}
