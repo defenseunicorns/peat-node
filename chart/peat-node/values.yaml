@@ -3,7 +3,7 @@
 # -- Container image
 image:
   repository: ghcr.io/defenseunicorns/peat-node
-  tag: v0.3.0
+  tag: v0.3.1
   pullPolicy: IfNotPresent
 
 # -- gRPC listen address (inside the pod)

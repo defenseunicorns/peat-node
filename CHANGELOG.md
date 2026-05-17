@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-17
+
+Closes [#68](https://github.com/defenseunicorns/peat-node/issues/68): the
+receive-side distribution lifecycle moves upstream into `peat-protocol`,
+where it belongs. peat-node is now a pure consumer of the distribution
+surface rather than the layer that closed a `peat-protocol` gap (the
+`[ARCH]` follow-up from the PRD-006 v1.1 QA review on #65).
+
+Patch bump (not minor): no change to peat-node's gRPC surface or
+observable behavior. This is an internal layering refactor plus
+dependency-floor bumps; the full attachment acceptance suite passes
+unchanged against the published dependencies.
+
+### Changed
+
+- **Receive lifecycle relocated to `peat-protocol` 0.9.0-rc.10 (#68).**
+  `src/attachments/inbox.rs` shrank from 713 to ~290 lines: the polling
+  watcher, distribution-doc scan, targeting check, per-receiver
+  `Transferring`/`Completed` status writes, and the deterministic test
+  fault seam are all gone — they now live in
+  `peat_protocol::storage::IrohFileDistribution::start_receive_watcher`.
+  What remains is `FilesystemInboxSink`, a thin
+  `peat_protocol::storage::ReceiveSink` implementation (durable
+  `already_delivered` gate + atomic tmp+rename `deliver`). The relocated
+  `#[doc(hidden)]` test seam is re-exported from `attachments::inbox` so
+  existing test imports keep resolving.
+- **`src/node.rs`** builds the sink and calls `start_receive_watcher`;
+  the distribution substrate is now constructed when **either** an
+  attachment root **or** an inbox path is configured (a receive-only
+  node still needs the instance).
+
+### Dependencies
+
+- `peat-protocol` pin raised to `>=0.9.0-rc.10, <0.9.1` (the receive
+  API only exists in rc.10); the cross-repo `[patch.crates-io]` dev
+  override used during development was removed.
+- `peat-mesh` pinned `=0.9.0-rc.10` → `=0.9.0-rc.11`. The published
+  `peat-protocol` 0.9.0-rc.10 requires `peat-mesh >=0.9.0-rc.10, <0.9.1`,
+  so rc.11 satisfies it transitively with no `peat-protocol` re-release.
+
 ## [0.3.0] - 2026-05-17
 
 Closes [defenseunicorns/peat#864](https://github.com/defenseunicorns/peat/issues/864)
