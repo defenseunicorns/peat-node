@@ -75,17 +75,17 @@
 
 #![allow(clippy::result_large_err)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use peat_mesh::storage::blob_traits::{BlobHash, BlobMetadata, BlobStore, BlobToken};
 use peat_mesh::storage::{AutomergeStore, NetworkedIrohBlobStore};
 use peat_protocol::storage::{
-    scan_distribution_documents, write_receiver_node_status, DistributionDocument,
-    NodeTransferStatus, TransferState,
+    read_distribution_document, scan_distribution_documents, write_receiver_node_status,
+    DistributionDocument, NodeTransferStatus, TransferState,
 };
 use tracing::{debug, info, warn};
 
@@ -217,6 +217,58 @@ async fn scan_once(
             );
         }
 
+        // Test fault/throttle seam (no-op in production — see
+        // `ReceiveTestDirective`). Consulted after the Transferring
+        // write so the sender has already observed IN_PROGRESS.
+        match peek_receive_directive(&doc.blob_hash) {
+            Some(ReceiveTestDirective::FailFetch(msg)) => {
+                if let Err(e) = write_node_status(
+                    document_store,
+                    &doc,
+                    own_endpoint_short,
+                    TransferStateWrite::Failed(msg),
+                ) {
+                    warn!(
+                        distribution_id = %doc.distribution_id,
+                        error = %e,
+                        "test seam: failed to write injected Failed node status"
+                    );
+                }
+                handled.insert(doc_id);
+                continue;
+            }
+            Some(ReceiveTestDirective::HoldInFlight) => {
+                // Re-read (cheap): if the sender cancelled while we
+                // were holding, stop — a receiver must not deliver a
+                // cancelled distribution (basis of PRD test 24's
+                // deterministic mid-flight cancel).
+                match read_distribution_document(document_store.as_ref(), &doc.distribution_id) {
+                    Ok(Some(fresh)) if fresh.status != "distributing" => {
+                        debug!(
+                            distribution_id = %doc.distribution_id,
+                            status = %fresh.status,
+                            "test seam: distribution no longer distributing; releasing hold"
+                        );
+                        handled.insert(doc_id);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            distribution_id = %doc.distribution_id,
+                            error = %e,
+                            "test seam: hold re-read failed; will retry next tick"
+                        );
+                    }
+                }
+                // Skip fetch this tick; NOT marked handled → revisited
+                // next sweep, staying IN_PROGRESS. Non-blocking: other
+                // distributions in this sweep proceed normally.
+                continue;
+            }
+            None => {}
+        }
+
         // Fetch the blob. `NetworkedIrohBlobStore::fetch_blob` iterates
         // known iroh peers internally and tries each via the
         // iroh-blobs downloader. If the sender isn't yet reachable
@@ -283,21 +335,107 @@ async fn scan_once(
     Ok(())
 }
 
+// ===========================================================================
+// Test fault/throttle seam (PRD §Testing Plan tests 24 & 29)
+// ===========================================================================
+//
+// Tests 24 (`cancel_in_flight_stops_transfer`) and 29
+// (`subscribe_mixed_state_emits_snapshot_for_terminal_then_live_for_inflight`)
+// both need to control a receiver's blob fetch deterministically: 24
+// needs a measurable in-flight window to cancel into, 29 needs one
+// distribution driven to FAILED while another stays IN_PROGRESS.
+//
+// This is a process-global, default-empty registry consulted once per
+// distribution per scan tick. **Not** a Cargo feature or `#[cfg(test)]`:
+// integration tests are a separate crate (so `#[cfg(test)]` lib gates
+// are inert for them), and a feature flag would exclude these PRD
+// acceptance tests from the default `cargo test` CI run — the entire
+// point of un-ignoring them is that CI exercises them. The cost when
+// unpopulated (production) is one `RwLock` read returning `None` per
+// distribution per 1s scan tick: negligible, and a complete behavioral
+// no-op. Keyed by **blob_hash** (hex), not distribution_id, so a test
+// can arm a directive *before* `SendAttachments` mints the
+// distribution_id — race-free against the receiver's first scan.
+// `#[doc(hidden)]`: the seam must be a non-`cfg(test)` `pub` symbol so
+// the separate integration-test crate can reach it under the default
+// `cargo test` (see the section comment above), but it is NOT a
+// supported library API for external peat-node consumers. Hidden from
+// rustdoc + signalled as internal; renaming into a `__test_seam`
+// module was considered and deferred (it would churn the test imports
+// for marginal additional signal over doc(hidden)).
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum ReceiveTestDirective {
+    /// Hold this distribution in-flight: after the `Transferring`
+    /// write, skip the fetch *this tick* and move on (do NOT block the
+    /// scan loop, do NOT mark handled) so the distribution stays
+    /// IN_PROGRESS and is revisited next tick. Each revisit re-reads
+    /// the doc: once the sender cancels (status != "distributing") the
+    /// receiver stops — it must not deliver a cancelled distribution
+    /// (a correctness property, and the basis of PRD test 24's
+    /// deterministic mid-flight cancel).
+    ///
+    /// Non-blocking by design: an earlier `PauseBeforeFetch(Duration)`
+    /// did an inline `sleep` inside the sequential per-distribution
+    /// scan loop, which starved every *other* distribution in the
+    /// same sweep for the pause duration (order-dependent flake in
+    /// PRD test 29's two-distribution bundle).
+    HoldInFlight,
+    /// Skip the fetch entirely and write a `Failed` node_status with
+    /// this error string. Drives one distribution to FAILED
+    /// deterministically for PRD test 29.
+    FailFetch(String),
+}
+
+static RECEIVE_TEST_HOOK: OnceLock<RwLock<HashMap<String, ReceiveTestDirective>>> = OnceLock::new();
+
+fn receive_test_hook() -> &'static RwLock<HashMap<String, ReceiveTestDirective>> {
+    RECEIVE_TEST_HOOK.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Test-only: arm a receive-path directive for blobs whose hex
+/// `blob_hash` equals `blob_hash`. Production never calls this; an
+/// unarmed hash is a no-op. See [`ReceiveTestDirective`].
+#[doc(hidden)]
+pub fn set_receive_test_directive(blob_hash: &str, directive: ReceiveTestDirective) {
+    receive_test_hook()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(blob_hash.to_string(), directive);
+}
+
+/// Test-only: clear all armed receive-path directives.
+#[doc(hidden)]
+pub fn clear_receive_test_directives() {
+    receive_test_hook()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+fn peek_receive_directive(blob_hash: &str) -> Option<ReceiveTestDirective> {
+    let guard = receive_test_hook()
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.get(blob_hash).cloned()
+}
+
 /// Receiver-side node-status writes the watcher emits via
-/// [`peat_protocol::storage::write_receiver_node_status`]. Only the two
-/// states the receiver observes from its own perspective —
-/// `Transferring` once fetch begins, `Completed` once the inbox write
-/// lands atomically.
+/// [`peat_protocol::storage::write_receiver_node_status`].
 ///
-/// The `Failed` variant of [`TransferState`] is intentionally not
-/// modelled here: the v1 inbox watcher retries fetch and write failures
-/// on the next tick rather than treating them as permanent, so the
-/// receiver has no "give up" event to map to `Failed`. A future
-/// give-up mechanism (e.g. retry-budget exhaustion) would extend this
-/// enum.
+/// `Transferring` once fetch begins; `Completed` once the inbox write
+/// lands atomically. `Failed` is normally NOT written by the v1 watcher
+/// — fetch/write failures retry on the next tick rather than being
+/// treated as permanent — and is reachable only through the test
+/// fault seam ([`ReceiveTestDirective::FailFetch`]), which deterministically
+/// drives a single distribution to FAILED for PRD §Testing Plan
+/// test 29. A production retry-budget-exhaustion give-up would also
+/// use this arm.
 enum TransferStateWrite {
     Transferring,
     Completed,
+    /// error string carried into the written `NodeTransferStatus`.
+    Failed(String),
 }
 
 /// Write a receiver's `NodeTransferStatus` into the distribution doc
@@ -346,6 +484,22 @@ fn write_node_status(
                 error: None,
             }
         }
+        TransferStateWrite::Failed(ref msg) => {
+            let started_at = doc
+                .node_statuses
+                .get(own_endpoint_short)
+                .and_then(|s| s.started_at)
+                .or(Some(now));
+            NodeTransferStatus {
+                node_id: own_endpoint_short.to_string(),
+                status: TransferState::Failed,
+                progress_bytes: 0,
+                total_bytes: doc.blob_size,
+                started_at,
+                completed_at: None,
+                error: Some(msg.clone()),
+            }
+        }
     };
 
     write_receiver_node_status(
@@ -361,6 +515,7 @@ fn write_node_status(
         new_status = ?match state {
             TransferStateWrite::Transferring => "Transferring",
             TransferStateWrite::Completed => "Completed",
+            TransferStateWrite::Failed(_) => "Failed",
         },
         "wrote receiver node_status into distribution doc"
     );

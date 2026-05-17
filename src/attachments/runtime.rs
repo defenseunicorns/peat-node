@@ -148,13 +148,30 @@ impl BundleRuntime {
                 Some(s) => s,
                 None => return false,
             };
-            let was_terminal = slot.state.is_terminal();
+            // Terminal is final. Once a distribution reaches
+            // Completed / Failed / Cancelled it is not transitioned
+            // again — a later observation never overwrites the first
+            // terminal, and no second frame is broadcast. This keeps
+            // an explicit Cancel observable as CANCELLED even though
+            // peat-protocol's `cancel()` represents the per-node
+            // transfers as `Failed("Distribution cancelled")`: the
+            // per-distribution watcher observes that broadcast and
+            // would otherwise `apply_progress(Failed)` over the
+            // cancel handler's `apply_progress(Cancelled)`, relabeling
+            // the bundle FAILED (surfaced by PRD §Testing Plan
+            // test 24). Also prevents a late COMPLETED from
+            // un-FAILing a distribution, etc.
+            if slot.state.is_terminal() {
+                return false;
+            }
+            // Reaching here, the slot was non-terminal, so this is a
+            // fresh terminal transition iff the new state is terminal.
             slot.state = new_state;
             slot.bytes_transferred = progress.bytes_transferred;
             slot.bytes_total = progress.bytes_total;
             slot.error = progress.error.clone();
             slot.last_progress = progress.clone();
-            !was_terminal && new_state.is_terminal()
+            new_state.is_terminal()
         };
         if became_terminal {
             self.terminal_count.fetch_add(1, Ordering::AcqRel);
