@@ -208,7 +208,7 @@ impl SidecarNode {
                     endpoint_short,
                     sink,
                     std::time::Duration::from_secs(
-                        config.attachment_config.inbox_poll_secs.max(1) as u64,
+                        config.attachment_config.inbox_poll_secs.max(1) as u64
                     ),
                 );
         }

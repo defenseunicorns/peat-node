@@ -95,11 +95,7 @@ impl ReceiveSink for FilesystemInboxSink {
     /// Copy the blob bytes into `{inbox}/{distribution_id}/{filename}`
     /// via a tmp-file + rename pair so readers never see a partial
     /// file.
-    async fn deliver(
-        &self,
-        doc: &DistributionDocument,
-        blob_path: &Path,
-    ) -> anyhow::Result<()> {
+    async fn deliver(&self, doc: &DistributionDocument, blob_path: &Path) -> anyhow::Result<()> {
         let dir = self.inbox_root.join(&doc.distribution_id);
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -243,7 +239,10 @@ mod tests {
             .await
             .unwrap();
         let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
-        assert!(sink.already_delivered(&doc_with("dist-X", 1024, None)).await);
+        assert!(
+            sink.already_delivered(&doc_with("dist-X", 1024, None))
+                .await
+        );
     }
 
     #[tokio::test]
