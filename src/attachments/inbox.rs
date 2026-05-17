@@ -84,7 +84,8 @@ use chrono::Utc;
 use peat_mesh::storage::blob_traits::{BlobHash, BlobMetadata, BlobStore, BlobToken};
 use peat_mesh::storage::{AutomergeStore, NetworkedIrohBlobStore};
 use peat_protocol::storage::{
-    DistributionDocument, NodeTransferStatus, TransferState, IROH_DISTRIBUTION_COLLECTION,
+    scan_distribution_documents, write_receiver_node_status, DistributionDocument,
+    NodeTransferStatus, TransferState,
 };
 use tracing::{debug, info, warn};
 
@@ -141,30 +142,20 @@ async fn scan_once(
     own_endpoint_short: &str,
     handled: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
-    let collection = document_store.collection(IROH_DISTRIBUTION_COLLECTION);
-    let docs = collection.scan()?;
+    // rc.9+: use the typed peat-protocol API which reads the structured
+    // Automerge document (metadata byte-scalar + node_statuses typed
+    // Map) and reconstructs the in-memory `DistributionDocument`.
+    // Malformed entries are logged and skipped inside the scan helper.
+    let docs = scan_distribution_documents(document_store.as_ref())?;
     debug!(
         doc_count = docs.len(),
         already_handled = handled.len(),
         "inbox sweep"
     );
-    for (doc_id, bytes) in docs {
+    for (doc_id, doc) in docs {
         if handled.contains(&doc_id) {
             continue;
         }
-
-        let doc: DistributionDocument = match serde_json::from_slice(&bytes) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    doc_id = %doc_id,
-                    error = %e,
-                    "skipping malformed distribution document (will not retry)"
-                );
-                handled.insert(doc_id);
-                continue;
-            }
-        };
 
         // Self-skip: distributions this node originated have a
         // registry entry; receivers never do.
@@ -292,10 +283,11 @@ async fn scan_once(
     Ok(())
 }
 
-/// Receiver-side node-status writes the watcher emits into
-/// `DistributionDocument::node_statuses`. Only the two states the
-/// receiver observes from its own perspective — `Transferring` once
-/// fetch begins, `Completed` once the inbox write lands atomically.
+/// Receiver-side node-status writes the watcher emits via
+/// [`peat_protocol::storage::write_receiver_node_status`]. Only the two
+/// states the receiver observes from its own perspective —
+/// `Transferring` once fetch begins, `Completed` once the inbox write
+/// lands atomically.
 ///
 /// The `Failed` variant of [`TransferState`] is intentionally not
 /// modelled here: the v1 inbox watcher retries fetch and write failures
@@ -308,51 +300,38 @@ enum TransferStateWrite {
     Completed,
 }
 
-/// Read-modify-write the distribution document so the sender's
-/// progress watcher (peat-protocol 0.9.0-rc.7+) can observe this
-/// receiver's state. The watcher subscribes to `AutomergeStore`
-/// observer events and re-reads the doc on each change, so this is
-/// the channel that drives `subscribe_progress` frames on the sender.
+/// Write a receiver's `NodeTransferStatus` into the distribution doc
+/// via the typed peat-protocol API. Each receiver writes only to its
+/// own keyed entry in `node_statuses` (a typed Automerge Map on rc.9+),
+/// so concurrent receivers don't collide and a receiver's sequential
+/// writes (Transferring → Completed) are causally ordered against
+/// themselves on the same key.
 ///
-/// Concurrent writes between sender (cancel path) and receiver
-/// (this function) race at the `Collection::upsert` boundary —
-/// `AutomergeCollection` replaces the JSON `"data"` scalar wholesale.
-/// Automerge convergence guarantees no permanent loss; the sender's
-/// watcher reconciles within one tick on either side. A proper
-/// per-key map shape on `node_statuses` is deferred upstream
-/// (peat-protocol).
+/// Replaces the pre-rc.9 inline read-modify-write of the wholesale-
+/// scalar `data` field, which was the substrate-side root of
+/// [defenseunicorns/peat#864](https://github.com/defenseunicorns/peat/issues/864).
 fn write_node_status(
     document_store: &Arc<AutomergeStore>,
     doc: &DistributionDocument,
     own_endpoint_short: &str,
     state: TransferStateWrite,
 ) -> anyhow::Result<()> {
-    let collection = document_store.collection(IROH_DISTRIBUTION_COLLECTION);
-    // Re-read the doc to RMW the latest committed state; the `doc`
-    // argument is the scan-tick snapshot and may be stale relative to
-    // a concurrent sender cancel.
-    let Some(existing) = collection.get(&doc.distribution_id)? else {
-        // Doc was deleted between scan and here — nothing to update.
-        return Ok(());
-    };
-    let mut latest: DistributionDocument = serde_json::from_slice(&existing)?;
-
     let now = Utc::now();
     let ns = match state {
         TransferStateWrite::Transferring => NodeTransferStatus {
             node_id: own_endpoint_short.to_string(),
             status: TransferState::Transferring,
             progress_bytes: 0,
-            total_bytes: latest.blob_size,
+            total_bytes: doc.blob_size,
             started_at: Some(now),
             completed_at: None,
             error: None,
         },
         TransferStateWrite::Completed => {
-            // Preserve started_at if the sender already saw our
-            // Transferring write; otherwise stamp now so the doc has
-            // some timing signal at all.
-            let started_at = latest
+            // Preserve started_at if the scan-tick snapshot saw our
+            // own Transferring write; otherwise stamp now so the doc
+            // has some timing signal at all.
+            let started_at = doc
                 .node_statuses
                 .get(own_endpoint_short)
                 .and_then(|s| s.started_at)
@@ -360,20 +339,22 @@ fn write_node_status(
             NodeTransferStatus {
                 node_id: own_endpoint_short.to_string(),
                 status: TransferState::Completed,
-                progress_bytes: latest.blob_size,
-                total_bytes: latest.blob_size,
+                progress_bytes: doc.blob_size,
+                total_bytes: doc.blob_size,
                 started_at,
                 completed_at: Some(now),
                 error: None,
             }
         }
     };
-    latest
-        .node_statuses
-        .insert(own_endpoint_short.to_string(), ns);
 
-    let bytes = serde_json::to_vec(&latest)?;
-    collection.upsert(&doc.distribution_id, bytes)?;
+    write_receiver_node_status(
+        document_store.as_ref(),
+        &doc.distribution_id,
+        own_endpoint_short,
+        &ns,
+    )?;
+
     debug!(
         distribution_id = %doc.distribution_id,
         node = %own_endpoint_short,
