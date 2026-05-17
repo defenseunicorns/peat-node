@@ -325,24 +325,142 @@ async fn cancel_in_flight_stops_transfer() {}
 
 /// PRD test 25 — `unknown_node_id_marked_failed_after_grace`.
 ///
-/// `NodeList{[nonexistent]}`; assert that after `discovery_grace_secs`,
-/// per-node status is FAILED.
+/// `NodeList{[nonexistent]}` with `--attachment-discovery-grace-secs=2`;
+/// assert that after the grace window the per-node status for the
+/// undiscovered ID is FAILED and the bundle finalizes FAILED.
 ///
-/// **Gap:** the grace-period mechanism is not yet implemented. v1
-/// records `--attachment-discovery-grace-secs` as a config knob but
-/// there is no background task that scans pending NodeList targets for
-/// unresolved IDs and promotes them to FAILED. Currently a
-/// `NodeList{[nonexistent]}` ingest succeeds and the resulting
-/// distribution sits idle with empty node_statuses indefinitely.
+/// Un-ignored 2026-05-17 (#70). The discovery-grace promoter
+/// (`handlers::spawn_discovery_grace_promoter`) now spawns per
+/// NodeList distribution: after `discovery_grace_secs`, any declared
+/// ID with no `node_statuses` entry (never discovered — peat-protocol
+/// `resolve_targets` filtered it out as an unknown peer) is written
+/// `Failed` into the distribution doc via the rc.9 typed API. The
+/// sender's own peat-protocol watcher folds that into the in-memory
+/// `DistributionStatus`; the per-distribution watcher's zero-peer
+/// COMPLETED short-circuit is suppressed for NodeList scopes with
+/// declared IDs, so the FAILED — not a vacuous COMPLETED — is what
+/// drives `maybe_finalize_bundle`.
 ///
-/// Implementation outline for the follow-up: spawn a per-bundle grace
-/// timer on send; when it fires, walk `IrohFileDistribution::status`,
-/// compute the set of declared-but-unconnected targets, and synthesise
-/// FAILED entries into the runtime via `apply_progress`. The watcher's
-/// terminal counter then drives `maybe_finalize_bundle` as today.
+/// Single-node, no real peer needed: the bogus ID never resolves, so
+/// the grace promoter is the only thing that can produce its status.
 #[tokio::test]
-#[ignore = "needs the --attachment-discovery-grace-secs background task (not yet implemented in v1)"]
-async fn unknown_node_id_marked_failed_after_grace() {}
+async fn unknown_node_id_marked_failed_after_grace() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let root_dir = tempfile::tempdir().unwrap();
+    let root_path = root_dir.path().to_path_buf();
+
+    // grace = 2s so the test's poll budget stays small.
+    let attachment_config = AttachmentConfig::from_raw(
+        &[format!("outbox={}", root_path.display())],
+        None,
+        peat_node::attachments::config::DEFAULT_MAX_FILE_BYTES,
+        peat_node::attachments::config::DEFAULT_MAX_BUNDLE_BYTES,
+        peat_node::attachments::config::DEFAULT_MAX_FILES_PER_BUNDLE,
+        peat_node::attachments::config::DEFAULT_MAX_NODE_LIST_LEN,
+        peat_node::attachments::config::DEFAULT_MAX_CONCURRENT_DISTRIBUTIONS,
+        peat_node::attachments::config::DEFAULT_QUEUE_WHEN_FULL,
+        AttachmentPriorityCli::Routine,
+        2, // discovery_grace_secs
+        peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
+        peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
+        peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+    )
+    .unwrap();
+
+    let node = Arc::new(
+        SidecarNode::new(SidecarConfig {
+            node_id: "grace-test".into(),
+            app_id: "test".into(),
+            shared_key: String::new(),
+            data_dir: data_dir.keep(),
+            peers: vec![],
+            encryption_key: None,
+            iroh_udp_port: None,
+            attachment_config,
+        })
+        .await
+        .unwrap(),
+    );
+
+    // SendAttachments with NodeList{["bogus-never-connects"]}.
+    let payload = b"grace-promoter-test";
+    std::fs::write(root_path.join("g.bin"), payload).unwrap();
+    let mut h = Sha256::new();
+    h.update(payload);
+    let send_req = pb::SendAttachmentsRequest {
+        files: vec![pb::FileSpec {
+            root_name: "outbox".into(),
+            relative_path: "g.bin".into(),
+            size_bytes: payload.len() as u64,
+            sha256: h.finalize().to_vec(),
+            ..Default::default()
+        }],
+        scope: buffa::MessageField::some(pb::DistributionScopeSpec {
+            scope: Some(pb::distribution_scope_spec::Scope::NodeList(Box::new(
+                pb::NodeListScope {
+                    node_ids: vec!["bogus-never-connects".to_string()],
+                    ..Default::default()
+                },
+            ))),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let resp = handlers::send_attachments(&node, send_req)
+        .await
+        .expect("SendAttachments with NodeList{[bogus]} must succeed (PRD Rule 10: unknown IDs tolerated at request time)");
+    let distribution_id = resp.handles[0].distribution_id.clone();
+    assert!(!distribution_id.is_empty());
+
+    // Poll GetAttachmentDistribution until the bogus node shows FAILED.
+    // grace=2s + a margin; if it never flips the panic surfaces the
+    // last-seen status so a promoter regression is obvious.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let got = handlers::get_attachment_distribution(
+            &node,
+            pb::GetAttachmentDistributionRequest {
+                distribution_id: distribution_id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("GetAttachmentDistribution must resolve the just-sent distribution");
+
+        let bogus = got
+            .per_node
+            .iter()
+            .find(|n| n.node_id == "bogus-never-connects");
+        let bogus_failed = bogus.map(|n| n.status.as_known())
+            == Some(Some(pb::DistributionStatus::DISTRIBUTION_STATUS_FAILED));
+        let dist_failed =
+            got.status.as_known() == Some(pb::DistributionStatus::DISTRIBUTION_STATUS_FAILED);
+
+        if bogus_failed && dist_failed {
+            // PRD Rule 10 acceptance: per-node FAILED for the
+            // undiscovered ID + bundle-level FAILED finalization.
+            // (The proto NodeTransferState carries no error string —
+            // node_id/status/bytes_transferred only — so the
+            // grace-expiry reason isn't wire-asserted here.)
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "discovery-grace promoter never marked `bogus-never-connects` \
+                 FAILED within 8s (grace=2s). Last-seen: dist_status={:?}, \
+                 per_node={:?}. A regression here means the grace promoter \
+                 didn't spawn / didn't write, or the zero-peer COMPLETED \
+                 short-circuit fired for a NodeList scope and vacuously \
+                 finalized the bundle before grace.",
+                got.status.as_known(),
+                got.per_node
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
 
 /// PRD test 29 — `subscribe_mixed_state_emits_snapshot_for_terminal_then_live_for_inflight`.
 ///
