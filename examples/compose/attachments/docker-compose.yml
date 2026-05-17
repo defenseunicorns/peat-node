@@ -21,11 +21,13 @@
 
 services:
   peat-node:
-    # Published v0.2.0 — first release with the PRD-006 attachment
-    # surface + receive-side delivery. For testing changes ahead of a
-    # release, comment out the `image:` line and uncomment the `build:`
-    # block to build from the repo root.
-    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    # Published v0.3.0 — completes the PRD-006 cross-peer progress
+    # contract (closes peat#864). v0.2.x has the substrate bug where
+    # the sender's SubscribeAttachmentBundle never sees a terminal
+    # frame; use v0.3.0+ for the delivery demo. For testing changes
+    # ahead of a release, comment out the `image:` line and uncomment
+    # the `build:` block to build from the repo root.
+    image: ghcr.io/defenseunicorns/peat-node:v0.3.0
     # build:
     #   context: ../../..
     container_name: peat-node-attachments

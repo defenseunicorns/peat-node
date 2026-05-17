@@ -16,7 +16,7 @@ services:
   peat-node-a:
     # Latest published release. For testing changes ahead of a release, comment
     # this out and uncomment the `build:` block to build from the repo root.
-    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    image: ghcr.io/defenseunicorns/peat-node:v0.3.0
     # build:
     #   context: ../..
     container_name: peat-node-a
@@ -40,7 +40,7 @@ services:
       - peat-node-a-data:/data/peat-node
 
   peat-node-b:
-    image: ghcr.io/defenseunicorns/peat-node:v0.2.0
+    image: ghcr.io/defenseunicorns/peat-node:v0.3.0
     # build:
     #   context: ../..
     container_name: peat-node-b

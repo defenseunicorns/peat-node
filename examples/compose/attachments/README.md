@@ -13,13 +13,16 @@ The single-node setup below is the per-size benchmark for sender-side
 ingest. **For the real delivery demo, jump to "Two-node delivery"
 below.**
 
-> **Uses published `v0.2.0` image by default.** The PRD-006 attachment
-> surface first shipped in `v0.2.0`; earlier `v0.1.x` images predate
-> it and fail with `unimplemented: method not found`. To test local
-> changes ahead of a release, comment out the `image:` line and
-> uncomment the `build:` block in `docker-compose.yml` (or
-> `docker-compose.two-node.yml` for the cross-peer demo) to build from
-> the repo root.
+> **Uses published `v0.3.0` image by default.** The PRD-006 attachment
+> surface first shipped in `v0.2.0`, but `v0.2.x` carries the peat#864
+> substrate bug: the sender's `SubscribeAttachmentBundle` stream stalls
+> one frame short of terminal on a real cross-peer transfer. `v0.3.0`
+> closes that end-to-end, so the two-node delivery demo needs `v0.3.0+`.
+> Earlier `v0.1.x` images predate PRD-006 entirely and fail with
+> `unimplemented: method not found`. To test local changes ahead of a
+> release, comment out the `image:` line and uncomment the `build:`
+> block in `docker-compose.yml` (or `docker-compose.two-node.yml` for
+> the cross-peer demo) to build from the repo root.
 
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the
@@ -92,7 +95,7 @@ ls inbox-b/                                # files appear here per distribution_
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
-(Pulls `ghcr.io/defenseunicorns/peat-node:v0.2.0`. For testing local
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.3.0`. For testing local
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 
