@@ -95,7 +95,14 @@ A session in this repo is not done until each of these produces evidence:
 
 Add an entry each time a session produces output that needed correction. One line per gotcha plus a `Why:` line.
 
-- *(none recorded yet)*
+- Read/write `IROH_DISTRIBUTION_COLLECTION` docs only via `peat_protocol::storage::{read_distribution_document, scan_distribution_documents, write_receiver_node_status}` — never `collection.get/scan` + `serde_json`.
+  Why: as of peat-protocol 0.9.0-rc.9 the on-wire shape is structured Automerge (`ROOT.metadata` byte-scalar + typed `ROOT.node_statuses` Map), not a single JSON `ROOT.data` scalar; the old access pattern returns `None`/garbage against rc.9 docs and the inline wholesale RMW was the substrate root of peat#864.
+- The four iroh two-node integration tests (`end_to_end_attachment_delivery_two_nodes`, `node_list_scope_only_delivers_to_listed_nodes`, `receiver_writes_node_status_into_distribution_doc`, `subscribe_emits_progress_then_terminal`) must carry `#[serial_test::serial(iroh_two_node)]`.
+  Why: `cargo test` runs tests within a binary in parallel; each of these spins up a `#[tokio::test(flavor = "multi_thread")]` runtime + two real iroh endpoints, and the CPU contention deterministically stalls PRD-006 test 23's 60s budget on CI runners (cost: a closed PR #77 and three CI-fail rounds before the cause was nailed).
+- Local `protoc` must support proto3 optional; the distro `protobuf-compiler` (3.12.x) does not. Install a prebuilt protoc ≥25 to `~/.local/bin` and pass `PROTOC=$HOME/.local/bin/protoc` to cargo.
+  Why: `build.rs` runs `connectrpc_build` over `proto/sidecar.proto` which uses proto3 optional; an old protoc fails the build with `--experimental_allow_proto3_optional was not set`. CI installs a current protoc; local dev usually doesn't.
+- The receiver-side contract is independently testable from the receiver's *local* Automerge doc — don't gate its test solely on the sender's `subscribe_progress` stream.
+  Why: `receiver_writes_node_status_into_distribution_doc` reads the receiver's own doc via `read_distribution_document`, isolating peat-node's write contract from upstream sender-observation races; this is what made the peat#864 bisect tractable.
 
 ## References (read on demand, not by default)
 
