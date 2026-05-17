@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-17
+
+Closes [defenseunicorns/peat#864](https://github.com/defenseunicorns/peat/issues/864)
+end-to-end: the attachment receive path now records per-receiver
+transfer status through `peat-protocol` 0.9.0-rc.9's typed
+`node_statuses` Automerge-Map API, so a sender's
+`SubscribeAttachmentBundle` stream reliably observes
+`IN_PROGRESS → terminal` for real cross-peer transfers.
+
+Minor bump (not patch) because this pulls in a **BREAKING wire-format
+change** on the synced `file_distributions` collection — see Migration.
+
+### Changed
+
+- **Attachment inbox watcher consumes the `peat-protocol` 0.9.0-rc.9
+  typed distribution-doc API (#78).** `attachments::inbox` now reads
+  via `scan_distribution_documents` and writes per-receiver status via
+  `write_receiver_node_status` (typed `ROOT.node_statuses` Automerge
+  Map, per-key, lock-guarded) instead of the pre-rc.9 inline
+  wholesale-scalar read-modify-write of `ROOT.data`. Dependency floor:
+  `peat-protocol >=0.9.0-rc.9` (peat-mesh stays `=0.9.0-rc.10`).
+- **Receiver writes its own `NodeTransferStatus` into the distribution
+  document (#76)** on `Transferring` (pre-fetch) and `Completed`
+  (post atomic-rename), which is what makes the sender-side progress
+  watcher observable.
+
+### Added
+
+- PRD-006 test 23 (`subscribe_emits_progress_then_terminal`) and the
+  receiver-local doc-state regression
+  (`receiver_writes_node_status_into_distribution_doc`) un-ignored and
+  passing against published `peat-protocol 0.9.0-rc.9` (#78).
+- PRD-006 test 22 — `NodeList` scope only delivers to listed nodes
+  (#73); `receiver_can_fetch_blob_pushed_by_sender` un-ignored (#72).
+- `#[serial_test::serial(iroh_two_node)]` on the four iroh two-node
+  integration tests so cargo's default per-binary parallelism can't
+  CPU-starve their multi-second budgets (#78).
+
+### Migration (BREAKING — mesh interop)
+
+`peat-node 0.3.0` runs on `peat-protocol 0.9.0-rc.9`, whose
+`file_distributions` Automerge collection uses a typed schema
+(`ROOT.metadata` byte-scalar + typed `ROOT.node_statuses` Map) instead
+of the pre-rc.9 single wholesale-scalar `ROOT.data`. A 0.3.0 node
+**dual-reads** a legacy (≤0.2.0) document, but a ≤0.2.0 node **cannot**
+read a 0.3.0-written document. In a mixed mesh that exercises the
+attachment subsystem (`--attachment-root` set), upgrade all peat-node
+instances together; do not run 0.3.0 and ≤0.2.0 side-by-side on a
+formation that uses attachments. Operators not using attachments are
+unaffected (the subsystem is opt-in and disabled by default).
+
+### Packaging
+
+- Helm chart `version`/`appVersion` and `values.yaml` image tag bumped
+  to `0.3.0` / `v0.3.0`.
+- `zarf.yaml` corrected: it was stale at `0.1.0` (two minors behind)
+  and its image ref lacked the `v` prefix the release workflow
+  actually pushes (`:vX.Y.Z`). Now `0.3.0` / `:v0.3.0` across
+  metadata, image, and chart version.
+
 ## [0.2.0] - 2026-05-14
 
 ### Added
