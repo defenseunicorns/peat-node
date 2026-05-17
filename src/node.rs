@@ -150,7 +150,14 @@ impl SidecarNode {
             handle_retention_secs: config.attachment_config.handle_retention_secs,
             max_known_bundles: config.attachment_config.max_known_bundles,
         }));
-        let file_distribution = if config.attachment_config.has_roots() {
+        // Construct the distribution substrate when either send
+        // (roots) or receive (inbox) is configured: the receive-side
+        // watcher (#68) is owned by `IrohFileDistribution` and a
+        // receive-only node still needs the instance (its in-memory
+        // `distributions` map stays empty — nothing to self-skip).
+        let file_distribution = if config.attachment_config.has_roots()
+            || config.attachment_config.inbox_path.is_some()
+        {
             Some(Arc::new(IrohFileDistribution::new(
                 Arc::clone(backend.blob_store()),
                 Arc::clone(backend.store()),
@@ -191,16 +198,19 @@ impl SidecarNode {
         // and writes them to the inbox.
         if let Some(ref inbox_path) = config.attachment_config.inbox_path {
             let endpoint_short = backend.blob_store().endpoint_id().fmt_short().to_string();
-            crate::attachments::inbox::spawn_inbox_watcher(
-                Arc::clone(backend.store()),
-                Arc::clone(backend.blob_store()),
-                Arc::clone(&bundle_registry),
+            let sink = std::sync::Arc::new(crate::attachments::inbox::FilesystemInboxSink::new(
                 inbox_path.clone(),
-                endpoint_short,
-                std::time::Duration::from_secs(
-                    config.attachment_config.inbox_poll_secs.max(1) as u64
-                ),
-            );
+            ));
+            file_distribution
+                .as_ref()
+                .expect("file_distribution is Some when inbox_path is configured")
+                .start_receive_watcher(
+                    endpoint_short,
+                    sink,
+                    std::time::Duration::from_secs(
+                        config.attachment_config.inbox_poll_secs.max(1) as u64,
+                    ),
+                );
         }
 
         Ok(Self {
