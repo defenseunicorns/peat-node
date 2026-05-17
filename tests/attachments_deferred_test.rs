@@ -29,6 +29,9 @@ use base64::Engine;
 use futures::StreamExt;
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::attachments::handlers;
+use peat_node::attachments::inbox::{
+    clear_receive_test_directives, set_receive_test_directive, ReceiveTestDirective,
+};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb;
 use peat_node::pb::PeatSidecarExt;
@@ -319,9 +322,148 @@ async fn subscribe_emits_progress_then_terminal() {
 /// fetch, OS-level traffic shaping (`tc netem`, brittle in CI), or a
 /// tokio sleep injection into the receiver's `BlobStore::fetch_blob` path.
 /// All three are non-trivial design decisions deferred from this PR.
-#[tokio::test]
-#[ignore = "needs a bandwidth-controlled receiver fixture (peat-node-only design decision)"]
-async fn cancel_in_flight_stops_transfer() {}
+/// Un-ignored 2026-05-17 (#71). The receive-path test seam
+/// (`inbox::ReceiveTestDirective::HoldInFlight`) holds the receiver
+/// in the in-flight state after it writes `Transferring`, giving a
+/// deterministic window to cancel into — no OS traffic shaping or mock
+/// blob store. Cancel is sender-side: `CancelAttachmentDistribution`
+/// flips the registry to `Cancelled` and `GetAttachmentDistribution`
+/// returns CANCELLED via the terminal-precedence branch, so the
+/// assertion is independent of the (paused) receiver; the pause only
+/// guarantees the cancel is genuinely *mid-flight* (IN_PROGRESS, not
+/// already terminal). On wake the paused receiver re-reads the doc,
+/// sees status != "distributing", and skips delivery — so it can't
+/// race a Completed over the CANCELLED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
+async fn cancel_in_flight_stops_transfer() {
+    const A_GRPC: u16 = 50171;
+    const A_IROH: u16 = 51271;
+    const B_GRPC: u16 = 50172;
+    const B_IROH: u16 = 51272;
+
+    clear_receive_test_directives();
+    let a = boot(A_GRPC, A_IROH, "sender", false).await;
+    let b = boot(B_GRPC, B_IROH, "receiver", true).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let sa = call(&http, &a.base, "GetStatus", serde_json::json!({})).await;
+    let sb = call(&http, &b.base, "GetStatus", serde_json::json!({})).await;
+    let ea = sa["endpointAddr"].as_str().unwrap().to_string();
+    let eb = sb["endpointAddr"].as_str().unwrap().to_string();
+    call(
+        &http,
+        &b.base,
+        "ConnectPeer",
+        serde_json::json!({ "endpointId": ea, "addresses": [format!("127.0.0.1:{A_IROH}")] }),
+    )
+    .await;
+    call(
+        &http,
+        &a.base,
+        "ConnectPeer",
+        serde_json::json!({ "endpointId": eb, "addresses": [format!("127.0.0.1:{B_IROH}")] }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    call(&http, &a.base, "StartSync", serde_json::json!({})).await;
+    call(&http, &b.base, "StartSync", serde_json::json!({})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let payload = b"cancel-in-flight-test payload".to_vec();
+    let hash = sha256_of(&payload);
+    std::fs::write(a.root_path.join("cancel.bin"), &payload).unwrap();
+    let resp = call(
+        &http,
+        &a.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "cancel.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "allNodes": {} }
+        }),
+    )
+    .await;
+    let distribution_id = resp["handles"][0]["distributionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blob_token = resp["handles"][0]["blobToken"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Arm the receiver to pause in-flight. Safe to arm now (post-send):
+    // the distribution doc still has to CRDT-sync A→B and B's scan tick
+    // (~1s) to fire before B consults the seam — well after this set.
+    set_receive_test_directive(&blob_token, ReceiveTestDirective::HoldInFlight);
+
+    // Wait until A observes IN_PROGRESS (B wrote Transferring, synced
+    // back) — i.e. the transfer is genuinely mid-flight.
+    // Generous: the deferred suite runs serially (`#[serial]`), so this
+    // can execute on a loaded box after the other two-node tests; the
+    // *assertion* (cancel → CANCELLED in 1s) is sender-local and fast,
+    // this only waits for the receiver to reach IN_PROGRESS first.
+    let inflight_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let body = call(
+            &http,
+            &a.base,
+            "GetAttachmentDistribution",
+            serde_json::json!({ "distributionId": distribution_id }),
+        )
+        .await;
+        if body.get("status").and_then(|v| v.as_str()) == Some("DISTRIBUTION_STATUS_IN_PROGRESS") {
+            break;
+        }
+        if Instant::now() >= inflight_deadline {
+            panic!(
+                "distribution never reached IN_PROGRESS (mid-flight) — \
+                 cannot test mid-flight cancel. Last body: {body}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Cancel mid-flight, then assert CANCELLED within 1s.
+    call(
+        &http,
+        &a.base,
+        "CancelAttachmentDistribution",
+        serde_json::json!({ "distributionId": distribution_id }),
+    )
+    .await;
+    let cancel_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let body = call(
+            &http,
+            &a.base,
+            "GetAttachmentDistribution",
+            serde_json::json!({ "distributionId": distribution_id }),
+        )
+        .await;
+        if body.get("status").and_then(|v| v.as_str()) == Some("DISTRIBUTION_STATUS_CANCELLED") {
+            break;
+        }
+        if Instant::now() >= cancel_deadline {
+            panic!(
+                "PRD §test 24: status did not flip to CANCELLED within 1s \
+                 of CancelAttachmentDistribution. Last-seen: {body}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    clear_receive_test_directives();
+    drop((a, b));
+}
 
 /// PRD test 25 — `unknown_node_id_marked_failed_after_grace`.
 ///
@@ -481,6 +623,199 @@ async fn unknown_node_id_marked_failed_after_grace() {
 /// distributions instead of Completed+Failed). The mixed-state ordering
 /// (snapshot before live) is exercised in unit tests on the
 /// `StreamCloser` adapter and `BundleRuntime::per_distribution_snapshot`.
-#[tokio::test]
-#[ignore = "needs a fault-injection hook to drive a single distribution to FAILED"]
-async fn subscribe_mixed_state_emits_snapshot_for_terminal_then_live_for_inflight() {}
+/// Un-ignored 2026-05-17 (#71). The receive-path test seam drives the
+/// mixed state: file 1's blob is armed `FailFetch` (receiver writes a
+/// Failed node_status instead of fetching → that distribution goes
+/// terminal FAILED) while file 2 is armed `HoldInFlight`
+/// (receiver writes Transferring then holds → that distribution stays
+/// IN_PROGRESS). A late subscriber must then see, per the
+/// SubscribeAttachmentBundle late-subscribe contract: the *snapshot*
+/// frame for the already-terminal distribution (file 1, FAILED) before
+/// any *live* frame for the still-in-flight distribution (file 2,
+/// IN_PROGRESS).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
+async fn subscribe_mixed_state_emits_snapshot_for_terminal_then_live_for_inflight() {
+    const A_GRPC: u16 = 50181;
+    const A_IROH: u16 = 51281;
+    const B_GRPC: u16 = 50182;
+    const B_IROH: u16 = 51282;
+
+    clear_receive_test_directives();
+    let a = boot(A_GRPC, A_IROH, "sender", false).await;
+    let b = boot(B_GRPC, B_IROH, "receiver", true).await;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let sa = call(&http, &a.base, "GetStatus", serde_json::json!({})).await;
+    let sb = call(&http, &b.base, "GetStatus", serde_json::json!({})).await;
+    let ea = sa["endpointAddr"].as_str().unwrap().to_string();
+    let eb = sb["endpointAddr"].as_str().unwrap().to_string();
+    call(
+        &http,
+        &b.base,
+        "ConnectPeer",
+        serde_json::json!({ "endpointId": ea, "addresses": [format!("127.0.0.1:{A_IROH}")] }),
+    )
+    .await;
+    call(
+        &http,
+        &a.base,
+        "ConnectPeer",
+        serde_json::json!({ "endpointId": eb, "addresses": [format!("127.0.0.1:{B_IROH}")] }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    call(&http, &a.base, "StartSync", serde_json::json!({})).await;
+    call(&http, &b.base, "StartSync", serde_json::json!({})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Two distinct files in one bundle.
+    let p1 = b"mixed-state file ONE (will be FAILED via fault seam)".to_vec();
+    let p2 = b"mixed-state file TWO (held IN_PROGRESS via pause seam)".to_vec();
+    let h1 = sha256_of(&p1);
+    let h2 = sha256_of(&p2);
+    std::fs::write(a.root_path.join("m1.bin"), &p1).unwrap();
+    std::fs::write(a.root_path.join("m2.bin"), &p2).unwrap();
+    let resp = call(
+        &http,
+        &a.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [
+                { "rootName": "outbox", "relativePath": "m1.bin", "sizeBytes": p1.len(), "sha256": b64(&h1) },
+                { "rootName": "outbox", "relativePath": "m2.bin", "sizeBytes": p2.len(), "sha256": b64(&h2) },
+            ],
+            "scope": { "allNodes": {} }
+        }),
+    )
+    .await;
+    let bundle_id = resp["bundleId"].as_str().unwrap().to_string();
+    let handles = resp["handles"].as_array().unwrap();
+    assert_eq!(
+        handles.len(),
+        2,
+        "expected 2 handles, got {}",
+        handles.len()
+    );
+    // Handles preserve the request's file order through ingest;
+    // index positionally (proto3-JSON omits `fileIndex` when 0).
+    let (dist1, blob1) = (
+        handles[0]["distributionId"].as_str().unwrap().to_string(),
+        handles[0]["blobToken"].as_str().unwrap().to_string(),
+    );
+    let (dist2, blob2) = (
+        handles[1]["distributionId"].as_str().unwrap().to_string(),
+        handles[1]["blobToken"].as_str().unwrap().to_string(),
+    );
+
+    set_receive_test_directive(
+        &blob1,
+        ReceiveTestDirective::FailFetch("fault-injected for PRD test 29".to_string()),
+    );
+    set_receive_test_directive(&blob2, ReceiveTestDirective::HoldInFlight);
+
+    // Wait until A's view shows dist1 FAILED and dist2 IN_PROGRESS.
+    let setup_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let b1 = call(
+            &http,
+            &a.base,
+            "GetAttachmentDistribution",
+            serde_json::json!({ "distributionId": dist1 }),
+        )
+        .await;
+        let b2 = call(
+            &http,
+            &a.base,
+            "GetAttachmentDistribution",
+            serde_json::json!({ "distributionId": dist2 }),
+        )
+        .await;
+        let s1 = b1.get("status").and_then(|v| v.as_str());
+        let s2 = b2.get("status").and_then(|v| v.as_str());
+        if s1 == Some("DISTRIBUTION_STATUS_FAILED") && s2 == Some("DISTRIBUTION_STATUS_IN_PROGRESS")
+        {
+            break;
+        }
+        if Instant::now() >= setup_deadline {
+            panic!("mixed state never set up: dist1(FAILED?)={s1:?} dist2(IN_PROGRESS?)={s2:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Late-subscribe while the mixed state holds: dist1 already
+    // terminal (FAILED), dist2 still in-flight (held IN_PROGRESS).
+    // Contract: the subscribe handler subscribes to the live broadcast
+    // FIRST, then emits a synthetic *snapshot* frame for each
+    // already-terminal distribution (dist1 FAILED) — chained ahead of
+    // any live frame. Non-terminal distributions are NOT snapshotted;
+    // they surface via the live stream as they progress.
+    let mut stream = handlers::subscribe_attachment_bundle(
+        &a.node,
+        pb::SubscribeAttachmentBundleRequest {
+            bundle_id: bundle_id.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("subscribe_attachment_bundle must succeed");
+
+    // Release dist2's hold AFTER subscribing. A stably-held IN_PROGRESS
+    // distribution emits no further progress events, so a late
+    // subscriber would legitimately never get a live frame for it —
+    // the contract delivers in-flight distributions via the live
+    // stream, which only fires on a state change. Releasing lets the
+    // receiver fetch+complete dist2, producing the post-subscribe live
+    // frame(s) the contract is about. dist1 is already FAILED + handled
+    // by the receiver, so clearing directives doesn't disturb it.
+    clear_receive_test_directives();
+
+    let mut dist1_failed_idx: Option<usize> = None;
+    let mut first_dist2_idx: Option<usize> = None;
+    let mut idx = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && (dist1_failed_idx.is_none() || first_dist2_idx.is_none()) {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Ok(Some(Ok(frame))) => {
+                if frame.distribution_id == dist1
+                    && distribution_status(&frame)
+                        == Some(pb::DistributionStatus::DISTRIBUTION_STATUS_FAILED)
+                    && dist1_failed_idx.is_none()
+                {
+                    dist1_failed_idx = Some(idx);
+                }
+                // Any live frame for dist2 (it progresses
+                // IN_PROGRESS→COMPLETED once the hold is released);
+                // the contract point is that it arrives *after* the
+                // terminal snapshot, not its specific status.
+                if frame.distribution_id == dist2 && first_dist2_idx.is_none() {
+                    first_dist2_idx = Some(idx);
+                }
+                idx += 1;
+            }
+            Ok(Some(Err(e))) => panic!("subscribe stream error frame: {e:?}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+
+    let f1 = dist1_failed_idx.expect(
+        "PRD §test 29: expected a snapshot frame for the already-terminal \
+         distribution (file 1, FAILED)",
+    );
+    let f2 = first_dist2_idx.expect(
+        "PRD §test 29: expected a live frame for the in-flight \
+         distribution (file 2) after releasing its hold",
+    );
+    assert!(
+        f1 < f2,
+        "PRD §test 29: terminal snapshot frame (file 1 FAILED, idx={f1}) \
+         must precede the first live frame for the in-flight \
+         distribution (file 2, idx={f2}) per the late-subscribe contract"
+    );
+
+    drop((a, b));
+}
