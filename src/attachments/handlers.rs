@@ -21,12 +21,16 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use connectrpc::ConnectError;
 use futures::stream::{Stream, StreamExt};
+use peat_mesh::storage::AutomergeStore;
 use peat_protocol::storage::file_distribution::{
     DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
     TransferPriority, TransferState,
 };
+use peat_protocol::storage::{read_distribution_document, write_receiver_node_status};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
@@ -64,6 +68,19 @@ pub async fn send_attachments(
 
     // 1. Validate (PRD rules 1-10 minus the bits owned by ingest / registry).
     let validated = validate::validate_request(&request, cfg)?;
+
+    // PRD Rule 10: a NodeList scope records its declared node_ids even
+    // for IDs that aren't known peers yet. peat-protocol's
+    // resolve_targets filters unknown IDs out (they never enter the
+    // distribution doc's node_statuses), so peat-node owns the
+    // discovery-grace promotion: capture the declared list here, before
+    // `validated` is moved into ingest, so the per-distribution grace
+    // timer can fail still-undiscovered IDs after the grace window.
+    let declared_node_list: Option<Vec<String>> = match &validated.scope {
+        validate::ValidatedScope::NodeList(ids) => Some(ids.clone()),
+        _ => None,
+    };
+    let discovery_grace = Duration::from_secs(cfg.discovery_grace_secs as u64);
 
     // 2. Concurrency cap (PRD rule 11). v1 reject-only; queue_when_full
     //    queue path is deferred.
@@ -167,6 +184,11 @@ pub async fn send_attachments(
     let runtime = node.bundle_runtime().register(&bundle_id, runtime_slots);
 
     for h in &handles {
+        let bytes_total = ingested
+            .iter()
+            .find(|ib| ib.file_index == h.file_index)
+            .map(|ib| ib.blob_token.size_bytes)
+            .unwrap_or(0);
         spawn_distribution_watcher(
             Arc::clone(file_distribution),
             Arc::clone(node.bundle_registry()),
@@ -175,7 +197,26 @@ pub async fn send_attachments(
             h.file_index,
             h.distribution_handle.clone(),
             h.blob_token_hash.clone(),
+            declared_node_list.clone(),
         );
+
+        // PRD Rule 10 discovery-grace promoter: for a NodeList scope,
+        // any declared ID still undiscovered (no node_statuses entry)
+        // when the grace window elapses is written FAILED into the
+        // distribution doc. The sender's own peat-protocol watcher
+        // observes that write, folds it into the in-memory
+        // DistributionStatus, and the existing per-distribution watcher
+        // (above) drives runtime/maybe_finalize as for any other
+        // terminal — no separate finalize path.
+        if let Some(ids) = declared_node_list.clone() {
+            spawn_discovery_grace_promoter(
+                Arc::clone(node.document_store()),
+                h.distribution_handle.distribution_id.clone(),
+                ids,
+                discovery_grace,
+                bytes_total,
+            );
+        }
     }
 
     Ok(build_response(&bundle_id, &handles))
@@ -496,6 +537,10 @@ fn is_terminal_status(s: buffa::EnumValue<pb::DistributionStatus>) -> bool {
 /// Spawn a watcher task for one distribution. Translates peat-protocol
 /// progress updates into `AttachmentProgress` frames, updates the runtime
 /// state, and bumps the registry's BundleStatus on terminal transitions.
+// Per-distribution identity tuple + the NodeList declared-IDs hint;
+// grouping into a struct would be ceremony for a single internal
+// spawn site. Same rationale as `AttachmentConfig::from_raw`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_distribution_watcher(
     file_distribution: Arc<IrohFileDistribution>,
     registry: Arc<BundleRegistry>,
@@ -504,8 +549,23 @@ fn spawn_distribution_watcher(
     file_index: usize,
     distribution_handle: DistributionHandle,
     blob_token_hash: String,
+    declared_node_list: Option<Vec<String>>,
 ) {
     tokio::spawn(async move {
+        // A NodeList scope with declared IDs is never "vacuously
+        // complete": IDs that didn't resolve to known peers are
+        // filtered out of peat-protocol's target_nodes (so
+        // total_targets can be 0 even though the operator declared
+        // targets), but PRD Rule 10 says those become per-node FAILED
+        // after the discovery-grace window — not COMPLETED. The
+        // grace promoter (spawned alongside this watcher) writes those
+        // FAILED entries into the distribution doc; suppressing the
+        // zero-peer short-circuit here lets the normal forward loop
+        // observe them and drive the real terminal state.
+        let nodelist_has_declared_ids = declared_node_list
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty());
+
         // Initial status check. peat-protocol considers a distribution
         // "complete" when `completed + failed >= total_targets`, which
         // is *immediately* true for zero-peer scopes (total_targets=0).
@@ -513,7 +573,7 @@ fn spawn_distribution_watcher(
         // so subscribers don't wait forever for an event the substrate
         // never emits.
         match file_distribution.status(&distribution_handle).await {
-            Ok(s) if s.total_targets == 0 => {
+            Ok(s) if s.total_targets == 0 && !nodelist_has_declared_ids => {
                 // Zero-peer distribution. peat-protocol's `is_complete`
                 // returns true here; map to COMPLETED (no peers to
                 // succeed or fail). The PRD §v1-honesty rule says
@@ -613,6 +673,88 @@ fn spawn_distribution_watcher(
         }
 
         maybe_finalize_bundle(&registry, &runtime, &bundle_id);
+    });
+}
+
+/// PRD-006 Rule 10 discovery-grace promoter.
+///
+/// `NodeListScope` tolerates unknown node IDs at request time so an
+/// operator can address tactical-edge peers that haven't connected
+/// yet. peat-protocol's `resolve_targets` filters those unknown IDs
+/// out of the distribution doc's `target_nodes` (they never enter
+/// `node_statuses`), so peat-node owns the eventual FAILED promotion:
+/// after `grace`, any declared ID that still has no `node_statuses`
+/// entry (never discovered) is written `Failed` into the distribution
+/// doc via the rc.9 typed API. The sender's own peat-protocol watcher
+/// observes that write, merges it into the in-memory
+/// `DistributionStatus`, and the per-distribution watcher's normal
+/// forward loop drives runtime + `maybe_finalize_bundle` — no separate
+/// finalize path here.
+///
+/// One-shot per PRD §v1.1: a peer that connects *after* grace is not
+/// re-promoted (re-discovery/retry is a v2 concern). An ID that *does*
+/// have a `node_statuses` entry by grace expiry (Connecting /
+/// Transferring / Completed) was discovered and is left to the normal
+/// transfer path — the grace window is about discovery, not transfer
+/// speed.
+fn spawn_discovery_grace_promoter(
+    document_store: Arc<AutomergeStore>,
+    distribution_id: String,
+    declared_ids: Vec<String>,
+    grace: Duration,
+    total_bytes: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+
+        let doc = match read_distribution_document(document_store.as_ref(), &distribution_id) {
+            Ok(Some(d)) => d,
+            // Doc gone (bundle evicted, or never persisted) — nothing
+            // to promote.
+            Ok(None) => return,
+            Err(e) => {
+                warn!(
+                    distribution_id = %distribution_id,
+                    error = %e,
+                    "grace promoter: failed to read distribution doc"
+                );
+                return;
+            }
+        };
+
+        // Cancelled within the grace window — cancel owns the terminal
+        // state; don't overwrite it with FAILED.
+        if doc.status != "distributing" {
+            return;
+        }
+
+        for id in &declared_ids {
+            // Entry exists → the peer was discovered (any of
+            // Connecting/Transferring/Completed). Discovery succeeded;
+            // leave its outcome to the normal transfer path.
+            if doc.node_statuses.contains_key(id) {
+                continue;
+            }
+            let ns = NodeTransferStatus {
+                node_id: id.clone(),
+                status: TransferState::Failed,
+                progress_bytes: 0,
+                total_bytes,
+                started_at: None,
+                completed_at: None,
+                error: Some("discovery grace expired: peer never connected".to_string()),
+            };
+            if let Err(e) =
+                write_receiver_node_status(document_store.as_ref(), &distribution_id, id, &ns)
+            {
+                warn!(
+                    distribution_id = %distribution_id,
+                    node = %id,
+                    error = %e,
+                    "grace promoter: failed to write FAILED node_status"
+                );
+            }
+        }
     });
 }
 
