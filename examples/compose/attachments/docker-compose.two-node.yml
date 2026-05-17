@@ -26,13 +26,15 @@
 
 services:
   peat-node-a:
-    # Published v0.3.0 — completes the PRD-006 cross-peer progress
-    # contract (closes peat#864); the two-node delivery demo needs
-    # v0.3.0+ because v0.2.x's substrate bug stalls the sender's
+    # Published v0.3.1 — the PRD-006 cross-peer progress contract
+    # (closes peat#864) shipped in v0.3.0 and is unchanged here;
+    # v0.3.1 relocates the receive lifecycle into peat-protocol with
+    # no behavior change. The two-node delivery demo needs v0.3.0+
+    # because v0.2.x's substrate bug stalls the sender's
     # SubscribeAttachmentBundle one frame short of terminal. For
     # testing local changes, comment out `image:` and uncomment the
     # `build:` block.
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.0
+    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-a
@@ -55,7 +57,7 @@ services:
       - ./outbox-a:/var/lib/peat/outbox:ro
 
   peat-node-b:
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.0
+    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-b
