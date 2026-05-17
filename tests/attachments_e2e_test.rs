@@ -672,3 +672,139 @@ async fn receiver_writes_node_status_into_distribution_doc() {
 
     drop((a, b));
 }
+
+/// peat-node#69 acceptance: the sender's **unary** `GetAttachmentDistribution`
+/// poll must reach `DISTRIBUTION_STATUS_COMPLETED` against a real
+/// two-peer transfer.
+///
+/// Test 23 (`subscribe_emits_progress_then_terminal`) covers the
+/// server-streaming `SubscribeAttachmentBundle` path and
+/// `receiver_writes_node_status_into_distribution_doc` covers the
+/// receiver's local doc write — but #69 is specifically about the
+/// operator-facing unary poll (`GetAttachmentDistribution`), which
+/// `send.sh` and any polling client hit. Pre-#864 it stayed
+/// PENDING/IN_PROGRESS forever because no receiver→sender status
+/// propagation existed. The peat-protocol rc.9 typed-`node_statuses`
+/// substrate + the sender-side watcher feed the same in-memory
+/// `IrohFileDistribution::status()` that `get_attachment_distribution`
+/// reads, so this path now advances — this test is the missing
+/// evidence that closes #69.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
+async fn sender_get_attachment_distribution_reaches_completed_two_nodes() {
+    init_test_tracing();
+    const A_GRPC: u16 = 50161;
+    const A_IROH: u16 = 51261;
+    const B_GRPC: u16 = 50162;
+    const B_IROH: u16 = 51262;
+
+    let a = boot(A_GRPC, A_IROH, "sender", false).await;
+    let b = boot(B_GRPC, B_IROH, "receiver", true).await;
+    let http = http_client();
+
+    let status_a = call(&http, &a.base, "GetStatus", serde_json::json!({})).await;
+    let status_b = call(&http, &b.base, "GetStatus", serde_json::json!({})).await;
+    let endpoint_a = status_a["endpointAddr"].as_str().unwrap().to_string();
+    let endpoint_b = status_b["endpointAddr"].as_str().unwrap().to_string();
+
+    call(
+        &http,
+        &b.base,
+        "ConnectPeer",
+        serde_json::json!({
+            "endpointId": endpoint_a,
+            "addresses": [format!("127.0.0.1:{A_IROH}")],
+        }),
+    )
+    .await;
+    call(
+        &http,
+        &a.base,
+        "ConnectPeer",
+        serde_json::json!({
+            "endpointId": endpoint_b,
+            "addresses": [format!("127.0.0.1:{B_IROH}")],
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    call(&http, &a.base, "StartSync", serde_json::json!({})).await;
+    call(&http, &b.base, "StartSync", serde_json::json!({})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let payload = b"peat-node#69: sender GetAttachmentDistribution must reach COMPLETED".to_vec();
+    let hash = sha256_of(&payload);
+    let file_path = a.root_path.join("unary-complete.bin");
+    std::fs::write(&file_path, &payload).unwrap();
+
+    let resp = call(
+        &http,
+        &a.base,
+        "SendAttachments",
+        serde_json::json!({
+            "files": [{
+                "rootName": "outbox",
+                "relativePath": "unary-complete.bin",
+                "sizeBytes": payload.len(),
+                "sha256": b64(&hash),
+            }],
+            "scope": { "allNodes": {} }
+        }),
+    )
+    .await;
+    let distribution_id = resp["handles"][0]["distributionId"]
+        .as_str()
+        .expect("SendAttachments must return a distribution_id")
+        .to_string();
+
+    // Sync point: bytes land on B's inbox, after which B's
+    // Completed node-status write propagates back to A.
+    let _ = await_inbox_file(
+        &b.inbox_path,
+        &distribution_id,
+        &payload,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // Poll A's unary GetAttachmentDistribution until it reports
+    // COMPLETED. 30s ceiling: byte delivery already happened, so this
+    // is just waiting for the receiver's node-status write to CRDT-sync
+    // back to A and the sender watcher to fold it into the in-memory
+    // status the handler reads. A regression that breaks receiver→sender
+    // propagation leaves this stuck at PENDING/IN_PROGRESS until the
+    // deadline, and the panic surfaces the last-seen status.
+    let poll_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let body = call(
+            &http,
+            &a.base,
+            "GetAttachmentDistribution",
+            serde_json::json!({ "distributionId": distribution_id }),
+        )
+        .await;
+        let status_val = body
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("DISTRIBUTION_STATUS_UNSPECIFIED");
+        if status_val == "DISTRIBUTION_STATUS_COMPLETED" {
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            panic!(
+                "sender's GetAttachmentDistribution never reached \
+                 DISTRIBUTION_STATUS_COMPLETED within 30s of byte-on-disk \
+                 delivery (peat-node#69). Last-seen status: {status_val}, \
+                 full body: {body}. A regression here means receiver→sender \
+                 node_status propagation broke — the substrate write \
+                 (peat-protocol write_receiver_node_status), the CRDT \
+                 sync-back, or the sender-side watcher folding it into \
+                 IrohFileDistribution::status()."
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    drop((a, b));
+}
