@@ -16,7 +16,7 @@ path = "src/main.rs"
 peat-mesh = { version = "=0.9.0-rc.10", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
-peat-protocol = { version = ">=0.9.0-rc.8, <0.9.1", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.9, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking
 iroh = "0.97"
@@ -80,3 +80,11 @@ connectrpc-build = "0.2"
 tempfile = "3.10"
 tokio = { version = "1", features = ["full", "test-util"] }
 rcgen = "0.13"
+# Serial execution for iroh two-node integration tests — each test spins
+# up its own `#[tokio::test(flavor = "multi_thread")]` runtime plus two
+# real iroh endpoints, and running them in parallel within a single
+# binary causes CPU contention that can stall PRD-006 test 23's
+# 60-second budget. `#[serial_test::serial(iroh_two_node)]` on the
+# relevant tests pins them to one-at-a-time execution within their
+# binary; cargo test already runs binaries sequentially.
+serial_test = "3"

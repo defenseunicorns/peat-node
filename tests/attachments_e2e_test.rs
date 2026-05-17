@@ -28,7 +28,7 @@ use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
-use peat_protocol::storage::{DistributionDocument, TransferState, IROH_DISTRIBUTION_COLLECTION};
+use peat_protocol::storage::{read_distribution_document, TransferState};
 use sha2::{Digest, Sha256};
 
 struct BootedNode {
@@ -216,6 +216,7 @@ fn init_test_tracing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
 async fn end_to_end_attachment_delivery_two_nodes() {
     init_test_tracing();
     const A_GRPC: u16 = 50131;
@@ -364,6 +365,7 @@ fn short_endpoint(full: &str) -> String {
 /// enough sweeps to act on it. Then we wait an extra 3 watcher
 /// intervals as a buffer before asserting C's inbox is still empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
 async fn node_list_scope_only_delivers_to_listed_nodes() {
     init_test_tracing();
     const A_GRPC: u16 = 50141;
@@ -535,6 +537,7 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
 /// complementary halves: this one pins the receiver's local doc state,
 /// test 23 pins the sender's observable broadcast.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial(iroh_two_node)]
 async fn receiver_writes_node_status_into_distribution_doc() {
     init_test_tracing();
     const A_GRPC: u16 = 50151;
@@ -627,19 +630,11 @@ async fn receiver_writes_node_status_into_distribution_doc() {
     // exact timing, and surfaces the pre-Completed snapshot in the
     // failure message so a regression that *drops* the write is
     // distinguishable from sheer slowness.
-    let collection = b
-        .node
-        .document_store()
-        .collection(IROH_DISTRIBUTION_COLLECTION);
     let poll_deadline = Instant::now() + Duration::from_secs(15);
     let entry = loop {
-        let bytes = collection
-            .get(&distribution_id)
-            .expect("collection.get must succeed")
+        let doc = read_distribution_document(b.node.document_store().as_ref(), &distribution_id)
+            .expect("read_distribution_document must succeed")
             .expect("distribution doc must exist on the receiver after delivery");
-        let doc: DistributionDocument = serde_json::from_slice(&bytes).expect(
-            "receiver's distribution doc must deserialize as the typed DistributionDocument",
-        );
         if let Some(entry) = doc.node_statuses.get(&b_short) {
             if entry.status == TransferState::Completed {
                 break entry.clone();
