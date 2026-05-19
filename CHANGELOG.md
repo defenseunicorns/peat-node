@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-05-19
+
+Patch release. Picks up [peat-mesh v0.9.0-rc.12](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.12) (FIPS-posture primitive swap) and [peat-protocol v0.9.0-rc.11](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.11) (matching FIPS adaptation). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.1.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.12"`** (was `rc.11`). Brings in the swap from ChaCha20-Poly1305 + X25519 to AES-256-GCM + ECDH-P256 (FIPS 140-3 approved equivalents, per peat ADR-060 §5). peat-node doesn't construct `EncryptionKeypair` or call `establish_channel` directly, so the AEAD/DH swap is transparent at the sidecar boundary.
+- **`peat-protocol` resolves to `0.9.0-rc.11`** (was `rc.10`). The peat-protocol release adapts its security re-exports to peat-mesh's new constant names (`X25519_PUBLIC_KEY_SIZE` → `ECDH_PUBLIC_KEY_SIZE`).
+- **`AutomergeBackendConfig` construction in `src/node.rs`** explicitly passes `cipher: None` for the new optional at-rest cipher hook peat-mesh rc.12 introduced. peat-node's existing higher-level `StoreCipher` (AES-256-GCM via `aes-gcm`, used in `forward_store_changes`) keeps its current encrypt-before-store role; plumbing it into the lower-level peat-mesh hook is a separate follow-up the rc.12 changelog called out.
+
+### Compatibility
+
+No source changes for sidecar consumers. The `proto/sidecar.proto` wire contract, Connect RPC surface, and on-disk `ENC:v1:` envelope format are all unchanged. Existing 0.3.1 sidecar clients can be redeployed against the 0.3.2 image with no code changes.
+
 ## [0.3.1] - 2026-05-17
 
 Closes [#68](https://github.com/defenseunicorns/peat-node/issues/68): the
