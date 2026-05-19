@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer)
-peat-mesh = { version = "=0.9.0-rc.11", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.12", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 peat-protocol = { version = ">=0.9.0-rc.10, <0.9.1", features = ["automerge-backend"] }

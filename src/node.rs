@@ -101,6 +101,15 @@ impl SidecarNode {
             formation_id: config.app_id.clone(),
             base64_shared_key: config.shared_key.clone(),
             iroh_bind_addr,
+            // peat-mesh rc.12 introduced an optional at-rest cipher hook on
+            // AutomergeBackendConfig. peat-node already encrypts at a higher
+            // layer via `StoreCipher` (see `forward_store_changes` below),
+            // so leave the peat-mesh-level cipher as None for now. Plumbing
+            // peat-node's StoreCipher into this field is the follow-up the
+            // peat-mesh rc.12 changelog called out (currently redundant with
+            // the higher-layer encryption; would let us remove the
+            // higher-layer path if/when we want).
+            cipher: None,
         })
         .await?;
 
