@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-05-24
+
+Patch release. Picks up [peat-mesh v0.9.0-rc.20](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.20) and [peat-protocol / peat v0.9.0-rc.14](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.14). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.2.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.20"`** (was `rc.12`). Brings in the iroh 0.97 → 1.0.0-rc.0 cascade, the extracted `iroh-mdns-address-lookup` crate, and the `Endpoint::builder(presets::Empty).crypto_provider(...)` API. `aws-lc-rs` is now the active rustls crypto provider for every iroh QUIC handshake; the previous `ring`-backed path is no longer reachable through any peat-mesh endpoint constructor. peat-node inherits the FIPS-aligned provider through `AutomergeBackend::with_iroh` without local change. Residual `ring` symbol surface via `noq-proto` / `rcgen` / `rustls-webpki` is tracked for upstream removal under [defenseunicorns/peat#923](https://github.com/defenseunicorns/peat/issues/923#issuecomment-4528407237).
+- **`peat-protocol` resolves to `0.9.0-rc.14`** (range floor advanced from `>=0.9.0-rc.10` to `>=0.9.0-rc.14`; range upper bound `<0.9.1` unchanged). rc.14 is the consumer-side cut of the FIPS-active provider + Android JNI hardening chain (peat#924 + peat#925).
+- **`iroh = "=1.0.0-rc.0"`** (was `"0.97"`). The direct peat-node dep must match peat-mesh's exact iroh pin — iroh's process-global crypto provider + ALPN registry have undefined behavior under split-version linkage. Exact-pin enforces the constraint at resolve time rather than at runtime.
+
+### Compatibility
+
+No source changes for sidecar consumers. The `proto/sidecar.proto` wire contract, Connect RPC surface, and on-disk `ENC:v1:` envelope format are all unchanged. Existing 0.3.2 sidecar clients can be redeployed against the 0.3.3 image with no code changes.
+
+Cross-cluster sync validated end-to-end on the k3d × 2 integration suite under the new iroh 1.0.0-rc.0 + aws-lc-rs stack (peat-node#92 CI). Field-tier scenario validation done in the peat workspace's QUICKSTART regression — all four scenarios pass on real LAN (laptop + 2 Raspberry Pi 5s, 192.168.228.0/24).
+
 ## [0.3.2] - 2026-05-19
 
 Patch release. Picks up [peat-mesh v0.9.0-rc.12](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.12) (FIPS-posture primitive swap) and [peat-protocol v0.9.0-rc.11](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.11) (matching FIPS adaptation). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.1.
