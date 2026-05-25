@@ -62,6 +62,25 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO:      ${{ github.repository }}
         run: |
+          set -uo pipefail
+
+          MAX_ATTEMPTS=3
+          rc=0
+
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+          echo "::group::QA Review attempt ${attempt}/${MAX_ATTEMPTS}"
+
+          # Idempotency: if a prior attempt already posted the review for this SHA,
+          # treat as success. Guards against re-posting if claude succeeded at
+          # `gh pr review` then crashed during teardown.
+          if gh pr view "$PR_NUMBER" --json reviews \
+               | jq -e --arg tag "Peat QA Review (SHA: ${SHORT_SHA})" \
+                    '.reviews[] | select(.body | contains($tag))' >/dev/null 2>&1; then
+            echo "Review for SHA ${SHORT_SHA} already posted; treating as success."
+            echo "::endgroup::"
+            exit 0
+          fi
+
           if [ "$HAS_PRIOR" = "true" ]; then
             # unquoted heredoc: shell expands $PR_NUMBER, $SHORT_SHA, $PREV_SHA, $REPO, $RUNNER_TEMP — all from controlled outputs
             cat <<PROMPT | claude -p --model claude-opus-4-7 --allowedTools "Bash(gh pr view *),Bash(gh pr review * --comment --body *),Bash(gh pr review * --comment --body-file *),Bash(git diff *),Bash(git log *),Bash(cat $RUNNER_TEMP/peat-qa-prior.md),Write"
@@ -166,6 +185,7 @@ jobs:
              If there are no findings under any tag, post a single line: "No findings."
              NEVER approve or request-changes — comment only.
           PROMPT
+          rc=$?
           else
             # unquoted heredoc: shell expands $PR_NUMBER, $SHORT_SHA, $REPO — all from controlled outputs
             cat <<PROMPT | claude -p --model claude-opus-4-7 --allowedTools 'Bash(gh pr diff *),Bash(gh pr view *),Bash(gh pr review * --comment --body *),Bash(gh pr review * --comment --body-file *),Write'
@@ -262,4 +282,20 @@ jobs:
              If there are no findings under any tag, post a single line: "No findings."
              NEVER approve or request-changes — comment only.
           PROMPT
+          rc=$?
           fi
+
+          echo "::endgroup::"
+
+          if [ "$rc" -eq 0 ]; then
+            exit 0
+          fi
+
+          if [ "$attempt" -lt "$MAX_ATTEMPTS" ]; then
+            echo "Attempt ${attempt} failed (claude -p exit ${rc}); sleeping 15s before retry..."
+            sleep 15
+          fi
+          done
+
+          echo "All ${MAX_ATTEMPTS} QA Review attempts failed (likely transient API errors)."
+          exit 1
