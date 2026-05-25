@@ -63,6 +63,7 @@ jobs:
           REPO:      ${{ github.repository }}
         run: |
           set -uo pipefail
+          set +e   # GH Actions defaults to bash -e; -e would abort before rc=$? captures the claude exit code
 
           MAX_ATTEMPTS=3
           rc=0
