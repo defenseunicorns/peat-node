@@ -87,10 +87,24 @@ pub struct SidecarNode {
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
 /// stored so the auto-reconnect watchdog (peat-node#91) can re-dial the
 /// same peer post-blackout without the operator re-issuing the call.
+///
+/// Carries per-peer backoff state so a permanently-unreachable peer
+/// doesn't get dialed every [`RECONNECT_WATCHDOG_INTERVAL`] forever —
+/// each consecutive failure doubles the wait up to
+/// [`RECONNECT_BACKOFF_MAX`]. A successful dial resets the backoff.
 #[derive(Debug, Clone)]
 struct PeerRegistration {
     addresses: Vec<String>,
     relay_url: String,
+    /// Earliest `Instant` at which the watchdog should next attempt
+    /// a re-dial. Set to `Instant::now()` on registration so the first
+    /// post-blackout tick fires immediately, then to
+    /// `now + backoff` after each failed attempt.
+    next_attempt: std::time::Instant,
+    /// Current reconnect backoff window. Starts at
+    /// [`RECONNECT_BACKOFF_MIN`], doubles on each failure (capped at
+    /// [`RECONNECT_BACKOFF_MAX`]), resets on success.
+    backoff: Duration,
 }
 
 /// How often the reconnect watchdog wakes to check for dropped peers.
@@ -99,6 +113,19 @@ struct PeerRegistration {
 /// within the drain budget (peat-node#91 UAT). Tunable here if a future
 /// scenario surfaces a different sweet spot.
 const RECONNECT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Initial backoff for a freshly-registered peer or a peer whose last
+/// dial succeeded. Equal to the watchdog interval so the first retry
+/// fires on the very next tick after a transient drop.
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(5);
+
+/// Upper bound on the watchdog's per-peer reconnect backoff. After this
+/// many seconds of consecutive failure the watchdog keeps trying at this
+/// cadence rather than growing indefinitely. 120 s matches the QA-review
+/// suggestion (peat-node#99) — long enough to avoid wasting cycles on a
+/// permanently-departed peer, short enough that a 2-minute partition
+/// still recovers within one cycle.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(120);
 
 /// Internal change event for the broadcast channel.
 #[derive(Debug, Clone)]
@@ -292,11 +319,18 @@ impl SidecarNode {
                     let live: std::collections::HashSet<iroh::EndpointId> =
                         backend.transport().connected_peers().into_iter().collect();
 
+                    // Per-peer backoff: only consider a peer ready to dial
+                    // if `next_attempt` has elapsed. This keeps the
+                    // permanently-unreachable-peer cost bounded (peat-node
+                    // #99 QA finding) without sacrificing the fast-recovery
+                    // path for transient drops, where `backoff` starts at
+                    // RECONNECT_BACKOFF_MIN (= watchdog interval).
+                    let now = std::time::Instant::now();
                     let dead: Vec<(iroh::EndpointId, PeerRegistration)> = {
                         let registered = registered.read().unwrap_or_else(|e| e.into_inner());
                         registered
                             .iter()
-                            .filter(|(id, _)| !live.contains(*id))
+                            .filter(|(id, reg)| !live.contains(*id) && reg.next_attempt <= now)
                             .map(|(id, reg)| (*id, reg.clone()))
                             .collect()
                     };
@@ -308,15 +342,44 @@ impl SidecarNode {
                     for (peer_id, reg) in dead {
                         info!(
                             peer = %peer_id,
+                            backoff_secs = reg.backoff.as_secs(),
                             "auto-reconnect: peer not in live set, re-dialing"
                         );
-                        if let Err(e) = Self::dial_and_attach(&backend, peer_id, &reg).await {
-                            warn!(
+                        let dial_result = Self::dial_and_attach(&backend, peer_id, &reg).await;
+                        // Update the registry's per-peer backoff state.
+                        // On success: reset backoff so a future drop is
+                        // re-tried immediately on the next tick. On
+                        // failure: double up to RECONNECT_BACKOFF_MAX and
+                        // schedule the next attempt accordingly. If the
+                        // operator explicitly disconnected during the dial,
+                        // the entry will be missing — skip silently.
+                        let mut registered_guard =
+                            registered.write().unwrap_or_else(|e| e.into_inner());
+                        if let Some(entry) = registered_guard.get_mut(&peer_id) {
+                            match &dial_result {
+                                Ok(()) => {
+                                    entry.backoff = RECONNECT_BACKOFF_MIN;
+                                    entry.next_attempt = now;
+                                }
+                                Err(_) => {
+                                    entry.backoff = (entry.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                                    entry.next_attempt = now + entry.backoff;
+                                }
+                            }
+                        }
+                        drop(registered_guard);
+                        match dial_result {
+                            Ok(()) => info!(peer = %peer_id, "auto-reconnect succeeded"),
+                            Err(e) => warn!(
                                 peer = %peer_id,
-                                "auto-reconnect failed (will retry on next tick): {e}"
-                            );
-                        } else {
-                            info!(peer = %peer_id, "auto-reconnect succeeded");
+                                "auto-reconnect failed (next attempt in {:?}): {e}",
+                                registered
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&peer_id)
+                                    .map(|r| r.backoff)
+                                    .unwrap_or(RECONNECT_BACKOFF_MIN)
+                            ),
                         }
                     }
                 }
@@ -471,6 +534,21 @@ impl SidecarNode {
         format!("{}", self.backend.blob_store().endpoint_id())
     }
 
+    /// The first IP-bound UDP port the iroh endpoint is listening on, if any.
+    ///
+    /// Used by integration tests that bind to port 0 to discover the OS-
+    /// assigned port without racing on a hardcoded number. Returns `None` if
+    /// the endpoint reports no IP-transport addresses (e.g. relay-only).
+    pub fn bound_udp_port(&self) -> Option<u16> {
+        self.backend
+            .blob_store()
+            .endpoint()
+            .bound_sockets()
+            .into_iter()
+            .next()
+            .map(|sa| sa.port())
+    }
+
     pub fn is_sync_active(&self) -> bool {
         self.sync_active.load(Ordering::Relaxed)
     }
@@ -548,6 +626,14 @@ impl SidecarNode {
         let registration = PeerRegistration {
             addresses: addresses.to_vec(),
             relay_url: relay_url.to_string(),
+            // Just registered + successful dial below means the
+            // first watchdog tick should re-check immediately if the
+            // connection drops. The two-step pattern (dial then
+            // insert) keeps these defaults coherent with the
+            // dial-already-succeeded invariant the insert below
+            // upholds.
+            next_attempt: std::time::Instant::now(),
+            backoff: RECONNECT_BACKOFF_MIN,
         };
 
         Self::dial_and_attach(&self.backend, peer_id, &registration).await?;

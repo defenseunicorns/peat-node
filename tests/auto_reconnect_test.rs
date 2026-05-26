@@ -13,7 +13,7 @@
 //!
 //! ## What this test exercises
 //!
-//! 1. Boot two `SidecarNode`s, connect B → A.
+//! 1. Boot two `SidecarNode`s on OS-assigned UDP ports, connect B → A.
 //! 2. Force-close the underlying QUIC connection from B's side using
 //!    `simulate_idle_timeout_for_test` — this bypasses `disconnect_peer`,
 //!    so the auto-reconnect registry retains its entry for A. This is the
@@ -32,41 +32,61 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peat_node::node::{SidecarConfig, SidecarNode};
+use tempfile::TempDir;
 
-async fn boot(iroh_port: u16) -> Arc<SidecarNode> {
-    let dir = tempfile::tempdir().unwrap();
-    Arc::new(
+/// A booted node bundled with the `TempDir` that owns its data directory.
+/// Holding the `TempDir` here means the directory is RAII-cleaned when the
+/// test scope ends — `dir.keep()` (the previous shape) would have leaked
+/// one tempdir per `boot` call per test run.
+struct BootedNode {
+    node: Arc<SidecarNode>,
+    _dir: TempDir,
+}
+
+/// Boot a `SidecarNode` on an OS-assigned UDP port (`iroh_udp_port =
+/// Some(0)`). Using port 0 avoids fixed-port collisions when `cargo test`
+/// runs binaries in parallel or when another local process happens to
+/// hold the port — flagged as a flake source in peat-node#99's QA review.
+async fn boot(node_id: &str) -> BootedNode {
+    let dir = TempDir::new().unwrap();
+    let node = Arc::new(
         SidecarNode::new(SidecarConfig {
-            node_id: format!("auto-reconnect-{iroh_port}"),
+            node_id: node_id.to_string(),
             app_id: "test".to_string(),
             shared_key: String::new(),
-            data_dir: dir.keep(),
+            data_dir: dir.path().to_path_buf(),
             peers: vec![],
             encryption_key: None,
-            iroh_udp_port: Some(iroh_port),
+            iroh_udp_port: Some(0),
             attachment_config: Default::default(),
         })
         .await
         .unwrap(),
-    )
+    );
+    BootedNode { node, _dir: dir }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn watchdog_redials_peer_after_simulated_idle_timeout_peat_node_91() {
-    let node_a = boot(51251).await;
-    let node_b = boot(51252).await;
+    let node_a = boot("auto-reconnect-A").await;
+    let node_b = boot("auto-reconnect-B").await;
 
-    let endpoint_a = node_a.endpoint_addr();
+    let endpoint_a = node_a.node.endpoint_addr();
+    let port_a = node_a
+        .node
+        .bound_udp_port()
+        .expect("node A must report a bound UDP port");
 
     node_b
-        .connect_peer(&endpoint_a, &["127.0.0.1:51251".to_string()], "")
+        .node
+        .connect_peer(&endpoint_a, &[format!("127.0.0.1:{port_a}")], "")
         .await
         .expect("initial connect_peer must succeed");
 
     // Give iroh a brief moment to fully settle the connection.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        node_b.connected_peer_count(),
+        node_b.node.connected_peer_count(),
         1,
         "B should see exactly 1 peer (A) after initial connect",
     );
@@ -75,11 +95,12 @@ async fn watchdog_redials_peer_after_simulated_idle_timeout_peat_node_91() {
     // drops, but the auto-reconnect registry retains its entry for A
     // (because the operator did NOT call disconnect_peer).
     node_b
+        .node
         .simulate_idle_timeout_for_test(&endpoint_a)
         .await
         .expect("simulated idle timeout must succeed");
     assert_eq!(
-        node_b.connected_peer_count(),
+        node_b.node.connected_peer_count(),
         0,
         "B should see 0 peers immediately after simulated idle timeout",
     );
@@ -90,7 +111,7 @@ async fn watchdog_redials_peer_after_simulated_idle_timeout_peat_node_91() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut recovered = false;
     while tokio::time::Instant::now() < deadline {
-        if node_b.connected_peer_count() >= 1 {
+        if node_b.node.connected_peer_count() >= 1 {
             recovered = true;
             break;
         }
@@ -100,6 +121,6 @@ async fn watchdog_redials_peer_after_simulated_idle_timeout_peat_node_91() {
         recovered,
         "B should auto-reconnect to A within 15 s of simulated idle timeout \
          (peat-node#91); connected_peer_count={}",
-        node_b.connected_peer_count()
+        node_b.node.connected_peer_count()
     );
 }
