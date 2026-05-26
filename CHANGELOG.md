@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-05-26
+
+Patch release. Picks up the **ADR-062 Phase 2 follow-up trail** published across peat-mesh and peat-protocol over 2026-05-25 / 2026-05-26: [peat-mesh v0.9.0-rc.24](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.24) (was rc.20) and [peat-protocol / peat v0.9.0-rc.16](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.16) (was rc.14). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.3.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.24"`** (was `rc.20`). Spans the ADR-062 Phase 2 trail:
+  - rc.21 ([peat-mesh#162](https://github.com/defenseunicorns/peat-mesh/pull/162)): `IrohMeshTransport` relocation from peat-protocol into `peat_mesh::transport::iroh_mesh`; `peat_mesh::network::EndpointId` re-export.
+  - rc.22 ([peat-mesh#166](https://github.com/defenseunicorns/peat-mesh/pull/166)): `Connection` + `DiscoveryEvent` re-exports the rc.21 surface accidentally missed.
+  - rc.23 ([peat-mesh#171](https://github.com/defenseunicorns/peat-mesh/pull/171)): `parse_close_reason` structured-variant refactor — exhaustive match on `iroh::endpoint::ConnectionError`, stable per-variant payload tags on `DisconnectReason::{NetworkError, ApplicationError}`. No behavior change for happy-path close handling; subtle wording-tweak resilience for log-parsing consumers.
+  - rc.24 ([peat-mesh#173](https://github.com/defenseunicorns/peat-mesh/pull/173)): narrow `peat_mesh::network::QuicMeshConnection` trait + removed `pub use Connection`. The trait names exactly the four methods peat-protocol's formation-handshake uses; a future iroh `Connection` method addition no longer widens peat-protocol's reachable surface by default. Closes the transport-agnosticism-at-API-shape gap from the original ADR-062 work.
+- **`peat-protocol` resolves to `0.9.0-rc.16`** (range floor advanced from `>=0.9.0-rc.14` to `>=0.9.0-rc.16`; range upper bound `<0.9.1` unchanged):
+  - rc.15 ([defenseunicorns/peat#930](https://github.com/defenseunicorns/peat/pull/930)): ADR-062 Phase 2 consumer-side — `peat-protocol/src/transport/iroh.rs` deleted (918 lines), `iroh`/`iroh-blobs`/`iroh-mdns-address-lookup` dropped from peat-protocol's direct deps, 13 import sites rewired to `peat_mesh::network::*` re-exports.
+  - rc.16 ([defenseunicorns/peat#933](https://github.com/defenseunicorns/peat/pull/933)): `formation_handshake.rs` signatures take `&dyn QuicMeshConnection` instead of `&Connection`; `network.rs` re-export list drops `Connection`, adds `QuicMeshConnection`.
+- **`iroh = "=1.0.0-rc.0"`** unchanged from 0.3.3. The exact-pin to peat-mesh's iroh version is preserved — iroh's process-global crypto provider + ALPN registry have undefined behavior under split-version linkage.
+
+### Impact on peat-node
+
+**None at the surface level.** peat-node uses `peat_mesh::storage::*`, `peat_mesh::sync::AutomergeBackend`, and `peat_protocol::storage::*`. None of the narrow-trait, IrohMeshTransport-relocation, or `Connection`-re-export-removal work touches that surface. The bump is a pure version advance to track the underlying ecosystem cleanup.
+
+### Compatibility
+
+No source changes for sidecar consumers. The `proto/sidecar.proto` wire contract, Connect RPC surface, and on-disk `ENC:v1:` envelope format are all unchanged. Existing 0.3.3 sidecar clients can be redeployed against the 0.3.4 image with no code changes.
+
+Cross-cluster sync validated end-to-end on the k3d × 2 integration suite under the new peat-mesh rc.24 / peat-protocol rc.16 stack ([peat-node#97](https://github.com/defenseunicorns/peat-node/pull/97) CI, 7m57s). 79 attachment-feature tests (53 unit + 26 integration across 6 test files) pass against the bumped stack with zero failures.
+
 ## [0.3.3] - 2026-05-24
 
 Patch release. Picks up [peat-mesh v0.9.0-rc.20](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.20) and [peat-protocol / peat v0.9.0-rc.14](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.14). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.2.
