@@ -8,16 +8,18 @@
 //! broadcast channel that `service.rs::subscribe` consumes, the
 //! `connect_peer` retry loop, and the `start_sync`/`stop_sync` flag.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::attachments::config::AttachmentConfig;
 use crate::attachments::registry::{BundleRegistry, RegistryConfig};
@@ -69,7 +71,34 @@ pub struct SidecarNode {
     /// when attachments are disabled so service handlers don't have to
     /// branch on Option.
     bundle_runtime: Arc<BundleRuntimeStore>,
+    /// **peat-node#91** — registry of peers that have been successfully
+    /// connected via [`connect_peer`], keyed by `EndpointId`. The
+    /// background reconnect watchdog reads this map every
+    /// [`RECONNECT_WATCHDOG_INTERVAL`] and re-establishes any peer whose
+    /// connection has dropped out of `MeshSyncTransport::connected_peers()`
+    /// (i.e. iroh's idle timeout fired during a network blackout).
+    ///
+    /// [`disconnect_peer`] removes from this map — an explicit disconnect
+    /// is treated as "don't reconnect," distinguishing operator-initiated
+    /// teardown from transient link loss.
+    registered_peers: Arc<RwLock<HashMap<iroh::EndpointId, PeerRegistration>>>,
 }
+
+/// Address hint captured per [`SidecarNode::connect_peer`] invocation,
+/// stored so the auto-reconnect watchdog (peat-node#91) can re-dial the
+/// same peer post-blackout without the operator re-issuing the call.
+#[derive(Debug, Clone)]
+struct PeerRegistration {
+    addresses: Vec<String>,
+    relay_url: String,
+}
+
+/// How often the reconnect watchdog wakes to check for dropped peers.
+/// 5 s is fast enough that a 60 s blackout + 30 s drain window has
+/// ample slack for the reconnect roundtrip + backlog drain to complete
+/// within the drain budget (peat-node#91 UAT). Tunable here if a future
+/// scenario surfaces a different sweet spot.
+const RECONNECT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Internal change event for the broadcast channel.
 #[derive(Debug, Clone)]
@@ -222,6 +251,78 @@ impl SidecarNode {
                 );
         }
 
+        let registered_peers: Arc<RwLock<HashMap<iroh::EndpointId, PeerRegistration>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // peat-node#91 — auto-reconnect watchdog. Iroh's idle timeout
+        // (default ~30 s) closes peer connections during a network
+        // blackout. The sync coordinator drains its backlog over a
+        // healthy connection but has no mechanism to re-establish one
+        // post-blackout — the underlying `MeshSyncTransport` doesn't
+        // own a `ReconnectionManager`. This watchdog fills that gap by
+        // periodically comparing the live-connection set against the
+        // registry of peers the operator originally asked to connect
+        // to, and re-dialing any that have dropped out.
+        //
+        // The watchdog holds `Weak` references rather than `Arc` so
+        // it exits cleanly when `SidecarNode` is dropped — important
+        // for integration tests that spin nodes up and down.
+        {
+            let registered = Arc::downgrade(&registered_peers);
+            let backend_weak = Arc::downgrade(&backend);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(RECONNECT_WATCHDOG_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Discard the immediate-first tick — there's nothing to
+                // reconnect on startup; first user-initiated connect_peer
+                // calls populate the registry.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let Some(registered) = registered.upgrade() else {
+                        // SidecarNode was dropped; exit watchdog.
+                        debug!("reconnect watchdog: SidecarNode dropped, exiting");
+                        break;
+                    };
+                    let Some(backend) = backend_weak.upgrade() else {
+                        debug!("reconnect watchdog: backend dropped, exiting");
+                        break;
+                    };
+
+                    let live: std::collections::HashSet<iroh::EndpointId> =
+                        backend.transport().connected_peers().into_iter().collect();
+
+                    let dead: Vec<(iroh::EndpointId, PeerRegistration)> = {
+                        let registered = registered.read().unwrap_or_else(|e| e.into_inner());
+                        registered
+                            .iter()
+                            .filter(|(id, _)| !live.contains(*id))
+                            .map(|(id, reg)| (*id, reg.clone()))
+                            .collect()
+                    };
+
+                    if dead.is_empty() {
+                        continue;
+                    }
+
+                    for (peer_id, reg) in dead {
+                        info!(
+                            peer = %peer_id,
+                            "auto-reconnect: peer not in live set, re-dialing"
+                        );
+                        if let Err(e) = Self::dial_and_attach(&backend, peer_id, &reg).await {
+                            warn!(
+                                peer = %peer_id,
+                                "auto-reconnect failed (will retry on next tick): {e}"
+                            );
+                        } else {
+                            info!(peer = %peer_id, "auto-reconnect succeeded");
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             node_id: config.node_id,
             backend,
@@ -232,6 +333,7 @@ impl SidecarNode {
             bundle_registry,
             file_distribution,
             bundle_runtime: Arc::new(BundleRuntimeStore::new()),
+            registered_peers,
         })
     }
 
@@ -419,6 +521,11 @@ impl SidecarNode {
     /// At least one of `addresses` or `relay_url` must be non-empty — without
     /// any reachability hints there is no way to locate the peer. `addresses`
     /// accepts `host:port` (the host is resolved via DNS) or `ip:port`.
+    ///
+    /// The peer is recorded in [`Self::registered_peers`] so the
+    /// auto-reconnect watchdog can re-dial it if the iroh idle timeout
+    /// fires during a network blackout (peat-node#91). The address
+    /// hints passed here are reused verbatim by the watchdog.
     pub async fn connect_peer(
         &self,
         endpoint_id_str: &str,
@@ -438,9 +545,41 @@ impl SidecarNode {
             ));
         }
 
+        let registration = PeerRegistration {
+            addresses: addresses.to_vec(),
+            relay_url: relay_url.to_string(),
+        };
+
+        Self::dial_and_attach(&self.backend, peer_id, &registration).await?;
+
+        // Record the address hints AFTER the dial succeeds so the watchdog
+        // doesn't try to reconnect peers that never connected in the first
+        // place. peat-node#91 — the auto-reconnect path keys on this map.
+        self.registered_peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer_id, registration);
+
+        info!(peer = endpoint_id_str, "connected to peer");
+        Ok(())
+    }
+
+    /// Inner dial-and-attach used by both [`Self::connect_peer`] and the
+    /// auto-reconnect watchdog. Resolves addresses, authenticates the
+    /// formation handshake, wires the connection into the sync transport,
+    /// and registers the peer with the blob-store peer index.
+    ///
+    /// Does **not** touch `registered_peers` — callers decide whether the
+    /// peer should be eligible for future auto-reconnects (the public
+    /// `connect_peer` inserts; the watchdog re-uses an existing entry).
+    async fn dial_and_attach(
+        backend: &Arc<AutomergeBackend>,
+        peer_id: iroh::EndpointId,
+        registration: &PeerRegistration,
+    ) -> anyhow::Result<()> {
         let mut peer_addr = iroh::EndpointAddr::new(peer_id);
 
-        for addr_str in addresses {
+        for addr_str in &registration.addresses {
             if addr_str.is_empty() {
                 continue;
             }
@@ -462,14 +601,14 @@ impl SidecarNode {
             }
         }
 
-        if has_relay {
-            let relay: iroh::RelayUrl = relay_url
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid relay URL `{relay_url}`: {e}"))?;
+        if !registration.relay_url.is_empty() {
+            let relay: iroh::RelayUrl = registration.relay_url.parse().map_err(|e| {
+                anyhow::anyhow!("invalid relay URL `{}`: {e}", registration.relay_url)
+            })?;
             peer_addr = peer_addr.with_relay_url(relay);
         }
 
-        self.backend
+        backend
             .blob_store()
             .memory_lookup()
             .add_endpoint_info(peer_addr);
@@ -489,20 +628,15 @@ impl SidecarNode {
         // elapses each loop, which is acceptable for a config that
         // rarely changes after deployment.
         const CONNECT_RETRY_ATTEMPTS: usize = 3;
-        const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+        const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
         let mut attempt = 0;
         let connection = loop {
             attempt += 1;
-            match self
-                .backend
-                .transport()
-                .connect_and_authenticate(peer_id)
-                .await
-            {
+            match backend.transport().connect_and_authenticate(peer_id).await {
                 Ok(c) => break c,
                 Err(e) if attempt < CONNECT_RETRY_ATTEMPTS => {
                     warn!(
-                        peer = endpoint_id_str,
+                        peer = %peer_id,
                         attempt,
                         max_attempts = CONNECT_RETRY_ATTEMPTS,
                         "connect_and_authenticate failed, retrying: {e}"
@@ -518,9 +652,9 @@ impl SidecarNode {
         };
 
         // Register the connection for CRDT sync
-        self.backend
+        backend
             .transport()
-            .start_sync_connection(connection, Arc::clone(self.backend.coordinator()));
+            .start_sync_connection(connection, Arc::clone(backend.coordinator()));
 
         // PRD-006: register the peer with the blob store so it shows up
         // in `known_peers()`. `IrohFileDistribution::resolve_targets`
@@ -529,13 +663,12 @@ impl SidecarNode {
         // iterates it when the BlobPeerIndex doesn't yet know which
         // peer holds a given blob. The two lists (iroh connection /
         // blob-store peer index) are tracked separately upstream —
-        // before this commit `connect_peer` only populated the former,
-        // which silently broke the attachment-delivery end-to-end path
+        // before peat-node 0.3.4 only the former was populated, which
+        // silently broke the attachment-delivery end-to-end path
         // (target_nodes resolved to `[]` for AllNodes distributions
         // unless the operator called add_peer through a private API).
-        self.backend.blob_store().add_peer(peer_id).await;
+        backend.blob_store().add_peer(peer_id).await;
 
-        info!(peer = endpoint_id_str, "connected to peer");
         Ok(())
     }
 
@@ -543,6 +676,17 @@ impl SidecarNode {
         let peer_id: iroh::EndpointId = endpoint_id_str
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
+        // peat-node#91 — remove from the auto-reconnect registry FIRST.
+        // An explicit disconnect is the operator saying "stop talking to
+        // this peer," distinguishing intentional teardown from transient
+        // link loss. Doing this before closing the QUIC connection avoids
+        // a race where the watchdog tick observes the dead connection
+        // before the registry entry is gone and re-dials the peer the
+        // operator just asked to disconnect.
+        self.registered_peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer_id);
         // Close the QUIC connection (causes the background sync task to exit)
         if let Some(conn) = self.backend.transport().get_connection(&peer_id) {
             conn.close(0u32.into(), b"disconnect requested");
@@ -552,6 +696,33 @@ impl SidecarNode {
         // Yield to let background sync tasks observe the closed connection and clean up
         tokio::task::yield_now().await;
         info!(peer = endpoint_id_str, "disconnected from peer");
+        Ok(())
+    }
+
+    /// **Test-only.** Forcibly close the underlying QUIC connection to a
+    /// peer *without* removing it from the auto-reconnect registry —
+    /// i.e. the moral equivalent of iroh's idle timeout firing during a
+    /// network blackout. Used by `tests/auto_reconnect_test.rs` to drive
+    /// the peat-node#91 reproducing test deterministically; production
+    /// code paths should use [`Self::disconnect_peer`] which also
+    /// unregisters the peer.
+    ///
+    /// Hidden from rustdoc because it intentionally bypasses the
+    /// registry invariant `disconnect_peer` upholds.
+    #[doc(hidden)]
+    pub async fn simulate_idle_timeout_for_test(
+        &self,
+        endpoint_id_str: &str,
+    ) -> anyhow::Result<()> {
+        let peer_id: iroh::EndpointId = endpoint_id_str
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid endpoint ID: {e}"))?;
+        if let Some(conn) = self.backend.transport().get_connection(&peer_id) {
+            conn.close(0u32.into(), b"simulated idle timeout (test)");
+        }
+        self.backend.transport().remove_connection(&peer_id);
+        self.backend.coordinator().clear_peer_sync_state(peer_id);
+        tokio::task::yield_now().await;
         Ok(())
     }
 
