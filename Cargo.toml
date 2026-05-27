@@ -14,7 +14,15 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
-# rc.24 ships the ADR-062 Phase 2 follow-up trail:
+# rc.25 (peat-mesh#176/#178/#180, ADR-063): persistent multiplexed sync
+# streams. `AutomergeBackend` now owns a strong `Arc<SyncChannelManager>`
+# so the coordinator's `Weak` no longer dangles at construction-scope
+# exit; per-peer writer-task + bounded mpsc replaces the per-message
+# stream-open + per-peer mutex serialisation. Closes peat-mesh#175
+# (architectural half). API surface unchanged; the persistent path is
+# entirely internal to peat-mesh.
+#
+# rc.24 shipped the ADR-062 Phase 2 follow-up trail:
 # - rc.21 (peat-mesh#162): `peat_mesh::transport::iroh_mesh::IrohMeshTransport`
 #   relocation from peat-protocol; `peat_mesh::network::EndpointId` re-export.
 # - rc.22 (peat-mesh#166): `Connection` + `DiscoveryEvent` re-exports
@@ -25,13 +33,14 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.24", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.25", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
-# rc.16 picks up peat-mesh rc.24 (formation_handshake → &dyn QuicMeshConnection,
-# peat#932). rc.15 was the ADR-062 Phase 2 consumer-side IrohMeshTransport
-# deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.16, <0.9.1", features = ["automerge-backend"] }
+# rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
+# peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
+# → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
+# consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
+peat-protocol = { version = ">=0.9.0-rc.17, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's exact iroh pin
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh
