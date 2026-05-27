@@ -3413,9 +3413,9 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peat-mesh"
-version = "0.9.0-rc.24"
+version = "0.9.0-rc.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f01e92d9b5ba32401daed987571d8b543274b0e83048e60ddfe07f7be00e5951"
+checksum = "79fdc816052bd000f396c057c20b57c144c9c3460363d067dd14f25e5b9c632a"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3495,9 +3495,9 @@ dependencies = [
 
 [[package]]
 name = "peat-protocol"
-version = "0.9.0-rc.16"
+version = "0.9.0-rc.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3858a7fb2c7989a37234fbc5b7f2a79dbf4b67a6c179c668f8ddea9c36d32961"
+checksum = "69f3675c1e9fc0b62016b263a5209f9996bc909d6d430af62ddde24eae092c76"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3537,9 +3537,9 @@ dependencies = [
 
 [[package]]
 name = "peat-schema"
-version = "0.9.0-rc.16"
+version = "0.9.0-rc.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10e2249027d1cae0b11cad20e92bbc4f502a4bf14df5de52d6da5f5b63e8d2e9"
+checksum = "dfb71da138f9034ceb71cc5645b43283da645f9e141667467b9ab9776677ba87"
 dependencies = [
  "chrono",
  "prost",
