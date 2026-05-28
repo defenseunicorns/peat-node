@@ -60,12 +60,14 @@ By making `peat` a node, the CLI dogfoods the protocol, requires no additional A
 
 ### Why this lives in peat-node
 
-The CLI's tight runtime coupling is to the same upstream crates that `peat-node` consumes from the peat repo: `peat-protocol`, `peat-schema`, and `peat-mesh`. `peat` is, like `peat-node`, a consumer of the protocol — not a sibling of it. Co-locating in the `peat-node` repo gives:
+This is a **packaging decision**, not a charter change. `peat-node`'s charter — be the in-cluster sidecar that exposes `peat-protocol` over Connect/gRPC — is unchanged. `peat-cli` lives here for two concrete distribution reasons:
 
-- Single CI/CD pipeline; protocol and tooling cannot drift out of sync.
-- Shared dependency graph; no cross-repo version pinning headaches.
-- Atomic refactors when wire format or sync API evolves.
-- Free inclusion in the `peat-node` container image.
+1. **Container inclusion.** Shipping `peat` inside the existing `peat-node` container image gives operators a `kubectl exec`-reachable debug surface with no additional sidecar, no extra image to pull, and no separate supply-chain story.
+2. **Release artifacts.** `peat-node`'s release pipeline already produces cross-arch / cross-OS binaries via the existing GitHub release workflow. Adding `peat` to the same workflow yields Linux (x86_64, aarch64), macOS (aarch64, x86_64), and Windows (x86_64) binaries from one tagged release, without standing up a parallel release pipeline in a separate repo.
+
+The CLI also happens to consume the same upstream crates (`peat-protocol`, `peat-mesh`, plus `peat-schema` for rendering) that `peat-node` already depends on, so colocation avoids cross-repo version pinning between two consumers of the same protocol surface. That's a convenience, not the rationale.
+
+**Scope discipline.** This colocation is not a precedent that operator tooling generically belongs in `peat-node`. Future operator surfaces (UIs, scripted runners, non-Rust admin clients) get evaluated on their own merits and against ADR-043; the answer may be `peat-gateway`, a dedicated repo, or here. `peat-cli` lands here because it is a Rust binary consuming the same upstream crates and shipping in the same container and release stream — not because `peat-node` is the home for operator tooling.
 
 ---
 
@@ -480,6 +482,7 @@ Functional scenarios to cover from day one:
 
 - macOS and Windows build matrix.
 - Cross-arch verification (aarch64 Linux at minimum).
+- `peat` binaries attached to the existing `peat-node` GitHub release workflow: Linux (x86_64, aarch64), macOS (aarch64, x86_64), Windows (x86_64).
 - Documentation: README, operator quickstart, examples (including round-trip edit pattern).
 - Open-source release prep (license headers, contribution notes).
 
