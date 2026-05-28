@@ -18,6 +18,20 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
+# rc.27 (peat-mesh#188/#189/#190): peat-mesh#175 follow-throughs.
+# - peat-mesh#189: `AutomergeBackend::get` keyed-lookup override (closes
+#   peat-mesh#186). Trait-default `get` was O(N) via scan_prefix; now
+#   O(1) via the same `key_for(collection, id)` shape the upsert path
+#   uses. Pure perf improvement; deletion semantics match the trait-
+#   default exactly.
+# - peat-mesh#190: `InMemoryBackend::get` analog. Same O(N)→O(1) shape.
+# - peat-mesh#188: UAT file-header doc-comment scope clarification. No
+#   code change.
+# No API surface change vs rc.26 — the overrides preserve all existing
+# contracts (return types, deletion-filter semantics, observer paths);
+# any caller using `DocumentStore::get` transparently gets the faster
+# path. peat-node's call sites are unchanged.
+#
 # rc.26 (peat-mesh#184): adds the in-CI behavioural UAT for peat-mesh#175
 # delivery-ratio thresholds under constrained-bandwidth shaping —
 # pairs with rc.25's architectural pin (peat-mesh#180) for code-shape +
@@ -44,7 +58,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.26", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.27", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
