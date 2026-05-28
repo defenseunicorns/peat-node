@@ -520,8 +520,10 @@ Functional scenarios to cover from day one:
 
 ## Open Questions
 
-1. **Write authorization scope identifiers.** The ADR asserts reads and writes use distinct scopes per ADR-006 and that missing write scope fails fast with exit 3 before parsing content. The concrete scope identifiers (names, granularity per collection vs. per type, inheritance rules) need to be confirmed against the current state of ADR-006 before implementation.
-2. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
+1. **Credential bundle file format.** ADR-006 does not yet specify an on-disk credential format. `peat-cli` ships a placeholder YAML shape in `crates/peat-cli/src/creds.rs` and `deny_unknown_fields` so the format is explicitly versioned until upstream picks a canonical one. Tracked: [peat#940](https://github.com/defenseunicorns/peat/issues/940).
+2. **Write authorization scope identifiers.** The ADR asserts reads and writes use distinct scopes per ADR-006 and that missing write scope fails fast with exit 3 before parsing content. ADR-006 today defines only coarse role-level permissions (`WriteCellState`, `WriteNodeState`); per-collection granularity does not exist. Phase 4a will check at the coarse level; scenarios 7 and 29 are gated on the upstream amendment. Tracked: [peat#941](https://github.com/defenseunicorns/peat/issues/941).
+3. **Automerge delta API for `update --from`.** `peat-mesh` does not currently expose Automerge delta computation; `update --set` works without it, `update --from` does not. Phase 4b is gated. Tracked: [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187).
+4. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
 
 ---
 
@@ -533,7 +535,7 @@ The following design decisions were settled during ADR review and are reflected 
 - **No `query --deltas`.** `query` returns the rows, not the WAL — same model as `psql` on a `SELECT`. Operation-stream consumption lives on `observe --mode full-history`, which is the surface for change-stream / CDC-style use.
 - **No `apply` command.** `create` is strict-create (errors if doc exists); `update` is upsert (creates if missing, applies delta if present). ADR-021's "create once, evolve through deltas" invariant holds because initial `update` on a missing doc is initial creation, not recreation.
 - **Node posture varies by command.** Reads are passive observers; writes are active participants. Both ephemeral, both identity-stamped, both short-TTL.
-- **Credentials.** YAML config file (path via `--creds` argument, `PEAT_CREDS` env var, or platform default config location). Bundle format per ADR-006.
+- **Credentials.** YAML config file (path via `--creds` argument, `PEAT_CREDS` env var, or platform default config location). Bundle format shipped in `crates/peat-cli/src/creds.rs` as a placeholder pending the ADR-006 amendment tracked in [peat#940](https://github.com/defenseunicorns/peat/issues/940).
 - **`observe --since`.** Deferred to future work pending ADR-019 sync mode replay semantics.
 - **No pagination.** `--limit <N>` on `query` for capping output; no cursor.
 - **Type identification.** Via document metadata emitted by `peat-schema`-defined types.

@@ -9,9 +9,9 @@
 //! The on-disk schema is intentionally narrow today — it mirrors the fields of
 //! `peat-node`'s `SidecarConfig` that are relevant to mesh participation. The
 //! full credential-bundle shape is pending formalization in an ADR-006
-//! amendment; see the cross-repo tracking issue. Until then, this format is
-//! the source of truth and the CLI rejects unknown fields strictly so
-//! migrations are explicit.
+//! amendment (tracked at <https://github.com/defenseunicorns/peat/issues/940>).
+//! Until then, this format is the source of truth and the CLI rejects unknown
+//! fields strictly so migrations are explicit.
 //!
 //! Failure to resolve credentials is a fatal error; the CLI does not silently
 //! fall back to an anonymous join.
