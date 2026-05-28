@@ -59,17 +59,41 @@ pub fn render_observe_event(key: &str, doc: &Automerge, fmt: OutputFormat) -> Re
                 .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?
         }
     };
-    // Use writeln! so we can intercept BrokenPipe instead of panicking like
-    // println! does. Map BrokenPipe to a sentinel error that the observe
-    // loop recognises as "pipe closed, exit clean."
+    write_stream_line(&line)
+}
+
+/// Render a "deleted" event observed via the change stream: a key fired the
+/// changes observer but the document is gone (tombstoned between event and
+/// our read). Emits a structurally distinct record so CDC consumers see
+/// deletes, not just upserts.
+pub fn render_observe_deleted(key: &str, fmt: OutputFormat) -> Result<(), CliError> {
+    let line = match fmt {
+        OutputFormat::Text => format!("{key} <deleted>"),
+        OutputFormat::Json => serde_json::to_string(&serde_json::json!({"deleted": true}))
+            .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?,
+        OutputFormat::Ndjson => {
+            let mut obj = serde_json::Map::with_capacity(2);
+            obj.insert("key".into(), Value::String(key.to_string()));
+            obj.insert("deleted".into(), Value::Bool(true));
+            serde_json::to_string(&Value::Object(obj))
+                .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?
+        }
+    };
+    write_stream_line(&line)
+}
+
+/// Single point that writes a line to stdout for the streaming subcommands.
+/// `writeln!` (not `println!`) so we can intercept BrokenPipe instead of
+/// panicking, and map it to the dedicated [`CliError::BrokenPipe`] variant
+/// the observe loop and main.rs treat as a clean exit per ADR-001 §"Shell
+/// integration discipline".
+fn write_stream_line(line: &str) -> Result<(), CliError> {
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     match writeln!(handle, "{line}") {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            Err(CliError::Generic("Broken pipe".into()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(CliError::BrokenPipe),
         Err(e) => Err(CliError::Generic(format!("stdout write: {e}"))),
     }
 }

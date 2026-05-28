@@ -41,10 +41,16 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
     )
     .await?;
 
-    // Lamport: proper distributed Lamport state isn't exposed by peat-mesh
-    // at this surface; v1 uses wall-clock nanoseconds since epoch as a
-    // monotonically-increasing-per-node proxy. Two CLI invocations on the
-    // same node will not collide unless they fire in the same nanosecond.
+    // Lamport: a proper distributed Lamport source isn't exposed by
+    // peat-mesh at any consumer-facing surface today, so v1 uses
+    // wall-clock nanoseconds since epoch as a single-node-collision-safe
+    // proxy. Two CLI invocations on different hosts deleting the same
+    // key near-simultaneously will order by NTP skew rather than causal
+    // precedence, which is wrong but bounded: the documents-table delete
+    // applies on receipt regardless of Lamport, so the tombstone's
+    // ordering matters only for tie-breaking across concurrent writes.
+    // Tracked at <https://github.com/defenseunicorns/peat-mesh/issues/192>;
+    // swap this for `backend.next_lamport()` when the upstream API lands.
     let lamport = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

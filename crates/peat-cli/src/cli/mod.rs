@@ -93,6 +93,13 @@ pub enum CliError {
     /// exit 130 (128 + SIGINT) by Unix convention.
     #[error("interrupted")]
     Interrupted,
+    /// Downstream pipe consumer closed its read end. ADR-001 §"Shell
+    /// integration discipline" says exit silently with status 0 — the
+    /// caller (main.rs) treats this variant as a clean exit, not as
+    /// failure. Distinguishes pipe-close from a real write error so the
+    /// observe loop doesn't have to string-match an error message.
+    #[error("broken pipe")]
+    BrokenPipe,
 }
 
 impl CliError {
@@ -104,6 +111,7 @@ impl CliError {
             CliError::PermissionDenied(_) => 3,
             CliError::Malformed(_) => 4,
             CliError::Interrupted => 130,
+            CliError::BrokenPipe => 0,
         }
     }
 }

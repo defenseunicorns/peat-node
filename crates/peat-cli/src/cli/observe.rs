@@ -11,7 +11,7 @@ use clap::{Args, ValueEnum};
 use std::io::Write;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::cli::output::render_observe_event;
+use crate::cli::output::{render_observe_deleted, render_observe_event};
 use crate::cli::query::parse_target;
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -91,26 +91,27 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                     continue;
                 }
 
-                let doc = match store.get(&key) {
-                    Ok(Some(d)) => d,
-                    // Document was deleted between event emission and our
-                    // read — surface as a tombstone-shaped record so
-                    // consumers can react. ADR-034 will refine this when
-                    // tombstone metadata is available; for v1 we emit a
-                    // structural "deleted" event.
-                    Ok(None) => continue,
+                let render = match store.get(&key) {
+                    // Live doc: render it.
+                    Ok(Some(d)) => render_observe_event(&key, &d, common.output),
+                    // Document is gone between event emission and our read
+                    // (tombstoned). Emit a structurally distinct "deleted"
+                    // record so CDC consumers see deletes, not just upserts.
+                    // ADR-034 metadata refinement is a follow-up; for v1
+                    // we emit a minimal `deleted: true` envelope.
+                    Ok(None) => render_observe_deleted(&key, common.output),
                     Err(e) => {
                         tracing::warn!(key = %key, error = %e, "store read failed");
                         continue;
                     }
                 };
 
-                match render_observe_event(&key, &doc, common.output) {
+                match render {
                     Ok(()) => {}
-                    // SIGPIPE / closed stdout: downstream pipe consumer
-                    // (head, jq | grep -q, etc.) closed its read end.
-                    // ADR-001 says exit silently with status 0.
-                    Err(CliError::Generic(msg)) if msg.contains("Broken pipe") => break,
+                    // ADR-001 §"Shell integration discipline": pipe-close
+                    // exits cleanly. Propagate so main.rs maps it to
+                    // status 0.
+                    Err(CliError::BrokenPipe) => return Err(CliError::BrokenPipe),
                     Err(e) => return Err(e),
                 }
 

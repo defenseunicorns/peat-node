@@ -28,7 +28,11 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
     match cli.run().await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) | Err(peat_cli::CliError::BrokenPipe) => {
+            // Pipe-close is a clean exit per ADR-001 §"Shell integration
+            // discipline" — no stderr line, status 0.
+            ExitCode::SUCCESS
+        }
         Err(peat_cli::CliError::Interrupted) => {
             // SIGINT: convention is silent exit with status 130.
             ExitCode::from(130)

@@ -31,7 +31,10 @@ app_id: my-app
 shared_key: <base64-formation-key>
 peers:
   - <endpoint_id>@10.0.0.5:4242
-encryption_key: <base64-32-byte-key>   # optional
+# encryption_key: <base64-32-byte-key>   # accepted by schema but rejected at
+# load time; at-rest cipher layering vs. peat-node's app-level encryption is
+# being resolved in peat#940. Setting this field today exits 2 with a clear
+# error rather than silently bypassing encryption.
 ```
 
 ## Commands

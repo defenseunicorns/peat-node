@@ -24,9 +24,15 @@
 //! # Optional initial peers in `endpoint_id@host:port` form.
 //! peers:
 //!   - <endpoint_id>@10.0.0.5:4242
-//! # Optional base64 32-byte AES-256-GCM key for at-rest encryption.
-//! encryption_key: <base64-32-byte-key>
 //! ```
+//!
+//! `encryption_key` is accepted by the schema for forward compatibility with
+//! the bundle shape pinned in <https://github.com/defenseunicorns/peat/issues/940>,
+//! but [`load`] rejects bundles that set it. The byte-level cipher path it
+//! would plug into operates at a different layer than peat-node's
+//! application-level `StoreCipher` envelope; until the layer question is
+//! settled, the CLI fails fast rather than silently bypassing encryption
+//! an operator may believe is on.
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -57,12 +63,29 @@ pub fn load(explicit: Option<&Path>) -> Result<PeatCredentials, CliError> {
             path.display()
         ))
     })?;
-    parse(&raw).map_err(|e| {
+    let creds = parse(&raw).map_err(|e| {
         CliError::Auth(format!(
             "could not parse credentials file {}: {e}",
             path.display()
         ))
-    })
+    })?;
+    // `encryption_key` is accepted by the schema for forward compatibility
+    // with peat#940, but the byte-level cipher path it would plug into
+    // (`AutomergeBackendConfig.cipher`) operates at a different layer
+    // than peat-node's application-level `StoreCipher` envelope. Wiring
+    // peat-cli for at-rest encryption that interoperates with peat-node
+    // requires the layer question to be settled. Until then we reject
+    // the field with a clear error rather than silently bypassing
+    // encryption an operator may believe is on.
+    if creds.encryption_key.is_some() {
+        return Err(CliError::Auth(format!(
+            "credentials at {} set `encryption_key`, but peat-cli does not yet \
+             apply it (at-rest cipher layering is being resolved in peat#940). \
+             Remove the field, or pass an unencrypted bundle, to proceed.",
+            path.display()
+        )));
+    }
+    Ok(creds)
 }
 
 /// Resolve which path to read, without reading it. Exposed for `peat
@@ -208,5 +231,20 @@ not_a_field: oops
         std::fs::write(&path, "app_id: my-app\nshared_key: abc123\n").unwrap();
         let creds = load(Some(&path)).unwrap();
         assert_eq!(creds.app_id, "my-app");
+    }
+
+    #[test]
+    fn load_rejects_encryption_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("creds.yaml");
+        std::fs::write(
+            &path,
+            "app_id: my-app\nshared_key: abc123\nencryption_key: zzz\n",
+        )
+        .unwrap();
+        let err = load(Some(&path)).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("encryption_key"));
+        assert!(err.to_string().contains("peat#940"));
     }
 }
