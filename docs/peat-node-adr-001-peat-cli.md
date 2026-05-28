@@ -374,7 +374,7 @@ Coverage is a release blocker, not a follow-up.
 - Credential resolution: each source path, including precedence and failure modes.
 - Lifecycle state machine: timeout handling, signal handling, exit code mapping.
 
-Target: **≥ 90% line coverage** for the `peat-cli` crate, enforced in CI (`cargo llvm-cov` or `tarpaulin`).
+Target: **≥ 90% line coverage** for the `peat-cli` crate *and* for the `peat-node` workspace as a whole, enforced in CI (`cargo llvm-cov` or `tarpaulin`). The workspace threshold applies to existing crates as well; bringing them up to the bar is part of accepting this ADR.
 
 ### Integration tests (in-crate, mock backend)
 
@@ -382,9 +382,9 @@ Target: **≥ 90% line coverage** for the `peat-cli` crate, enforced in CI (`car
 - Sync-mode-to-subscription-API mapping is exercised for every command/flag combination.
 - Auth failure and permission-denied paths return correct exit codes.
 
-### End-to-end functional sync tests (workspace-level)
+### End-to-end functional sync tests (in-crate)
 
-A new `tests/e2e/` suite at the workspace root that stands up real `peat-node` instances and the `peat` binary, then asserts on observed behavior across the mesh.
+A `tests/e2e/` suite inside the `peat-cli` crate that stands up real `peat-node` instances and the `peat` binary, then asserts on observed behavior across the mesh. The harness lives with the crate so that CLI-only changes can iterate without touching workspace-level test infrastructure.
 
 Test harness requirements:
 
@@ -472,7 +472,7 @@ Functional scenarios to cover from day one:
 
 ### Phase 5 — End-to-end suite (Week 5)
 
-- Workspace `tests/e2e/` harness: multi-process topology runner.
+- In-crate `crates/peat-cli/tests/e2e/` harness: multi-process topology runner.
 - All thirty functional scenarios passing on Linux.
 - Container image updated to include `peat`; in-container smoke test green.
 
@@ -517,7 +517,8 @@ Functional scenarios to cover from day one:
 
 ## Open Questions
 
-*(None currently. All design decisions resolved during review; see "Resolved During Review" below.)*
+1. **Write authorization scope identifiers.** The ADR asserts reads and writes use distinct scopes per ADR-006 and that missing write scope fails fast with exit 3 before parsing content. The concrete scope identifiers (names, granularity per collection vs. per type, inheritance rules) need to be confirmed against the current state of ADR-006 before implementation.
+2. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
 
 ---
 
@@ -544,8 +545,6 @@ Before this ADR moves from Proposed to Accepted:
 
 - [ ] Write authorization scope model confirmed against ADR-006
 - [ ] Output schema versioning approach signed off
-- [ ] Coverage threshold confirmed
-- [ ] E2E harness location (workspace `tests/e2e/` vs per-crate) confirmed
 
 Before this ADR moves from Accepted to Implemented:
 
