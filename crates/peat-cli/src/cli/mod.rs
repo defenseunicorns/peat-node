@@ -88,6 +88,10 @@ pub enum CliError {
     Malformed(String),
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
+    /// SIGINT received while a streaming subcommand was running. Maps to
+    /// exit 130 (128 + SIGINT) by Unix convention.
+    #[error("interrupted")]
+    Interrupted,
 }
 
 impl CliError {
@@ -98,6 +102,7 @@ impl CliError {
             CliError::Auth(_) => 2,
             CliError::PermissionDenied(_) => 3,
             CliError::Malformed(_) => 4,
+            CliError::Interrupted => 130,
         }
     }
 }
@@ -107,7 +112,7 @@ impl Cli {
     pub async fn run(self) -> Result<(), CliError> {
         match self.command {
             Command::Query(args) => query::run(args, self.common).await,
-            Command::Observe(_) => Err(CliError::NotImplemented("observe")),
+            Command::Observe(args) => observe::run(args, self.common).await,
             Command::Create(_) => Err(CliError::NotImplemented("create")),
             Command::Update(_) => Err(CliError::NotImplemented("update")),
             Command::Delete(_) => Err(CliError::NotImplemented("delete")),

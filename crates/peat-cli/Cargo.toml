@@ -39,6 +39,11 @@ iroh = "=1.0.0-rc.0"
 # hands us.
 automerge = "0.7.1"
 serde_json = "1"
+# SIGPIPE handling for `observe` (ADR-001 §"Shell integration discipline":
+# pipe-close should exit silently, not crash). Default disposition kills
+# the process; we ignore the signal at startup so writes surface BrokenPipe
+# we can map to a clean exit.
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

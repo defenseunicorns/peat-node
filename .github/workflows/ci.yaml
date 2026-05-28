@@ -93,9 +93,18 @@ jobs:
           test "$code" = "2"
           test ! -s stdout.txt
           grep -q "authentication failure" stderr.txt
-          # observe is still stubbed (Phase 3 work) — confirm exit 1 + NotImplemented.
+          # observe is wired (Phase 3) — same auth-failure path as query when
+          # creds are absent.
           set +e
-          "$PEAT" observe contacts > /dev/null 2> stderr.txt
+          "$PEAT" --creds /nonexistent.yaml observe contacts > stdout.txt 2> stderr.txt
+          code=$?
+          set -e
+          test "$code" = "2"
+          test ! -s stdout.txt
+          grep -q "authentication failure" stderr.txt
+          # create is still stubbed (Phase 4a work) — confirm exit 1 + NotImplemented.
+          set +e
+          "$PEAT" create contacts --from doc.json > /dev/null 2> stderr.txt
           code=$?
           set -e
           test "$code" = "1"

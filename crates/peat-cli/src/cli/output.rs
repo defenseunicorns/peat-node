@@ -35,6 +35,45 @@ pub enum OutputFormat {
     Ndjson,
 }
 
+/// Render a single observe event — one document change emitted on each
+/// `subscribe_to_observer_changes` signal. Uses ndjson semantics regardless
+/// of the configured `OutputFormat` for the streaming subcommands, because
+/// stream consumers want one-record-per-line. `text` mode adds a leading
+/// `key=` prefix for human readability; `json` produces the bare JSON value;
+/// `ndjson` adds the key as a top-level field for `jq` selection.
+pub fn render_observe_event(key: &str, doc: &Automerge, fmt: OutputFormat) -> Result<(), CliError> {
+    let doc_json = automerge_to_json(doc);
+    let line = match fmt {
+        OutputFormat::Text => {
+            let body = serde_json::to_string(&doc_json)
+                .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?;
+            format!("{key} {body}")
+        }
+        OutputFormat::Json => serde_json::to_string(&doc_json)
+            .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?,
+        OutputFormat::Ndjson => {
+            let mut obj = serde_json::Map::with_capacity(2);
+            obj.insert("key".into(), Value::String(key.to_string()));
+            obj.insert("doc".into(), doc_json);
+            serde_json::to_string(&Value::Object(obj))
+                .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?
+        }
+    };
+    // Use writeln! so we can intercept BrokenPipe instead of panicking like
+    // println! does. Map BrokenPipe to a sentinel error that the observe
+    // loop recognises as "pipe closed, exit clean."
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    match writeln!(handle, "{line}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            Err(CliError::Generic("Broken pipe".into()))
+        }
+        Err(e) => Err(CliError::Generic(format!("stdout write: {e}"))),
+    }
+}
+
 /// Render the result of a `query` invocation.
 ///
 /// `docs` is the list returned by the store: each entry is `(key, Automerge)`

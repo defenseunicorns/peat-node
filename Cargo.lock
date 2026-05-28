@@ -3504,6 +3504,7 @@ dependencies = [
  "clap",
  "dirs",
  "iroh",
+ "libc",
  "peat-mesh",
  "peat-protocol",
  "predicates",

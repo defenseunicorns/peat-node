@@ -14,9 +14,25 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    // ADR-001 §"Shell integration discipline": pipe-close exits silently
+    // with status 0 (not a SIGPIPE-kill at the OS level). Ignore SIGPIPE so
+    // stdout writes surface a BrokenPipe error we can map to a clean exit
+    // in the streaming handlers (currently `observe`).
+    #[cfg(unix)]
+    // SAFETY: signal() with SIG_IGN has no preconditions and no async-signal
+    // safety hazard; we touch no shared state inside a handler because there
+    // is no handler.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let cli = Cli::parse();
     match cli.run().await {
         Ok(()) => ExitCode::SUCCESS,
+        Err(peat_cli::CliError::Interrupted) => {
+            // SIGINT: convention is silent exit with status 130.
+            ExitCode::from(130)
+        }
         Err(e) => {
             eprintln!("peat: {e}");
             ExitCode::from(e.exit_code())

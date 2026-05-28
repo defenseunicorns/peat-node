@@ -73,11 +73,29 @@ fn query_without_creds_exits_auth_error() {
 }
 
 #[test]
-fn observe_stub_still_returns_not_implemented() {
-    // The other write/read subcommands are still stubbed in Phase 2; this
-    // anchor will be removed as they get wired up in subsequent phases.
+fn observe_without_creds_exits_auth_error() {
+    // Same shape as query: missing creds → exit 2 with the auth message on
+    // stderr, no stdout. Confirms the streaming subcommand reaches the join
+    // prelude before any subscription work.
     peat()
-        .args(["observe", "contacts"])
+        .args([
+            "observe",
+            "contacts",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn create_stub_still_returns_not_implemented() {
+    // create/update/delete are still stubbed in Phase 4a; this anchor moves
+    // forward as each gets wired.
+    peat()
+        .args(["create", "contacts", "--from", "doc.json"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not yet implemented"));

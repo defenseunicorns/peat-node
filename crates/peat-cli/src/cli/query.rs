@@ -72,7 +72,9 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
 /// Split a target spec into `(collection, optional_doc_id)`. The grammar is
 /// the minimum the ADR demands: a single `/` separator. Trailing slashes and
 /// double slashes are malformed.
-fn parse_target(s: &str) -> Result<(&str, Option<&str>), CliError> {
+///
+/// Shared with `observe` — same target grammar.
+pub(crate) fn parse_target(s: &str) -> Result<(&str, Option<&str>), CliError> {
     if s.is_empty() {
         return Err(CliError::Malformed("target is empty".into()));
     }
