@@ -18,7 +18,11 @@ path = "src/lib.rs"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+dirs = "5"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3"
