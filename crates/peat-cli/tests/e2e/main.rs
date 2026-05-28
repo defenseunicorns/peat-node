@@ -91,14 +91,77 @@ fn observe_without_creds_exits_auth_error() {
 }
 
 #[test]
-fn create_stub_still_returns_not_implemented() {
-    // create/update/delete are still stubbed in Phase 4a; this anchor moves
-    // forward as each gets wired.
+fn create_without_creds_exits_auth_error() {
     peat()
-        .args(["create", "contacts", "--from", "doc.json"])
+        .args([
+            "create",
+            "contacts",
+            "--set",
+            "name=alice",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn create_dry_run_renders_op_without_join() {
+    // --dry-run skips the join prelude entirely, so missing creds don't
+    // matter and we get the would-be op on stdout. Confirms the
+    // ArgGroup wiring and the JSON shape of the dry-run output.
+    peat()
+        .args([
+            "create",
+            "contacts",
+            "--id",
+            "c-1",
+            "--set",
+            "name=alice",
+            "--set",
+            "position.lat=40.7128",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""))
+        .stdout(predicate::str::contains("\"key\": \"contacts:c-1\""))
+        .stdout(predicate::str::contains("\"name\": \"alice\""))
+        .stdout(predicate::str::contains("\"lat\": 40.7128"));
+}
+
+#[test]
+fn update_from_returns_not_implemented_with_upstream_link() {
+    // --from is gated on peat-mesh#187; the error names the issue so
+    // operators know where to look. Note: clap parses --from before the
+    // handler runs, so we need a valid --from arg shape even though we
+    // never read the file.
+    peat()
+        .args(["update", "contacts/c-1", "--from", "doc.json"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("update --from"))
+        .stderr(predicate::str::contains("peat-mesh#187"));
+}
+
+#[test]
+fn update_without_target_doc_id_is_malformed() {
+    peat()
+        .args(["update", "contacts", "--set", "name=alice"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("update requires"));
+}
+
+#[test]
+fn delete_without_target_doc_id_is_malformed() {
+    peat()
+        .args(["delete", "contacts"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("delete requires"));
 }
 
 #[test]

@@ -4,6 +4,7 @@ pub mod observe;
 pub mod output;
 pub mod query;
 pub mod update;
+pub mod writes;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -113,9 +114,9 @@ impl Cli {
         match self.command {
             Command::Query(args) => query::run(args, self.common).await,
             Command::Observe(args) => observe::run(args, self.common).await,
-            Command::Create(_) => Err(CliError::NotImplemented("create")),
-            Command::Update(_) => Err(CliError::NotImplemented("update")),
-            Command::Delete(_) => Err(CliError::NotImplemented("delete")),
+            Command::Create(args) => create::run(args, self.common).await,
+            Command::Update(args) => update::run(args, self.common).await,
+            Command::Delete(args) => delete::run(args, self.common).await,
         }
     }
 }

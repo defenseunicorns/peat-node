@@ -102,13 +102,17 @@ jobs:
           test "$code" = "2"
           test ! -s stdout.txt
           grep -q "authentication failure" stderr.txt
-          # create is still stubbed (Phase 4a work) — confirm exit 1 + NotImplemented.
+          # create --dry-run skips the join prelude — confirm it renders.
+          "$PEAT" create contacts --id c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
+          grep -q '"op": "create"' stdout.txt
+          grep -q '"key": "contacts:c-1"' stdout.txt
+          # update --from is gated on peat-mesh#187 — confirm error wiring.
           set +e
-          "$PEAT" create contacts --from doc.json > /dev/null 2> stderr.txt
+          "$PEAT" update contacts/c-1 --from doc.json > /dev/null 2> stderr.txt
           code=$?
           set -e
           test "$code" = "1"
-          grep -q "not yet implemented" stderr.txt
+          grep -q "peat-mesh#187" stderr.txt
 
   helm-lint:
     name: Helm Lint
