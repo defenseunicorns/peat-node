@@ -1,12 +1,19 @@
 //! End-to-end functional tests for the `peat` binary.
 //!
 //! Per peat-node ADR-001: this suite spawns the real `peat` binary as a
-//! subprocess and asserts on its stdout / stderr / exit code. It is the
-//! infrastructure on which Phase 2+ behavioral tests (multi-node sync,
-//! credential resolution, observe streaming, etc.) will be built.
+//! subprocess and asserts on its stdout / stderr / exit code.
 //!
-//! Phase 1 only exercises the binary's own surface: `--help`, `--version`,
-//! subcommand `--help`, and the documented stub exit code + stderr line.
+//! Two layers:
+//!   - **Surface** tests (this file): exercise the binary's own surface
+//!     — `--help`, exit codes, parser errors, dry-run paths. Don't need
+//!     a live mesh peer.
+//!   - **Scenario** tests (this file via `mod scenarios`): stand up a
+//!     real `AutomergeBackend` peer via `topology::TestPeer` and verify
+//!     end-to-end behavior across the wire. Slower (real Iroh
+//!     handshakes) but exercise the same code paths as production.
+
+mod scenarios;
+mod topology;
 
 use assert_cmd::Command;
 use predicates::prelude::*;

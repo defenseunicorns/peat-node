@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use peat_mesh::storage::SyncTransport;
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use tempfile::TempDir;
 
@@ -40,6 +41,12 @@ impl Default for SessionOptions {
         }
     }
 }
+
+/// Settle window after the join + per-peer sync_all kick to let the peer's
+/// reciprocal catch-up sync drain into the CLI's local store. Loopback and
+/// LAN handshakes typically finish well under this; very slow links may
+/// need more (and individual read commands poll on top — see query.rs).
+const POST_JOIN_SETTLE: Duration = Duration::from_millis(1000);
 
 /// A live mesh participant. Holds the backend plus the tempdir its store
 /// lives in so cleanup is RAII.
@@ -106,11 +113,57 @@ impl MeshSession {
             )));
         }
 
+        // Kick off initial sync per connected peer. `start_sync_connection`
+        // wired the transport above; this asks each peer for the documents
+        // they have so the CLI's local store gets populated. Mirrors
+        // `peat-node` src/node.rs::start_sync. Errors are logged but don't
+        // fail the join — partial sync is still useful to subsequent
+        // commands.
+        for peer_id in backend.transport().connected_peers() {
+            if let Err(e) = backend
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
+                tracing::warn!(peer = %peer_id, "initial sync_all_documents failed: {e}");
+            }
+        }
+
+        // Spawn the same on-change pusher peat-node runs: when the local
+        // store accepts a write (via `create` / `update` / `delete`), push
+        // it to every currently-connected peer. Without this the CLI's
+        // writes stay local — `--wait-for-sync` would only block on a
+        // local timer, with nothing actually flowing across the wire.
+        // Task is owned by the MeshSession's tokio runtime; it terminates
+        // when the broadcast channel closes (i.e. when the backend is
+        // dropped on session drop).
+        Self::spawn_on_change_pusher(&backend);
+
+        // Brief settle window for the peer's reciprocal sync to drain into
+        // our local store. peat-mesh doesn't surface a "sync caught up"
+        // signal; this fixed window is the v1 heuristic — long enough for
+        // loopback / LAN, short enough that interactive CLI feels snappy.
+        // Subcommands that need stronger guarantees layer additional
+        // polling on top (see query.rs).
+        tokio::time::sleep(POST_JOIN_SETTLE).await;
+
         Ok(Self {
             backend,
             node_id,
             _data_dir: data_dir,
         })
+    }
+
+    fn spawn_on_change_pusher(backend: &Arc<AutomergeBackend>) {
+        let mut rx = backend.store().subscribe_to_changes();
+        let coord = Arc::clone(backend.coordinator());
+        tokio::spawn(async move {
+            while let Ok(key) = rx.recv().await {
+                if let Err(e) = coord.sync_document_with_all_peers(&key).await {
+                    tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+                }
+            }
+        });
     }
 
     pub fn backend(&self) -> &Arc<AutomergeBackend> {

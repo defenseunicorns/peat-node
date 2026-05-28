@@ -2,6 +2,7 @@
 
 use clap::Args;
 use peat_mesh::qos::Tombstone;
+use peat_mesh::storage::SyncTransport;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::query::parse_target;
@@ -55,6 +56,23 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
         .store()
         .put_tombstone(&tombstone)
         .map_err(|e| CliError::Generic(format!("put_tombstone: {e}")))?;
+
+    // peat-mesh stores tombstones in a separate table and does NOT fire
+    // the document-changes observer, so the join-prelude on-change pusher
+    // won't see this write. Explicitly push tombstones to each connected
+    // peer; this is what peat-node's delete path will eventually do once
+    // the cross-peer tombstone protocol is wired in src/node.rs (today
+    // peat-node's delete is local-only too). For the CLI we do it inline.
+    for peer_id in session.backend().transport().connected_peers() {
+        if let Err(e) = session
+            .backend()
+            .coordinator()
+            .send_tombstones_to_peer(peer_id)
+            .await
+        {
+            tracing::warn!(peer = %peer_id, "send_tombstones_to_peer failed: {e}");
+        }
+    }
 
     if args.wait_for_sync {
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;

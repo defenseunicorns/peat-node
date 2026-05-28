@@ -48,3 +48,5 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# E2E topology helper builds creds with a base64-encoded test formation key.
+base64 = "0.22"

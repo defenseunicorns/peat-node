@@ -1,7 +1,7 @@
 //! `peat query` — fetch current materialized state and exit (ADR-001 §Lifecycle).
 
 use clap::Args;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cli::output::render_query;
 use crate::cli::{parse_timeout, CliError, CommonArgs};
@@ -18,12 +18,14 @@ pub struct QueryArgs {
     pub limit: Option<usize>,
 }
 
-/// Settle window after `MeshSession::open` returns, giving the initial sync
-/// from the connected peer(s) time to populate the local store before we
-/// snapshot it. peat-mesh today doesn't surface a "sync drained" signal —
-/// this fixed window is the v1 heuristic; revisit when the upstream API grows
-/// a per-peer drain marker.
-const POST_CONNECT_SETTLE: Duration = Duration::from_millis(500);
+/// Polling interval for "wait for sync to populate" after connect. Tighter
+/// than the timeout so we don't block longer than necessary when sync
+/// completes quickly.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Minimum settle window before the first read attempt. Gives `sync_all_documents_with_peer`
+/// a head start so the very first scan isn't racing the handshake.
+const INITIAL_SETTLE: Duration = Duration::from_millis(250);
 
 pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
     let (collection, doc_id) = parse_target(&args.target)?;
@@ -40,33 +42,43 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
     )
     .await?;
 
-    tokio::time::sleep(POST_CONNECT_SETTLE).await;
+    tokio::time::sleep(INITIAL_SETTLE).await;
 
     let store = session.backend().store();
-    let docs = match doc_id {
-        Some(id) => {
-            let key = format!("{collection}:{id}");
-            match store
-                .get(&key)
-                .map_err(|e| CliError::Generic(format!("read `{key}`: {e}")))?
-            {
-                Some(doc) => vec![(key, doc)],
-                None => Vec::new(),
+    // Poll for state: peat-mesh doesn't surface a per-peer "sync drained"
+    // signal, so we re-read every POLL_INTERVAL up to --timeout. As soon as
+    // we see ANY matching state, return it. Empty-after-timeout is also a
+    // valid result (the target genuinely has no matching documents).
+    let deadline = Instant::now() + timeout;
+    loop {
+        let docs = match doc_id {
+            Some(id) => {
+                let key = format!("{collection}:{id}");
+                match store
+                    .get(&key)
+                    .map_err(|e| CliError::Generic(format!("read `{key}`: {e}")))?
+                {
+                    Some(doc) => vec![(key, doc)],
+                    None => Vec::new(),
+                }
             }
-        }
-        None => {
-            let prefix = format!("{collection}:");
-            let mut entries = store
-                .scan_prefix(&prefix)
-                .map_err(|e| CliError::Generic(format!("scan `{prefix}`: {e}")))?;
-            if let Some(n) = args.limit {
-                entries.truncate(n);
+            None => {
+                let prefix = format!("{collection}:");
+                let mut entries = store
+                    .scan_prefix(&prefix)
+                    .map_err(|e| CliError::Generic(format!("scan `{prefix}`: {e}")))?;
+                if let Some(n) = args.limit {
+                    entries.truncate(n);
+                }
+                entries
             }
-            entries
-        }
-    };
+        };
 
-    render_query(&docs, common.output)
+        if !docs.is_empty() || Instant::now() >= deadline {
+            return render_query(&docs, common.output);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Split a target spec into `(collection, optional_doc_id)`. The grammar is
