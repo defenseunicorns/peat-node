@@ -374,7 +374,7 @@ Coverage is a release blocker, not a follow-up.
 - Credential resolution: each source path, including precedence and failure modes.
 - Lifecycle state machine: timeout handling, signal handling, exit code mapping.
 
-Target: **≥ 90% line coverage** for the `peat-cli` crate *and* for the `peat-node` workspace as a whole, enforced in CI (`cargo llvm-cov` or `tarpaulin`). The workspace threshold applies to existing crates as well; bringing them up to the bar is part of accepting this ADR.
+Target: **≥ 90% line coverage** for the `peat-cli` crate, enforced in CI (`cargo llvm-cov` or `tarpaulin`). Raising existing `peat-node` crate coverage to the same bar is desirable but out of scope for this ADR and tracked separately.
 
 ### Integration tests (in-crate, mock backend)
 
