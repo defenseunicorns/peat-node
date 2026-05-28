@@ -73,6 +73,23 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo build --workspace --release
+      - name: peat binary smoke test
+        run: |
+          set -euo pipefail
+          PEAT=./target/release/peat
+          test -x "$PEAT"
+          "$PEAT" --version
+          "$PEAT" --help > /dev/null
+          for sub in query observe create update delete; do
+            "$PEAT" "$sub" --help > /dev/null
+          done
+          # Phase 1 handlers return NotImplemented (exit 1) per ADR-001.
+          set +e
+          "$PEAT" query contacts > /dev/null 2> stderr.txt
+          code=$?
+          set -e
+          test "$code" = "1"
+          grep -q "not yet implemented" stderr.txt
 
   helm-lint:
     name: Helm Lint
