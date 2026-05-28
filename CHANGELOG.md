@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-05-28
+
+Patch release. Picks up the **peat-mesh#175 closure follow-throughs** published in [peat-mesh v0.9.0-rc.27](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.27) (was rc.26). Also rolls forward to consume the peat-cli scaffolding that merged on `main` between 0.3.5 and this release ([peat-node#103](https://github.com/defenseunicorns/peat-node/pull/103)). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.5.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.27"`** (was `rc.26`). Spans three peat-mesh#175 follow-through PRs:
+  - [peat-mesh#189](https://github.com/defenseunicorns/peat-mesh/pull/189) — `AutomergeBackend::get` keyed-lookup override (closes [peat-mesh#186](https://github.com/defenseunicorns/peat-mesh/issues/186)). The trait-default `DocumentStore::get(collection, id)` routed through `query(Query::Eq{id})` → `scan_prefix(collection_prefix)` + Automerge-deserialize of every entry in the collection — O(N) per lookup, O(N²) when looped over a set of IDs. The override does one redb point lookup + one Automerge parse using the same `key_for(collection, id)` shape the upsert path already builds — O(1) w.r.t. collection size. Deletion semantics preserved (soft-deleted docs return `None`; `IncludeDeleted` callers continue to route through `query()`).
+  - [peat-mesh#190](https://github.com/defenseunicorns/peat-mesh/pull/190) — `InMemoryBackend::get` analog. Same O(N)→O(1) shape on the in-memory backend (two HashMap point lookups vs `col.values()` iteration).
+  - [peat-mesh#188](https://github.com/defenseunicorns/peat-mesh/pull/188) — UAT file-header doc-comment scope clarification distinguishing the in-CI symmetric two-peer / single-relay case from the peat-sim 7n-dual-c2 multi-emitter / oversubscribed-link case. Doc-only.
+
+  Both perf overrides are pure behavioural improvements — no API surface change, no contract change. peat-node's `DocumentStore::get` call sites transparently get the faster path.
+- **`peat-protocol`** resolves unchanged at `>=0.9.0-rc.17, <0.9.1` — peat-protocol rc.17's workspace pin `peat-mesh = ">=0.9.0-rc.25, <0.9.1"` already permits rc.27 transitively, so no floor advance is needed.
+- **`iroh = "=1.0.0-rc.0"`** unchanged from 0.3.5.
+
+### Added
+
+- **`crates/peat-cli/`** ([peat-node#103](https://github.com/defenseunicorns/peat-node/pull/103), ADR-001). New workspace member: the `peat` operator CLI as a Peat node. Phase-1 scaffolding only — all subcommand handlers stub to `CliError::NotImplemented`; full mesh wiring lands in subsequent phases. Cargo workspace conversion landed alongside (root `[workspace] members = ["crates/*"]`); existing `peat-node` package remains in place.
+
+### Impact on peat-node
+
+**None at the surface level.** peat-node uses `peat_mesh::storage::*`, `peat_mesh::sync::AutomergeBackend`, and `peat_protocol::storage::*`. The peat-mesh rc.27 perf overrides preserve all existing contracts (return types, deletion-filter semantics, observer paths); any caller using `DocumentStore::get` transparently gets the faster path. peat-cli is a new workspace member not invoked from the sidecar runtime.
+
+### Compatibility
+
+No source changes for sidecar consumers. The `proto/sidecar.proto` wire contract, Connect RPC surface, and on-disk `ENC:v1:` envelope format are all unchanged from 0.3.5. Existing 0.3.5 sidecar clients can be redeployed against the 0.3.6 image with no code changes.
+
+Cross-cluster sync validated end-to-end on the k3d × 2 integration suite under the bumped stack ([peat-node#108](https://github.com/defenseunicorns/peat-node/pull/108) CI, 7m53s). 183 tests pass across 27 test binaries.
+
 ## [0.3.5] - 2026-05-28
 
 Patch release. Picks up the **persistent multiplexed sync streams + peat-mesh#175 regression coverage** trail published across peat-mesh and peat-protocol over 2026-05-26 → 2026-05-28: [peat-mesh v0.9.0-rc.26](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.26) (was rc.24, two rc-step advance through rc.25's ADR-063 closure and rc.26's in-CI behavioural UAT) and [peat-protocol / peat v0.9.0-rc.17](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.17) (was rc.16). Also lands the peat-node-side auto-reconnect-after-blackout fix. Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.4.
