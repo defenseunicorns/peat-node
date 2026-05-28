@@ -3502,11 +3502,18 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dirs",
+ "iroh",
+ "peat-mesh",
+ "peat-protocol",
  "predicates",
  "serde",
  "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
