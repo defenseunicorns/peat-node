@@ -34,6 +34,11 @@ tempfile = "3"
 peat-mesh = { version = "=0.9.0-rc.26", features = ["automerge-backend"] }
 peat-protocol = { version = ">=0.9.0-rc.17, <0.9.1", features = ["automerge-backend"] }
 iroh = "=1.0.0-rc.0"
+# Pinned to match peat-mesh's `automerge` dep so the `Automerge` type peat-cli
+# names (from store.get / scan_prefix) is ABI-compatible with what the backend
+# hands us.
+automerge = "0.7.1"
+serde_json = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -83,9 +83,19 @@ jobs:
           for sub in query observe create update delete; do
             "$PEAT" "$sub" --help > /dev/null
           done
-          # Phase 1 handlers return NotImplemented (exit 1) per ADR-001.
+          # query handler is wired (Phase 2). With a non-existent creds path
+          # it must exit 2 (auth) per the ADR-001 exit-code table, with
+          # empty stdout and the explanation on stderr.
           set +e
-          "$PEAT" query contacts > /dev/null 2> stderr.txt
+          "$PEAT" --creds /nonexistent.yaml query contacts > stdout.txt 2> stderr.txt
+          code=$?
+          set -e
+          test "$code" = "2"
+          test ! -s stdout.txt
+          grep -q "authentication failure" stderr.txt
+          # observe is still stubbed (Phase 3 work) — confirm exit 1 + NotImplemented.
+          set +e
+          "$PEAT" observe contacts > /dev/null 2> stderr.txt
           code=$?
           set -e
           test "$code" = "1"

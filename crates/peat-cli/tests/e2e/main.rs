@@ -54,14 +54,32 @@ fn subcommand_help_renders() {
 }
 
 #[test]
-fn query_stub_exits_with_documented_code() {
-    // ADR-001 "Shell integration discipline": NotImplemented maps to exit 1
-    // and the explanation lands on stderr, not stdout.
+fn query_without_creds_exits_auth_error() {
+    // ADR-001 "Shell integration discipline": auth failure → exit 2, empty
+    // stdout, explanation on stderr. Passing a path that doesn't exist
+    // bypasses any platform-default config that may be present on the
+    // developer's machine.
     peat()
-        .args(["query", "contacts"])
+        .args([
+            "query",
+            "contacts",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn observe_stub_still_returns_not_implemented() {
+    // The other write/read subcommands are still stubbed in Phase 2; this
+    // anchor will be removed as they get wired up in subsequent phases.
+    peat()
+        .args(["observe", "contacts"])
         .assert()
         .code(1)
-        .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("not yet implemented"));
 }
 

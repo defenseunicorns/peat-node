@@ -3500,6 +3500,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "automerge",
  "clap",
  "dirs",
  "iroh",
@@ -3507,6 +3508,7 @@ dependencies = [
  "peat-protocol",
  "predicates",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
