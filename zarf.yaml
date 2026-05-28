@@ -2,7 +2,7 @@ kind: ZarfPackageConfig
 metadata:
   name: peat-node
   description: Peat mesh sidecar for DDIL-resilient fleet state sync
-  version: 0.3.4
+  version: 0.3.5
   url: https://github.com/defenseunicorns/peat-node
 
 components:
@@ -10,12 +10,12 @@ components:
     required: true
     description: Deploy peat-node mesh node
     images:
-      - ghcr.io/defenseunicorns/peat-node:v0.3.4
+      - ghcr.io/defenseunicorns/peat-node:v0.3.5
     charts:
       - name: peat-node
         localPath: chart/peat-node
         namespace: peat-system
-        version: 0.3.4
+        version: 0.3.5
         valuesFiles:
           - chart/peat-node/values.yaml
     actions:
