@@ -14,6 +14,13 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
+# rc.26 (peat-mesh#184): adds the in-CI behavioural UAT for peat-mesh#175
+# delivery-ratio thresholds under constrained-bandwidth shaping —
+# pairs with rc.25's architectural pin (peat-mesh#180) for code-shape +
+# measurement coverage of the persistent multiplexed sync stream
+# wire-up. Test-only addition; no production API surface change vs
+# rc.25.
+#
 # rc.25 (peat-mesh#176/#178/#180, ADR-063): persistent multiplexed sync
 # streams. `AutomergeBackend` now owns a strong `Arc<SyncChannelManager>`
 # so the coordinator's `Weak` no longer dangles at construction-scope
@@ -33,7 +40,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.25", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.26", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
