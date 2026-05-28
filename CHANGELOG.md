@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-05-28
+
+Patch release. Picks up the **persistent multiplexed sync streams + peat-mesh#175 regression coverage** trail published across peat-mesh and peat-protocol over 2026-05-26 → 2026-05-28: [peat-mesh v0.9.0-rc.26](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.26) (was rc.24, two rc-step advance through rc.25's ADR-063 closure and rc.26's in-CI behavioural UAT) and [peat-protocol / peat v0.9.0-rc.17](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.17) (was rc.16). Also lands the peat-node-side auto-reconnect-after-blackout fix. Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.4.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.26"`** (was `rc.24`). Spans:
+  - rc.25 ([peat-mesh#176](https://github.com/defenseunicorns/peat-mesh/pull/176), [peat-mesh#178](https://github.com/defenseunicorns/peat-mesh/pull/178), [peat-mesh#180](https://github.com/defenseunicorns/peat-mesh/pull/180); ADR-063): persistent multiplexed sync streams. `AutomergeBackend` owns a strong `Arc<SyncChannelManager>`, closing the dropped-`Arc` symptom from [peat-mesh#175](https://github.com/defenseunicorns/peat-mesh/issues/175); per-peer writer-task + bounded mpsc replaces per-message stream-open + per-peer mutex. Persistent path is internal to peat-mesh — peat-node API surface unchanged.
+  - rc.26 ([peat-mesh#184](https://github.com/defenseunicorns/peat-mesh/pull/184)): in-CI behavioural UAT for peat-mesh#175 delivery-ratio thresholds under constrained-bandwidth shaping (256 kbps, ~MTU bucket, 100 ms one-way delay). Pairs with rc.25's architectural pin from [peat-mesh#180](https://github.com/defenseunicorns/peat-mesh/pull/180) for code-shape + measurement coverage. Test-only addition; no peat-node-side adaptation.
+- **`peat-protocol` resolves to `0.9.0-rc.17`** (floor advanced from `>=0.9.0-rc.16` to `>=0.9.0-rc.17`; range upper bound `<0.9.1` unchanged): rc.17 ([defenseunicorns/peat#936](https://github.com/defenseunicorns/peat/pull/936)) ships the ADR-063 docs and advances the workspace's peat-mesh floor to rc.25 so peat-protocol picks up the persistent-stream wire-up.
+- **`iroh = "=1.0.0-rc.0"`** unchanged from 0.3.4. The exact-pin to peat-mesh's iroh version is preserved — iroh's process-global crypto provider + ALPN registry have undefined behavior under split-version linkage.
+
+### Fixed
+
+- **Auto-reconnect peers after blackout** ([peat-node#99](https://github.com/defenseunicorns/peat-node/pull/99), closes [peat-node#91](https://github.com/defenseunicorns/peat-node/issues/91)): a peer that disconnected during a transport blackout was not being re-attempted automatically — operator had to restart the sidecar to recover the link. Reconnect loop now correctly resumes once iroh reports the peer reachable again.
+
+### CI
+
+- **QA review workflow** ([peat-node#101](https://github.com/defenseunicorns/peat-node/pull/101), refs [defenseunicorns/peat#937](https://github.com/defenseunicorns/peat/issues/937)): retrieve prior review content via `gh` rather than a sandboxed temp file, fixing a sandbox-permission-denied class of QA-review failures.
+
+### Impact on peat-node
+
+**None at the surface level.** peat-node uses `peat_mesh::storage::*`, `peat_mesh::sync::AutomergeBackend`, and `peat_protocol::storage::*`. The peat-mesh rc.25 persistent-stream refactor is internal to the backend; rc.26 is test-only. The bumps are pure version advances.
+
+### Compatibility
+
+No source changes for sidecar consumers. The `proto/sidecar.proto` wire contract, Connect RPC surface, and on-disk `ENC:v1:` envelope format are all unchanged from 0.3.4. Existing 0.3.4 sidecar clients can be redeployed against the 0.3.5 image with no code changes.
+
+Cross-cluster sync validated end-to-end on the k3d × 2 integration suite under the bumped stack ([peat-node#104](https://github.com/defenseunicorns/peat-node/pull/104) CI, 8m16s). 161 tests pass across 22 test binaries.
+
 ## [0.3.4] - 2026-05-26
 
 Patch release. Picks up the **ADR-062 Phase 2 follow-up trail** published across peat-mesh and peat-protocol over 2026-05-25 / 2026-05-26: [peat-mesh v0.9.0-rc.24](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.24) (was rc.20) and [peat-protocol / peat v0.9.0-rc.16](https://github.com/defenseunicorns/peat/releases/tag/v0.9.0-rc.16) (was rc.14). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.3.
