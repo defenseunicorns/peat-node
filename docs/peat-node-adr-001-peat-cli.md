@@ -553,9 +553,9 @@ Before this ADR moves from Proposed to Accepted:
 
 Before this ADR moves from Accepted to Implemented:
 
-- [ ] All thirty E2E scenarios passing in CI
-- [ ] Coverage target met
-- [ ] `peat` binary present in container image
+- [ ] All thirty E2E scenarios passing in CI (8 representative scenarios landed in Phase 5; remaining ADR scenarios that depend on `update --from`, `observe --since`, or per-collection write scopes are gated on the upstream issues filed under Open Questions)
+- [ ] Coverage target met (`cargo llvm-cov -p peat-cli` ≥ 90 %)
+- [x] `peat` binary present in container image (Phase 6 — Dockerfile builds `--workspace` and copies `/usr/local/bin/peat`)
 - [ ] Cross-platform builds green
 - [ ] Operator quickstart documented (including round-trip edit pattern)
 

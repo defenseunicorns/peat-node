@@ -81,6 +81,7 @@ async fn await_key_gone(peer: &TestPeer, key: &str, deadline: Duration) {
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn query_returns_doc_written_on_peer() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice", "rank": 1}), None).unwrap();
@@ -96,6 +97,7 @@ async fn query_returns_doc_written_on_peer() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn query_collection_returns_all_docs_keyed() {
     let peer = TestPeer::start().await;
     for (id, name) in [("c-1", "alice"), ("c-2", "bob"), ("c-3", "carol")] {
@@ -116,6 +118,7 @@ async fn query_collection_returns_all_docs_keyed() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn create_propagates_to_peer() {
     let peer = TestPeer::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -141,6 +144,7 @@ async fn create_propagates_to_peer() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn update_set_modifies_existing_doc() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice", "rank": 1}), None).unwrap();
@@ -171,6 +175,7 @@ async fn update_set_modifies_existing_doc() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn update_set_against_missing_doc_creates_it() {
     // ADR-021 + ADR-001: update is upsert-shaped — initial update on a
     // missing doc is initial creation, not recreation.
@@ -195,6 +200,7 @@ async fn update_set_against_missing_doc_creates_it() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn delete_tombstones_doc_on_peer() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice"}), None).unwrap();
@@ -210,6 +216,7 @@ async fn delete_tombstones_doc_on_peer() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn create_rejects_duplicate_id() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice"}), None).unwrap();
@@ -255,6 +262,7 @@ async fn create_rejects_duplicate_id() {
 }
 
 #[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn query_limit_caps_result_count() {
     let peer = TestPeer::start().await;
     for i in 0..10 {

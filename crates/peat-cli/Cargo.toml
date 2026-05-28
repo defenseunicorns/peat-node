@@ -50,3 +50,8 @@ assert_cmd = "2"
 predicates = "3"
 # E2E topology helper builds creds with a base64-encoded test formation key.
 base64 = "0.22"
+# Multi-node e2e scenarios each spin up their own Iroh endpoint plus
+# spawn a peat subprocess. Running them in parallel saturates the system
+# crypto provider and triggers handshake races. Mirrors peat-node's own
+# tests/sync_test.rs pattern (`#[serial(iroh_two_node)]`).
+serial_test = "3"

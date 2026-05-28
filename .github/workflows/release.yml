@@ -169,9 +169,95 @@ jobs:
             docker buildx imagetools inspect "$tag"
           done
 
+  peat-cli-binaries:
+    # Phase 6 of peat-node ADR-001: attach the `peat` operator binary
+    # for every supported platform to each tagged release. Native runners
+    # per target — cross-compilation isn't necessary and avoids the
+    # QEMU/cross-rs flakiness peat-node hit on the container side.
+    name: peat-cli (${{ matrix.target.label }})
+    needs: validate-tag
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            archive: tar.gz
+          - label: linux-aarch64
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - label: macos-x86_64
+            os: macos-13
+            archive: tar.gz
+          - label: macos-aarch64
+            os: macos-14
+            archive: tar.gz
+          - label: windows-x86_64
+            os: windows-latest
+            archive: zip
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y --no-progress
+      - name: Build peat-cli
+        run: cargo build --release -p peat-cli
+      - name: Smoke `peat --help` (Unix)
+        if: runner.os != 'Windows'
+        run: ./target/release/peat --help > /dev/null
+      - name: Smoke `peat --help` (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\target\release\peat.exe --help > $null
+      - name: Package (tar.gz)
+        if: matrix.target.archive == 'tar.gz'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="peat-${VERSION}-${{ matrix.target.label }}"
+          mkdir "$STAGE"
+          cp target/release/peat "$STAGE/"
+          cp crates/peat-cli/README.md "$STAGE/README.md"
+          cp LICENSE "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+      - name: Package (zip)
+        if: matrix.target.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $stage = "peat-${version}-${{ matrix.target.label }}"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target\release\peat.exe -Destination $stage
+          Copy-Item crates\peat-cli\README.md -Destination "$stage\README.md"
+          Copy-Item LICENSE -Destination $stage
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash | Out-File "$stage.zip.sha256"
+      - name: Upload artifact for release job
+        uses: actions/upload-artifact@v4
+        with:
+          name: peat-cli-${{ matrix.target.label }}
+          path: |
+            peat-*.tar.gz
+            peat-*.tar.gz.sha256
+            peat-*.zip
+            peat-*.zip.sha256
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: GitHub Release
-    needs: manifest
+    needs: [manifest, peat-cli-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -213,3 +299,18 @@ jobs:
           fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download peat-cli binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/peat-binaries
+          pattern: peat-cli-*
+          merge-multiple: true
+      - name: Attach peat-cli binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd /tmp/peat-binaries
+          ls -la
+          # --clobber so a re-run of a tag replaces previous assets.
+          gh release upload "$GITHUB_REF_NAME" peat-*.tar.gz peat-*.tar.gz.sha256 peat-*.zip peat-*.zip.sha256 --clobber
