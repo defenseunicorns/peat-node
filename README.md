@@ -101,6 +101,28 @@ cargo build --release
 
 Every CLI flag has a `PEAT_NODE_*` environment variable equivalent — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for the full reference.
 
+## Operator CLI (`peat`)
+
+`peat-node` ships with **`peat`**, an operator CLI that joins the mesh as a real Peat node and runs a CRUD-shaped command, then exits. See [peat-node ADR-001](docs/peat-node-adr-001-peat-cli.md) for the design, and [`crates/peat-cli/README.md`](crates/peat-cli/README.md) for the operator quickstart.
+
+```bash
+peat query contacts/c-1234 --output json
+peat observe contacts --output ndjson | jq 'select(.doc.rank > 3)'
+peat create contacts --id c-1234 --from contact.json --wait-for-sync
+peat update contacts/c-1234 --set rank=2 --wait-for-sync
+peat delete contacts/c-1234
+```
+
+The binary is included in the `peat-node` container image at `/usr/local/bin/peat`, so `kubectl exec` reaches a debug surface with no extra sidecar:
+
+```bash
+kubectl exec -n peat -it deploy/peat-node -- peat \
+  --creds /etc/peat/credentials.yaml \
+  query contacts/c-1234 --output json
+```
+
+Standalone binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64) are attached to each tagged release.
+
 ## gRPC API
 
 The sidecar exposes `peat.sidecar.v1.PeatSidecar` with 25 RPCs:

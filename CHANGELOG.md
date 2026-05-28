@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`peat` operator CLI — Phase 2–6 build-out** ([peat-node ADR-001](docs/peat-node-adr-001-peat-cli.md), PR [#107](https://github.com/defenseunicorns/peat-node/pull/107)). 0.3.6 shipped the Phase 1 scaffolding (workspace conversion + skeleton via [peat-node#103](https://github.com/defenseunicorns/peat-node/pull/103)); this PR wires all subcommand handlers to the live mesh:
+  - **Read commands:** `peat query <COLLECTION>[/<DOC_ID>]` (materialised current state then exit) and `peat observe <COLLECTION>[/<DOC_ID>]` (stream changes until SIGINT).
+  - **Write commands:** `peat create`, `peat update --set` (upsert per ADR-021), and `peat delete` (tombstone per ADR-034). `peat update --from` is gated on [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) and returns `NotImplemented` until that lands.
+  - **Output formats:** `text` (default, generic CRDT renderer), `json` (canonical), `ndjson` (one record per line for `observe`).
+  - **Shell discipline:** data → stdout, logs/errors → stderr; documented exit code table (0/1/2/3/4/130); SIGPIPE-ignore at startup; SIGINT silent-exit.
+  - **Distribution:** included in the `peat-node` container image at `/usr/local/bin/peat`; standalone binaries (`.tar.gz` + SHA-256 on Unix, `.zip` + SHA-256 on Windows) for Linux x86_64 / Linux aarch64 / macOS x86_64 / macOS aarch64 / Windows x86_64 attached to each tagged release.
+  - **Testing:** 70 tests — 34 unit, 15 in-process parser, 21 binary e2e (13 surface tests + 8 real-mesh CRUD-lifecycle scenarios spawning the `peat` subprocess against an in-process `AutomergeBackend` peer with formation auth over loopback Iroh).
+- **Optional pre-commit hook** at `.githooks/pre-commit` runs `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` when Rust files are staged. Enable per-clone with `git config core.hooksPath .githooks`.
+- **Cross-platform CI matrix.** `.github/workflows/ci.yaml` adds a `cross-platform` job covering macOS aarch64 (workspace build + `peat-cli` tests) and Windows x86_64 (`peat-cli` build). Closes the "Windows in Constraints but not in CI gates" ADR-001 review finding.
+
+### Upstream landed
+
+- **[peat#940](https://github.com/defenseunicorns/peat/issues/940)** — operator credential bundle file format formalised in ADR-006 (via [peat#944](https://github.com/defenseunicorns/peat/pull/944)). `peat-cli`'s `crates/peat-cli/src/creds.rs` shape (`app_id` + `shared_key` + optional `peers`) is now the canonical bundle; file-system custody normative requirements (mode 0600, refuse on world/group-readable).
+
+### Open upstream tracking
+
+- [peat#941](https://github.com/defenseunicorns/peat/issues/941) — authorization model. **Deferred** pending ADR-006 Layer 1 device identity. `peat-cli`'s "exit 3 before content parse" path stays as scaffolding for the future design; today's access boundary is formation-key custody.
+- [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) — Automerge delta API. Blocks `peat update --from`.
+- [peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192) — Lamport-clock source. `peat delete` uses wall-clock proxy until this lands.
+- [peat#946](https://github.com/defenseunicorns/peat/issues/946) — peat-schema runtime type metadata registry. Blocks typed renderer dispatch + schema-validated writes (filed P0).
+
 ## [0.3.6] - 2026-05-28
 
 Patch release. Picks up the **peat-mesh#175 closure follow-throughs** published in [peat-mesh v0.9.0-rc.27](https://github.com/defenseunicorns/peat-mesh/releases/tag/v0.9.0-rc.27) (was rc.26). Also rolls forward to consume the peat-cli scaffolding that merged on `main` between 0.3.5 and this release ([peat-node#103](https://github.com/defenseunicorns/peat-node/pull/103)). Sidecar gRPC surface and on-the-wire formats are unchanged from 0.3.5.
