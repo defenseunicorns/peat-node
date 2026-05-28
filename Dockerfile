@@ -19,6 +19,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY build.rs build.rs
 COPY proto proto
 COPY src src
+COPY crates crates
 
 RUN cargo build --release
 
