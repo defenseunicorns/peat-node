@@ -6,12 +6,45 @@
 //! narrow — bool / null / number / string only. Arrays and nested objects
 //! come from `--from`.
 
+use peat_schema::type_registry::{BuiltinRegistry, TypeRegistry};
 use serde_json::{Map, Value};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::CliError;
+
+/// Validate a proposed JSON document against the type registered for
+/// `collection` in `peat-schema`. Returns `Ok(())` when:
+///
+/// - the collection has no registered type (unknown shape — caller decides
+///   whether to accept structurally), or
+/// - the registered type's validator accepts the JSON.
+///
+/// Returns `Err(CliError::Malformed)` (exit 4 per ADR-001) when the
+/// registered validator rejects the JSON. The error message carries the
+/// type name and the underlying validation error.
+///
+/// Callers gate this on the `--no-validate` flag — when set, skip the
+/// call entirely and emit a stderr warning.
+pub fn validate_against_schema(collection: &str, value: &Value) -> Result<(), CliError> {
+    // Construct the builtin registry per call. Cost is one HashMap build
+    // (~5 entries today). Cheap relative to the rest of the write path.
+    // Cache via OnceLock if it becomes hot.
+    let registry = BuiltinRegistry::with_peat_schema_types();
+    let Some(desc) = registry.for_collection(collection) else {
+        // Unknown collection → accept structurally (per ADR-001 §"Write
+        // semantics" → "Validation": application-defined types are
+        // accepted without validation).
+        return Ok(());
+    };
+    (desc.validate_json)(value).map_err(|e| {
+        CliError::Malformed(format!(
+            "schema validation failed for {} document: {e}",
+            desc.name
+        ))
+    })
+}
 
 /// Fixed-period wait that approximates ADR-001 `--wait-for-sync` semantics.
 /// peat-mesh does not yet surface a per-write "acknowledged by N peers"

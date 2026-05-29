@@ -33,6 +33,11 @@ tempfile = "3"
 # version skew, see peat#923/#924).
 peat-mesh = { version = "=0.9.0-rc.27", features = ["automerge-backend"] }
 peat-protocol = { version = ">=0.9.0-rc.17, <0.9.1", features = ["automerge-backend"] }
+# peat-schema runtime type registry (peat#946 / peat#947). Git-pinned to
+# the merge SHA on `main` until the next peat workspace release cut
+# (rc.19+) ships this module on the registry. Flip to a semver dep
+# `peat-schema = { version = ">=0.9.0-rc.19, <0.9.1" }` once that lands.
+peat-schema = { git = "https://github.com/defenseunicorns/peat", rev = "14d16a97" }
 iroh = "=1.0.0-rc.0"
 # Pinned to match peat-mesh's `automerge` dep so the `Automerge` type peat-cli
 # names (from store.get / scan_prefix) is ABI-compatible with what the backend

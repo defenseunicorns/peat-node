@@ -6,7 +6,7 @@ use peat_mesh::storage::json_convert::json_to_automerge;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::cli::writes::{apply_sets, read_from, POST_WRITE_SYNC_WAIT};
+use crate::cli::writes::{apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT};
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -52,6 +52,14 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         (None, sets) if !sets.is_empty() => apply_sets(Value::Object(Default::default()), sets)?,
         _ => unreachable!("clap ArgGroup requires --from or --set"),
     };
+
+    // Schema gate (ADR-001 §"Write semantics" → "Validation"). Runs against
+    // the peat-schema type registry: known collections enforce the
+    // typed-message shape and field constraints; unknown collections accept
+    // structurally. `--no-validate` skips the gate with the warning above.
+    if !args.no_validate {
+        validate_against_schema(&args.collection, &json_value)?;
+    }
 
     let doc_id = args
         .id

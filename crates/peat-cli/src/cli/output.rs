@@ -1,26 +1,146 @@
 //! Output formatters.
 //!
-//! ADR-001 §"Document rendering" mandates a typed-vs-generic dispatch model.
-//! `peat-schema` does not yet expose a type-metadata registry (tracked
-//! upstream as a follow-up; see ADR-001 §Open Questions), so v1 ships the
-//! **generic** path only — every document renders structurally via
-//! `peat_mesh::storage::json_convert::automerge_to_json`. This is the
-//! "renderer-not-found fallback" path the ADR specifies; type-aware
-//! formatters will land additively when the upstream registry exists.
+//! ADR-001 §"Document rendering" mandates a typed-vs-generic dispatch
+//! model. The peat-schema runtime type registry (peat#946/#947) provides
+//! the typed path; this module wires it in for `text` mode of `query`:
+//!
+//! - **Known collection** (`for_collection(key.collection_prefix)`
+//!   returns a `TypeDescriptor`) → typed render using
+//!   `TypeDescriptor.fields` for label / order / format dispatch
+//!   (`FieldFormat::Percentage`, `Position`, `Enum`, `List`, etc.).
+//! - **Unknown collection** → generic structural JSON via
+//!   `automerge_to_json` (the ADR's "renderer-not-found fallback" path).
+//!
+//! `json` and `ndjson` output formats are the **stable contract surface**
+//! for downstream scripts — they always emit the generic structural JSON
+//! shape regardless of registry hits. ADR-001 §"Document rendering" calls
+//! this out so consumers of `peat … --output json` see the same shape
+//! whether or not the document's type happens to be registered.
 //!
 //! Stream discipline (ADR-001 §"Shell integration discipline"):
 //!   - All document data goes to stdout.
 //!   - Logs / status / errors go to stderr (wired in main.rs via
 //!     tracing_subscriber).
-//!   - `json` / `ndjson` outputs are stable schemas (the generic structural
-//!     JSON shape). `text` is human-readable and may evolve.
+//!   - `text` is human-readable and may evolve; `json` / `ndjson` are
+//!     stable.
 
 use automerge::Automerge;
 use clap::ValueEnum;
 use peat_mesh::storage::json_convert::automerge_to_json;
+use peat_schema::type_registry::{BuiltinRegistry, FieldFormat, TypeDescriptor, TypeRegistry};
 use serde_json::Value;
 
 use crate::cli::CliError;
+
+/// Extract the collection name from a store key of the form
+/// `collection:doc_id`. Returns `None` if the key has no separator.
+fn collection_of(key: &str) -> Option<&str> {
+    key.split_once(':').map(|(c, _)| c)
+}
+
+/// Format a single field value per its `FieldFormat` hint. Falls back to
+/// the verbatim JSON rendering when the value shape doesn't match the
+/// hint (defensive — operators see *something* rather than nothing).
+fn format_field_value(value: Option<&Value>, fmt: &FieldFormat) -> String {
+    let v = match value {
+        None | Some(Value::Null) => return "—".to_string(),
+        Some(v) => v,
+    };
+    match fmt {
+        FieldFormat::Text => match v {
+            Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        },
+        FieldFormat::Number { unit } => match (v.as_f64(), unit) {
+            (Some(n), Some(u)) => format!("{n} {u}"),
+            (Some(n), None) => format!("{n}"),
+            _ => v.to_string(),
+        },
+        FieldFormat::Percentage => match v.as_f64() {
+            Some(n) => format!("{:.1}%", n * 100.0),
+            None => v.to_string(),
+        },
+        FieldFormat::Boolean => match v.as_bool() {
+            Some(b) => b.to_string(),
+            None => v.to_string(),
+        },
+        FieldFormat::Timestamp => {
+            // Timestamps come through as the proto3 Timestamp message
+            // shape: {"seconds": …, "nanos": …}. v1 emits the raw JSON;
+            // a richer RFC 3339 conversion can layer in later.
+            serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+        }
+        FieldFormat::Position => match v.as_object() {
+            Some(obj) => {
+                let lat = obj.get("latitude").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let lon = obj.get("longitude").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let alt = obj.get("altitude").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                format!("{lat:.4}°, {lon:.4}°, {alt:.0}m")
+            }
+            None => v.to_string(),
+        },
+        FieldFormat::Enum { variants } => match v.as_u64() {
+            Some(idx) => variants
+                .get(idx as usize)
+                .map(|s| (*s).to_string())
+                .unwrap_or_else(|| format!("unknown({idx})")),
+            None => v.to_string(),
+        },
+        FieldFormat::Nested { .. } => {
+            // v1: pretty-print as JSON. Recursing through the registry to
+            // a nested TypeDescriptor's `fields` is a richer follow-on.
+            serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+        }
+        FieldFormat::List { item_format } => match v.as_array() {
+            Some(arr) if arr.is_empty() => "(empty)".to_string(),
+            Some(arr) => {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .map(|x| format_field_value(Some(x), item_format))
+                    .collect();
+                parts.join(", ")
+            }
+            None => v.to_string(),
+        },
+        FieldFormat::JsonString => match v.as_str() {
+            Some(s) => {
+                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                    serde_json::to_string(&parsed).unwrap_or_else(|_| s.to_string())
+                } else {
+                    s.to_string()
+                }
+            }
+            None => v.to_string(),
+        },
+        FieldFormat::BlobRef => {
+            // Renderer-only summary: don't dereference. v1 just dumps the
+            // metadata as JSON; a future format pass can pull size/hash
+            // into a "<blob:N sha256:…>" form.
+            serde_json::to_string(v).unwrap_or_else(|_| v.to_string())
+        }
+        // FieldFormat is `#[non_exhaustive]` so we wildcard-fall-through to
+        // a verbatim rendering for any future variant we don't recognise.
+        _ => v.to_string(),
+    }
+}
+
+/// Build a typed-render string for one document given its descriptor.
+/// Format: type name on a line, then `<label> : <value>` pairs in
+/// canonical field order, right-aligned label column.
+fn render_typed_doc(doc_json: &Value, desc: &TypeDescriptor) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", desc.name);
+    let label_width = desc.fields.iter().map(|f| f.label.len()).max().unwrap_or(0);
+    let obj = doc_json.as_object();
+    for field in &desc.fields {
+        let value = obj.and_then(|o| o.get(field.name));
+        let formatted = format_field_value(value, &field.format);
+        let label = field.label;
+        let _ = writeln!(out, "  {label:>label_width$} : {formatted}");
+    }
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -101,18 +221,49 @@ fn write_stream_line(line: &str) -> Result<(), CliError> {
 /// Render the result of a `query` invocation.
 ///
 /// `docs` is the list returned by the store: each entry is `(key, Automerge)`
-/// where `key` is the full `collection:doc_id` form. The renderer strips the
-/// collection prefix when emitting per-doc keys in `json` mode for ergonomic
-/// downstream piping.
+/// where `key` is the full `collection:doc_id` form.
+///
+/// In `text` mode, when the document's collection resolves to a known
+/// `peat-schema` type, the typed renderer dispatches off `TypeDescriptor.fields`
+/// — field labels, ordering, format hints. Unknown collections fall through to
+/// the structurally-faithful generic JSON walk. `json` and `ndjson` modes are
+/// always the structural JSON form regardless of registry hits — they're the
+/// stable contract surface for downstream scripts (ADR-001 §"Document
+/// rendering" → "Output formats").
 pub fn render_query(docs: &[(String, Automerge)], fmt: OutputFormat) -> Result<(), CliError> {
+    let registry = BuiltinRegistry::with_peat_schema_types();
     match fmt {
-        OutputFormat::Text | OutputFormat::Json => {
+        OutputFormat::Text => {
+            // Try typed rendering per doc when the collection is known.
+            // Single-doc + known type → typed render directly.
+            // Anything else → fall through to structural JSON.
+            if let [(key, doc)] = docs {
+                if let Some(desc) = collection_of(key).and_then(|c| registry.for_collection(c)) {
+                    let json = automerge_to_json(doc);
+                    let rendered = render_typed_doc(&json, desc);
+                    print!("{rendered}");
+                    return Ok(());
+                }
+            }
+            // Multi-doc OR unknown collection → existing structural JSON
+            // path. (Multi-doc typed rendering is a follow-on; the issue
+            // is producing readable multi-doc output, not a registry gap.)
             let value = match docs {
-                // Single doc: emit the doc value directly.
                 [(_, doc)] => automerge_to_json(doc),
-                // Empty or multi-doc collection: emit a JSON object keyed by
-                // the raw store key (collection:doc_id) so consumers can
-                // identify each record.
+                _ => Value::Object(
+                    docs.iter()
+                        .map(|(k, d)| (k.clone(), automerge_to_json(d)))
+                        .collect(),
+                ),
+            };
+            let out = serde_json::to_string_pretty(&value)
+                .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?;
+            println!("{out}");
+        }
+        OutputFormat::Json => {
+            // Stable structural contract — no typed dispatch.
+            let value = match docs {
+                [(_, doc)] => automerge_to_json(doc),
                 _ => Value::Object(
                     docs.iter()
                         .map(|(k, d)| (k.clone(), automerge_to_json(d)))
@@ -169,5 +320,126 @@ mod tests {
             .collect();
         assert_eq!(obj["contacts:c-1"]["name"], serde_json::json!("alice"));
         assert_eq!(obj["contacts:c-2"]["name"], serde_json::json!("bob"));
+    }
+
+    // --- Typed-renderer dispatch tests (peat#946 / peat#947 adoption) ---
+
+    #[test]
+    fn collection_of_splits_on_first_colon() {
+        assert_eq!(collection_of("capabilities:cap-1"), Some("capabilities"));
+        assert_eq!(collection_of("node-states:n-1"), Some("node-states"));
+        // Multi-colon: only the first separator counts; doc_id may have colons.
+        assert_eq!(collection_of("contacts:tenant:a:c-1"), Some("contacts"));
+        assert_eq!(collection_of("no-colon-here"), None);
+    }
+
+    #[test]
+    fn format_percentage_renders_with_unit() {
+        assert_eq!(
+            format_field_value(Some(&serde_json::json!(0.95)), &FieldFormat::Percentage),
+            "95.0%"
+        );
+        assert_eq!(
+            format_field_value(Some(&serde_json::json!(0.0)), &FieldFormat::Percentage),
+            "0.0%"
+        );
+    }
+
+    #[test]
+    fn format_number_with_unit_appends_suffix() {
+        assert_eq!(
+            format_field_value(
+                Some(&serde_json::json!(10.5)),
+                &FieldFormat::Number { unit: Some("m/s") }
+            ),
+            "10.5 m/s"
+        );
+        assert_eq!(
+            format_field_value(
+                Some(&serde_json::json!(42)),
+                &FieldFormat::Number { unit: None }
+            ),
+            "42"
+        );
+    }
+
+    #[test]
+    fn format_enum_resolves_variant_by_index() {
+        let variants: &[&str] = &["Unspecified", "Sensor", "Compute"];
+        let fmt = FieldFormat::Enum { variants };
+        assert_eq!(
+            format_field_value(Some(&serde_json::json!(1)), &fmt),
+            "Sensor"
+        );
+        assert_eq!(
+            format_field_value(Some(&serde_json::json!(2)), &fmt),
+            "Compute"
+        );
+        // Out-of-range index surfaces "unknown(N)" so renderers never silently
+        // drop unrecognised enum values.
+        assert_eq!(
+            format_field_value(Some(&serde_json::json!(99)), &fmt),
+            "unknown(99)"
+        );
+    }
+
+    #[test]
+    fn format_position_renders_lat_lon_alt() {
+        let pos = serde_json::json!({
+            "latitude": 40.7128,
+            "longitude": -74.0060,
+            "altitude": 10.0,
+        });
+        let s = format_field_value(Some(&pos), &FieldFormat::Position);
+        assert!(s.contains("40.7128°"), "got {s}");
+        assert!(s.contains("-74.0060°"), "got {s}");
+        assert!(s.contains("10m"), "got {s}");
+    }
+
+    #[test]
+    fn format_list_joins_items() {
+        let v = serde_json::json!(["alpha", "beta", "gamma"]);
+        let fmt = FieldFormat::List {
+            item_format: Box::new(FieldFormat::Text),
+        };
+        assert_eq!(format_field_value(Some(&v), &fmt), "alpha, beta, gamma");
+        // Empty list gets a sentinel rather than a confusing blank.
+        let empty = serde_json::json!([]);
+        assert_eq!(format_field_value(Some(&empty), &fmt), "(empty)");
+    }
+
+    #[test]
+    fn format_null_is_em_dash() {
+        // Null / None values render as an em dash so operators see "field
+        // is absent" rather than the literal "null".
+        assert_eq!(format_field_value(None, &FieldFormat::Text), "—");
+        assert_eq!(
+            format_field_value(Some(&serde_json::Value::Null), &FieldFormat::Percentage),
+            "—"
+        );
+    }
+
+    #[test]
+    fn render_typed_doc_emits_capability_with_labels() {
+        // Round-trip: build a Capability-shaped JSON, render through the
+        // registry's descriptor, assert the typed labels + format hints
+        // show up in the output.
+        let registry = BuiltinRegistry::with_peat_schema_types();
+        let desc = registry.for_collection("capabilities").unwrap();
+        let doc = serde_json::json!({
+            "id": "cap-1",
+            "name": "thermal-sensor",
+            "capability_type": 1,
+            "confidence": 0.95,
+            "metadata_json": "{}",
+            "registered_at": null,
+        });
+        let rendered = render_typed_doc(&doc, desc);
+        assert!(rendered.starts_with("Capability\n"), "got: {rendered}");
+        assert!(rendered.contains("ID : cap-1"), "got: {rendered}");
+        assert!(rendered.contains("Type : Sensor"), "got: {rendered}");
+        assert!(rendered.contains("Confidence : 95.0%"), "got: {rendered}");
+        // Null registered_at renders as em dash.
+        assert!(rendered.contains("Registered : —"), "got: {rendered}");
     }
 }

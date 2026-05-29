@@ -13,7 +13,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::cli::query::parse_target;
-use crate::cli::writes::{apply_sets, POST_WRITE_SYNC_WAIT};
+use crate::cli::writes::{apply_sets, validate_against_schema, POST_WRITE_SYNC_WAIT};
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -90,6 +90,14 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
         .map(automerge_to_json)
         .unwrap_or_else(|| Value::Object(Default::default()));
     let updated = apply_sets(base, &args.set)?;
+
+    // Schema gate (ADR-001 §"Write semantics" → "Validation"). Validate
+    // the *post-update* shape against the registry. Unknown collections
+    // are accepted structurally; known types must satisfy field
+    // constraints. `--no-validate` skips with the warning above.
+    if !args.no_validate {
+        validate_against_schema(collection, &updated)?;
+    }
 
     if args.dry_run {
         let op = serde_json::json!({

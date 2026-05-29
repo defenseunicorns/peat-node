@@ -140,6 +140,63 @@ fn create_dry_run_renders_op_without_join() {
 }
 
 #[test]
+fn create_for_unknown_collection_skips_validation() {
+    // "contacts" is not a peat-schema-registered collection, so the
+    // schema gate accepts the document structurally and dry-run prints.
+    peat()
+        .args([
+            "create",
+            "contacts",
+            "--id",
+            "c-1",
+            "--set",
+            "name=alice",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""));
+}
+
+#[test]
+fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
+    // "capabilities" IS a registered collection (peat-schema). Building
+    // only `name` leaves `id` and other proto3 fields at their defaults.
+    // validate_capability rejects an empty id with MissingField, which
+    // surfaces as CliError::Malformed → exit 4.
+    peat()
+        .args([
+            "create",
+            "capabilities",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("schema validation failed"))
+        .stderr(predicate::str::contains("Capability"));
+}
+
+#[test]
+fn create_with_no_validate_skips_schema_gate_for_known_collection() {
+    // --no-validate bypasses the gate so a Capability missing `id`
+    // succeeds at the dry-run stage. Warning goes to stderr.
+    peat()
+        .args([
+            "create",
+            "capabilities",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+            "--no-validate",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""));
+}
+
+#[test]
 fn update_from_returns_not_implemented_with_upstream_link() {
     // --from is gated on peat-mesh#187; the error names the issue so
     // operators know where to look. Note: clap parses --from before the
