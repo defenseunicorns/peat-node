@@ -520,11 +520,12 @@ Functional scenarios to cover from day one:
 
 ## Open Questions
 
-1. **Credential bundle file format.** ADR-006 does not yet specify an on-disk credential format. `peat-cli` ships a placeholder YAML shape in `crates/peat-cli/src/creds.rs` and `deny_unknown_fields` so the format is explicitly versioned until upstream picks a canonical one. Tracked: [peat#940](https://github.com/defenseunicorns/peat/issues/940).
-2. **Write authorization scope identifiers.** The ADR asserts reads and writes use distinct scopes per ADR-006 and that missing write scope fails fast with exit 3 before parsing content. ADR-006 today defines only coarse role-level permissions (`WriteCellState`, `WriteNodeState`); per-collection granularity does not exist. Phase 4a will check at the coarse level; scenarios 7 and 29 are gated on the upstream amendment. Tracked: [peat#941](https://github.com/defenseunicorns/peat/issues/941).
+1. **Credential bundle file format.** Formalised in the ADR-006 amendment landed via [peat#944](https://github.com/defenseunicorns/peat/pull/944) (closes [peat#940](https://github.com/defenseunicorns/peat/issues/940), 2026-05-29). `peat-cli`'s `crates/peat-cli/src/creds.rs` shape (`app_id` + `shared_key` + optional `peers`) is now the canonical operational bundle. File-system custody normative requirements (mode 0600, refuse on world/group-readable) apply.
+2. **Authorization model — deferred.** Earlier framing assumed an authorization layer (per-collection write scopes, exit 3 before content parse). That framing implicitly required a client-server architecture; Peat is serverless, and today's access model is "hold the formation key → participate fully." A real authorization model needs ADR-006 Layer 1 (Device Identity) to be implemented first so operations have authenticated authors to bind enforcement against. Tracked deferred at [peat#941](https://github.com/defenseunicorns/peat/issues/941). **Consequence for this ADR:** scenarios 7 and 29 of the test plan ("write authorization" → exit 3) are removed from near-term scope. `CliError::PermissionDenied` and exit code 3 remain in code as scaffolding for when the authorization design exercise resumes.
 3. **Automerge delta API for `update --from`.** `peat-mesh` does not currently expose Automerge delta computation; `update --set` works without it, `update --from` does not. Phase 4b is gated. Tracked: [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187).
 4. **Lamport-clock source for tombstone authorship.** `peat delete` builds a `Tombstone` that needs a Lamport timestamp ordering correctly across nodes. peat-mesh does not yet surface one; the CLI uses wall-clock nanoseconds as a single-node-safe proxy (NTP-drifted hosts will tombstone-race). Tracked: [peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192).
-5. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
+5. **Typed renderer dispatch.** `peat-schema` has no runtime type metadata registry today; the CLI ships only the generic CRDT-walk renderer. Tracked: [peat#946](https://github.com/defenseunicorns/peat/issues/946) (P0 upstream — independent of the deferred authorization design).
+6. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
 
 ---
 
@@ -549,12 +550,12 @@ The following design decisions were settled during ADR review and are reflected 
 
 Before this ADR moves from Proposed to Accepted:
 
-- [ ] Write authorization scope model confirmed against ADR-006
+- [x] ~~Write authorization scope model confirmed against ADR-006~~ — **deferred**: authorization model needs ADR-006 Layer 1 (Device Identity) first; tracked at [peat#941](https://github.com/defenseunicorns/peat/issues/941). This ADR no longer commits to exit-3-before-content-parse in near-term scope; the surface (CliError variant + exit code) stays as scaffolding.
 - [ ] Output schema versioning approach signed off
 
 Before this ADR moves from Accepted to Implemented:
 
-- [ ] All thirty E2E scenarios passing in CI (8 representative scenarios landed in Phase 5; remaining ADR scenarios that depend on `update --from`, `observe --since`, or per-collection write scopes are gated on the upstream issues filed under Open Questions)
+- [ ] E2E scenarios passing in CI (8 representative scenarios landed in Phase 5). Remaining ADR scenarios are scoped as follows: scenarios 7 + 29 (write authorization → exit 3) are **out of near-term scope** per the deferred authorization model in Open Question 2; scenarios that depend on `update --from` or `observe --since` are gated on the upstream issues filed under Open Questions.
 - [ ] Coverage target met (`cargo llvm-cov -p peat-cli` ≥ 90 %)
 - [x] `peat` binary present in container image (Phase 6 — Dockerfile builds `--workspace` and copies `/usr/local/bin/peat`)
 - [ ] Cross-platform builds green
