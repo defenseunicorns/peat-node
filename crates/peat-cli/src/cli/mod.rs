@@ -4,6 +4,7 @@ pub mod observe;
 pub mod output;
 pub mod query;
 pub mod update;
+pub mod writes;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -88,6 +89,17 @@ pub enum CliError {
     Malformed(String),
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
+    /// SIGINT received while a streaming subcommand was running. Maps to
+    /// exit 130 (128 + SIGINT) by Unix convention.
+    #[error("interrupted")]
+    Interrupted,
+    /// Downstream pipe consumer closed its read end. ADR-001 §"Shell
+    /// integration discipline" says exit silently with status 0 — the
+    /// caller (main.rs) treats this variant as a clean exit, not as
+    /// failure. Distinguishes pipe-close from a real write error so the
+    /// observe loop doesn't have to string-match an error message.
+    #[error("broken pipe")]
+    BrokenPipe,
 }
 
 impl CliError {
@@ -98,19 +110,75 @@ impl CliError {
             CliError::Auth(_) => 2,
             CliError::PermissionDenied(_) => 3,
             CliError::Malformed(_) => 4,
+            CliError::Interrupted => 130,
+            CliError::BrokenPipe => 0,
         }
     }
 }
 
 impl Cli {
-    /// Dispatch into the chosen subcommand. All handlers are stubbed in Phase 1.
-    pub fn run(self) -> Result<(), CliError> {
+    /// Dispatch into the chosen subcommand.
+    pub async fn run(self) -> Result<(), CliError> {
         match self.command {
-            Command::Query(_) => Err(CliError::NotImplemented("query")),
-            Command::Observe(_) => Err(CliError::NotImplemented("observe")),
-            Command::Create(_) => Err(CliError::NotImplemented("create")),
-            Command::Update(_) => Err(CliError::NotImplemented("update")),
-            Command::Delete(_) => Err(CliError::NotImplemented("delete")),
+            Command::Query(args) => query::run(args, self.common).await,
+            Command::Observe(args) => observe::run(args, self.common).await,
+            Command::Create(args) => create::run(args, self.common).await,
+            Command::Update(args) => update::run(args, self.common).await,
+            Command::Delete(args) => delete::run(args, self.common).await,
         }
+    }
+}
+
+/// Parse a `--timeout` value like `10s`, `1m`, or `500ms`. Sufficient for v1;
+/// `humantime`-style parsing can come later if operators want richer syntax.
+pub(crate) fn parse_timeout(s: &str) -> Result<std::time::Duration, CliError> {
+    use std::time::Duration;
+    let map_err = |e: std::num::ParseIntError| CliError::Malformed(format!("timeout `{s}`: {e}"));
+    if let Some(num) = s.strip_suffix("ms") {
+        return num
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map_err(map_err);
+    }
+    if let Some(num) = s.strip_suffix('s') {
+        return num.parse::<u64>().map(Duration::from_secs).map_err(map_err);
+    }
+    if let Some(num) = s.strip_suffix('m') {
+        return num
+            .parse::<u64>()
+            .map(|n| Duration::from_secs(n * 60))
+            .map_err(map_err);
+    }
+    Err(CliError::Malformed(format!(
+        "timeout `{s}`: expected suffix s, m, or ms (e.g. 10s, 1m, 500ms)"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_seconds() {
+        assert_eq!(parse_timeout("10s").unwrap(), Duration::from_secs(10));
+    }
+    #[test]
+    fn parses_minutes() {
+        assert_eq!(parse_timeout("2m").unwrap(), Duration::from_secs(120));
+    }
+    #[test]
+    fn parses_milliseconds() {
+        assert_eq!(parse_timeout("500ms").unwrap(), Duration::from_millis(500));
+    }
+    #[test]
+    fn rejects_missing_suffix() {
+        let err = parse_timeout("10").unwrap_err();
+        assert_eq!(err.exit_code(), 4);
+    }
+    #[test]
+    fn rejects_bad_number() {
+        let err = parse_timeout("abc s").unwrap_err();
+        assert_eq!(err.exit_code(), 4);
     }
 }

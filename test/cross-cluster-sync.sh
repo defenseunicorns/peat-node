@@ -76,9 +76,10 @@ build_image() {
 
 deploy_to() {
     local cluster="$1" node_id="$2"
-    kubectl --context "k3d-${cluster}" create namespace peat --dry-run=client -o yaml | \
-        kubectl --context "k3d-${cluster}" apply -f -
-    helm --kube-context "k3d-${cluster}" upgrade --install peat \
+    local ctx="k3d-${cluster}"
+    kubectl --context "${ctx}" create namespace peat --dry-run=client -o yaml | \
+        kubectl --context "${ctx}" apply -f -
+    if ! helm --kube-context "${ctx}" upgrade --install peat \
         "${REPO_DIR}/chart/peat-node" \
         --namespace peat \
         --set image.repository=peat-node \
@@ -90,7 +91,27 @@ deploy_to() {
         --set autoSync=true \
         --set irohUdpPort="${IROH_PORT}" \
         --set irohUdpHostPort=true \
-        --wait --timeout 90s
+        --wait --timeout 90s; then
+        # Helm install timed out or rolled back. Capture diagnostics
+        # before the cleanup trap nukes the cluster so the next CI
+        # failure has something to investigate. Without this the
+        # operator sees only "context deadline exceeded".
+        echo "==> Helm install failed; capturing diagnostics for ${cluster}..."
+        echo "--- kubectl get pods -n peat ---"
+        kubectl --context "${ctx}" get pods -n peat -o wide 2>&1 || true
+        echo "--- kubectl describe pods -n peat ---"
+        kubectl --context "${ctx}" describe pods -n peat 2>&1 || true
+        echo "--- kubectl get events -n peat (last 30) ---"
+        kubectl --context "${ctx}" get events -n peat \
+            --sort-by=.lastTimestamp 2>&1 | tail -30 || true
+        echo "--- peat-node container logs (current) ---"
+        kubectl --context "${ctx}" logs -n peat -l app.kubernetes.io/name=peat-node \
+            -c peat-node --tail=200 2>&1 || true
+        echo "--- peat-node container logs (previous, if crashed) ---"
+        kubectl --context "${ctx}" logs -n peat -l app.kubernetes.io/name=peat-node \
+            -c peat-node --tail=200 --previous 2>&1 || true
+        return 1
+    fi
 }
 
 create_clusters() {

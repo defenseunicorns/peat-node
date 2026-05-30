@@ -2,7 +2,7 @@
 name: peat-node
 description: Per-repo skill for the Peat sidecar node — Rust binary that exposes peat-protocol over Connect/gRPC/gRPC-Web for co-located applications, plus Helm/Zarf packaging.
 when_to_use: Editing files under peat-node/, reviewing peat-node PRs, debugging the sidecar API or DDIL fleet sync, editing proto/sidecar.proto, or working on the Helm chart / Zarf packaging.
-verifies_with: cargo fmt --check, cargo clippy -- -D warnings, cargo test, the cross-cluster-sync.sh functional test for sync-path changes, and helm template for chart changes.
+verifies_with: cargo fmt --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace, the cross-cluster-sync.sh functional test for sync-path changes, and helm template for chart changes.
 ---
 
 # `peat-node` SKILL
@@ -61,14 +61,24 @@ Consumers in other languages talk to the sidecar directly over the Connect-RPC w
 A session in this repo is not done until each of these produces evidence:
 
 - [ ] `cargo fmt --check` exits 0
-- [ ] `cargo clippy -- -D warnings` exits 0
-- [ ] `cargo test` exits 0 (this includes `tests/sync_test.rs`, the two-node in-process CRDT-sync test)
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [ ] `cargo test --workspace` exits 0 (this includes `tests/sync_test.rs`, the two-node in-process CRDT-sync test, and the `peat-cli` parser + e2e tests under `crates/peat-cli/tests/`)
 - [ ] If `proto/sidecar.proto` was touched: `cargo build` (re-runs proto compile via build.rs and confirms server code matches the new contract); external consumers regenerate from the new proto on their side
 - [ ] If sync-path code or the chart changed: `./test/cross-cluster-sync.sh`
 - [ ] If `chart/` or `zarf.yaml` was touched: `helm template chart/peat-node` renders cleanly
 - [ ] If the change bumps `peat-mesh`: full integration suite, not just unit tests
 
 "Seems right" or "the diff looks correct" is never sufficient.
+
+### Optional: pre-commit hook
+
+Enable the repo-supplied pre-commit hook to run the first two gates locally:
+
+```
+git config core.hooksPath .githooks
+```
+
+The hook runs `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` when any `.rs` or `Cargo.*` file is staged, and skips for pure docs/chart/proto commits. Bypass with `git commit --no-verify` when intentional.
 
 ## Anti-rationalization
 

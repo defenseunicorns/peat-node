@@ -18,6 +18,22 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
+# rc.29 (peat-mesh#202): `AutomergeStore::delete` now fires
+#   `observer_tx`, satisfying the CDC contract documented on
+#   `subscribe_to_observer_changes` ("fires for ALL document changes").
+#   This makes `peat observe` see remote tombstone arrivals — the
+#   `apply_tombstone` receive path lands on `store.delete`, which now
+#   wakes the observer. ADR-001 Open Question §7 resolved.
+#
+# rc.28 (peat-mesh#187/#192/#195/#196): peat-cli unblocker —
+#   `AutomergeStore::diff` / `apply_delta` + `AutomergeDelta` (closes
+#   peat-mesh#187, unblocks ADR-001 `peat update --from`);
+#   `AutomergeBackend::{next_lamport, current_lamport, observe_lamport}`
+#   node-local Lamport clock + persistence + receive-side wire-up
+#   (closes peat-mesh#192/#195/#196, replaces peat-cli's wall-clock
+#   Lamport workaround in `peat delete`). Pure additions; rc.27 surface
+#   is unchanged.
+#
 # rc.27 (peat-mesh#188/#189/#190): peat-mesh#175 follow-throughs.
 # - peat-mesh#189: `AutomergeBackend::get` keyed-lookup override (closes
 #   peat-mesh#186). Trait-default `get` was O(N) via scan_prefix; now
@@ -58,7 +74,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.27", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.29", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,

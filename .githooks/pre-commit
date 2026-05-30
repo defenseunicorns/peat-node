@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pre-commit hook for peat-node.
+#
+# Enable once per clone with:
+#
+#   git config core.hooksPath .githooks
+#
+# Runs the two cheap local-equivalents of CI gates that have caused most
+# fix-up commits historically. Bypass with `git commit --no-verify` if you
+# need to (committing WIP docs, intentional broken branch, etc.).
+
+set -euo pipefail
+
+# Only run cargo checks when Rust files or Cargo manifests are staged.
+# Pure docs / chart / proto-only commits skip the heavy clippy step.
+rust_changed=$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '\.(rs|toml)$' \
+    | grep -v -E '^chart/|^docs/|^README' \
+    || true)
+
+if [ -z "$rust_changed" ]; then
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check"
+if ! cargo fmt --check; then
+    echo
+    echo "pre-commit: rustfmt diffs detected. Run 'cargo fmt' and re-stage." >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo
+    echo "pre-commit: clippy warnings detected. Fix and re-stage." >&2
+    exit 1
+fi

@@ -71,13 +71,83 @@ jobs:
           for sub in query observe create update delete; do
             "$PEAT" "$sub" --help > /dev/null
           done
-          # Phase 1 handlers return NotImplemented (exit 1) per ADR-001.
+          # query handler is wired (Phase 2). With a non-existent creds path
+          # it must exit 2 (auth) per the ADR-001 exit-code table, with
+          # empty stdout and the explanation on stderr.
           set +e
-          "$PEAT" query contacts > /dev/null 2> stderr.txt
+          "$PEAT" --creds /nonexistent.yaml query contacts > stdout.txt 2> stderr.txt
           code=$?
           set -e
-          test "$code" = "1"
-          grep -q "not yet implemented" stderr.txt
+          test "$code" = "2"
+          test ! -s stdout.txt
+          grep -q "authentication failure" stderr.txt
+          # observe is wired (Phase 3) — same auth-failure path as query when
+          # creds are absent.
+          set +e
+          "$PEAT" --creds /nonexistent.yaml observe contacts > stdout.txt 2> stderr.txt
+          code=$?
+          set -e
+          test "$code" = "2"
+          test ! -s stdout.txt
+          grep -q "authentication failure" stderr.txt
+          # create --dry-run skips the join prelude — confirm it renders.
+          "$PEAT" create contacts --id c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
+          grep -q '"op": "create"' stdout.txt
+          grep -q '"key": "contacts:c-1"' stdout.txt
+          # update --from reads the proposed JSON before the join prelude
+          # (peat-mesh#187 / rc.28). A missing path surfaces as exit 4
+          # (Malformed) with no mesh handshake attempted.
+          set +e
+          "$PEAT" update contacts/c-1 --from /nonexistent.json > /dev/null 2> stderr.txt
+          code=$?
+          set -e
+          test "$code" = "4"
+
+  cross-platform:
+    # Phase 6 of peat-node ADR-001: confirms peat-cli builds (and tests, on
+    # macOS) on the non-Linux targets the operator quickstart promises.
+    # Closes the 'Windows in Constraints but not in CI gates' QA finding.
+    name: Cross-platform (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14   # Apple Silicon (aarch64)
+            test: true
+          - os: windows-latest   # x86_64
+            test: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-xplat-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc -y --no-progress
+      # macOS builds the whole workspace; Windows builds peat-cli only.
+      # The peat-node root crate uses Unix-only crates (e.g. iroh's
+      # underlying transport pulls in libc) that the Windows port hasn't
+      # been validated against. Phase 6's commitment is to ship `peat`
+      # binaries — peat-node remains Linux/macOS only.
+      - name: Build peat-cli (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build -p peat-cli --release
+      - name: Build workspace (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --workspace --release
+      - name: Run peat-cli tests (macOS only)
+        if: matrix.test
+        run: cargo test -p peat-cli
 
   helm-lint:
     name: Helm Lint

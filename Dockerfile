@@ -21,7 +21,17 @@ COPY proto proto
 COPY src src
 COPY crates crates
 
-RUN cargo build --release
+# --workspace builds both the peat-node root package and the peat-cli
+# crate. peat-cli's binary is named `peat` and gets included in the
+# runtime image below so `kubectl exec` reaches a built-in debug surface
+# per peat-node ADR-001.
+RUN cargo build --release --workspace
+
+# Confirm the peat binary actually launches at image build time —
+# `peat --help` exiting 0 is the in-container smoke test ADR-001
+# §"CI gates" calls for. Catches any link-time / library-path issue
+# before the runtime stage.
+RUN /build/target/release/peat --help > /dev/null
 
 # -- Runtime ------------------------------------------------------------------
 FROM debian:bookworm-slim
@@ -31,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/peat-node /usr/local/bin/peat-node
+COPY --from=builder /build/target/release/peat /usr/local/bin/peat
 
 # Data directory for Automerge CRDT state and Iroh blobs
 VOLUME /data/peat-node

@@ -1,12 +1,19 @@
 //! End-to-end functional tests for the `peat` binary.
 //!
 //! Per peat-node ADR-001: this suite spawns the real `peat` binary as a
-//! subprocess and asserts on its stdout / stderr / exit code. It is the
-//! infrastructure on which Phase 2+ behavioral tests (multi-node sync,
-//! credential resolution, observe streaming, etc.) will be built.
+//! subprocess and asserts on its stdout / stderr / exit code.
 //!
-//! Phase 1 only exercises the binary's own surface: `--help`, `--version`,
-//! subcommand `--help`, and the documented stub exit code + stderr line.
+//! Two layers:
+//!   - **Surface** tests (this file): exercise the binary's own surface
+//!     — `--help`, exit codes, parser errors, dry-run paths. Don't need
+//!     a live mesh peer.
+//!   - **Scenario** tests (this file via `mod scenarios`): stand up a
+//!     real `AutomergeBackend` peer via `topology::TestPeer` and verify
+//!     end-to-end behavior across the wire. Slower (real Iroh
+//!     handshakes) but exercise the same code paths as production.
+
+mod scenarios;
+mod topology;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -54,15 +61,174 @@ fn subcommand_help_renders() {
 }
 
 #[test]
-fn query_stub_exits_with_documented_code() {
-    // ADR-001 "Shell integration discipline": NotImplemented maps to exit 1
-    // and the explanation lands on stderr, not stdout.
+fn query_without_creds_exits_auth_error() {
+    // ADR-001 "Shell integration discipline": auth failure → exit 2, empty
+    // stdout, explanation on stderr. Passing a path that doesn't exist
+    // bypasses any platform-default config that may be present on the
+    // developer's machine.
     peat()
-        .args(["query", "contacts"])
+        .args([
+            "query",
+            "contacts",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
         .assert()
-        .code(1)
+        .code(2)
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("not yet implemented"));
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn observe_without_creds_exits_auth_error() {
+    // Same shape as query: missing creds → exit 2 with the auth message on
+    // stderr, no stdout. Confirms the streaming subcommand reaches the join
+    // prelude before any subscription work.
+    peat()
+        .args([
+            "observe",
+            "contacts",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn create_without_creds_exits_auth_error() {
+    peat()
+        .args([
+            "create",
+            "contacts",
+            "--set",
+            "name=alice",
+            "--creds",
+            "/definitely/does/not/exist.yaml",
+        ])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("authentication failure"));
+}
+
+#[test]
+fn create_dry_run_renders_op_without_join() {
+    // --dry-run skips the join prelude entirely, so missing creds don't
+    // matter and we get the would-be op on stdout. Confirms the
+    // ArgGroup wiring and the JSON shape of the dry-run output.
+    peat()
+        .args([
+            "create",
+            "contacts",
+            "--id",
+            "c-1",
+            "--set",
+            "name=alice",
+            "--set",
+            "position.lat=40.7128",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""))
+        .stdout(predicate::str::contains("\"key\": \"contacts:c-1\""))
+        .stdout(predicate::str::contains("\"name\": \"alice\""))
+        .stdout(predicate::str::contains("\"lat\": 40.7128"));
+}
+
+#[test]
+fn create_for_unknown_collection_skips_validation() {
+    // "contacts" is not a peat-schema-registered collection, so the
+    // schema gate accepts the document structurally and dry-run prints.
+    peat()
+        .args([
+            "create",
+            "contacts",
+            "--id",
+            "c-1",
+            "--set",
+            "name=alice",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""));
+}
+
+#[test]
+fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
+    // "capabilities" IS a registered collection (peat-schema). Building
+    // only `name` leaves `id` and other proto3 fields at their defaults.
+    // validate_capability rejects an empty id with MissingField, which
+    // surfaces as CliError::Malformed → exit 4.
+    peat()
+        .args([
+            "create",
+            "capabilities",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("schema validation failed"))
+        .stderr(predicate::str::contains("Capability"));
+}
+
+#[test]
+fn create_with_no_validate_skips_schema_gate_for_known_collection() {
+    // --no-validate bypasses the gate so a Capability missing `id`
+    // succeeds at the dry-run stage. Warning goes to stderr.
+    peat()
+        .args([
+            "create",
+            "capabilities",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+            "--no-validate",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"op\": \"create\""));
+}
+
+#[test]
+fn update_from_missing_file_is_malformed() {
+    // `--from` is parsed *before* the join prelude (peat-mesh#187 landed
+    // the delta API, so this is real now). A bad path surfaces as
+    // CliError::Malformed → exit 4 before we attempt any mesh handshake,
+    // so passing a path that doesn't exist exercises the eager-read path.
+    peat()
+        .args([
+            "update",
+            "contacts/c-1",
+            "--from",
+            "/definitely/does/not/exist.json",
+        ])
+        .assert()
+        .code(4);
+}
+
+#[test]
+fn update_without_target_doc_id_is_malformed() {
+    peat()
+        .args(["update", "contacts", "--set", "name=alice"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("update requires"));
+}
+
+#[test]
+fn delete_without_target_doc_id_is_malformed() {
+    peat()
+        .args(["delete", "contacts"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("delete requires"));
 }
 
 #[test]

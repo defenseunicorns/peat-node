@@ -165,19 +165,29 @@ Common options:
 **Read commands**
 
 ```
-peat query <COLLECTION>[/<DOC_ID>] [OPTIONS]
+peat query <TARGET | --all-collections> [OPTIONS]
+  <TARGET>                  <COLLECTION>[/<DOC_ID>]
+  --all-collections, --all  Scan every collection reachable with the
+                            supplied credentials (mutually exclusive
+                            with <TARGET>)
   --limit <N>               Cap the number of records emitted
 ```
 
-`query` returns the materialized current state of the target — a collection of documents if `<COLLECTION>` alone is given, a single document if `<COLLECTION>/<DOC_ID>` is given. There is no operation-log mode and no pagination cursor; if more selectivity is needed, narrow the target or use `--limit`. This mirrors how `psql` handles a `SELECT`: the result is the rows, not the WAL that produced them.
+`query` returns the materialized current state of the target — a collection of documents if `<COLLECTION>` alone is given, a single document if `<COLLECTION>/<DOC_ID>` is given. `--all-collections` (alias `--all`) scans the full mesh store and returns docs keyed by `<collection>:<doc_id>`; combine with `--limit` to cap. Exactly one of `<TARGET>` or `--all-collections` is required — clap rejects the bare command and the combined-flags case at parse time. There is no operation-log mode and no pagination cursor; if more selectivity is needed, narrow the target or use `--limit`. This mirrors how `psql` handles a `SELECT`: the result is the rows, not the WAL that produced them.
 
 For change-stream / CDC-style consumption, see `observe --mode full-history` below.
 
 ```
-peat observe <COLLECTION>[/<DOC_ID>] [OPTIONS]
+peat observe <TARGET | --all-collections> [OPTIONS]
+  <TARGET>                  <COLLECTION>[/<DOC_ID>]
+  --all-collections, --all  Subscribe across every collection reachable
+                            with the supplied credentials (mutually
+                            exclusive with <TARGET>)
   --mode <SYNC_MODE>        latest-only | windowed | full-history
                             (default: latest-only)
 ```
+
+Same target grammar as `query`: exactly one of `<TARGET>` or `--all-collections` is required. `--all-collections` turns the prefix filter off; every observer event reaches the renderer with the full `<collection>:<doc_id>` key intact, so a downstream `jq` consumer can route on the `key` field. Authorization is formation-key custody today (ADR-006, peat#941 deferred), so "all collections reachable with the supplied credentials" equals the full store.
 
 `observe --since <TIMESTAMP>` is deferred; it requires sync mode replay semantics still being finalized in ADR-019. Captured as future work.
 
@@ -520,8 +530,14 @@ Functional scenarios to cover from day one:
 
 ## Open Questions
 
-1. **Write authorization scope identifiers.** The ADR asserts reads and writes use distinct scopes per ADR-006 and that missing write scope fails fast with exit 3 before parsing content. The concrete scope identifiers (names, granularity per collection vs. per type, inheritance rules) need to be confirmed against the current state of ADR-006 before implementation.
-2. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
+1. **Credential bundle file format.** Formalised in the ADR-006 amendment landed via [peat#944](https://github.com/defenseunicorns/peat/pull/944) (closes [peat#940](https://github.com/defenseunicorns/peat/issues/940), 2026-05-29). `peat-cli`'s `crates/peat-cli/src/creds.rs` shape (`app_id` + `shared_key` + optional `peers`) is now the canonical operational bundle. File-system custody normative requirements (mode 0600, refuse on world/group-readable) apply.
+2. **Authorization model — deferred.** Earlier framing assumed an authorization layer (per-collection write scopes, exit 3 before content parse). That framing implicitly required a client-server architecture; Peat is serverless, and today's access model is "hold the formation key → participate fully." A real authorization model needs ADR-006 Layer 1 (Device Identity) to be implemented first so operations have authenticated authors to bind enforcement against. Tracked deferred at [peat#941](https://github.com/defenseunicorns/peat/issues/941). **Consequence for this ADR:** scenarios 7 and 29 of the test plan ("write authorization" → exit 3) are removed from near-term scope. `CliError::PermissionDenied` and exit code 3 remain in code as scaffolding for when the authorization design exercise resumes.
+3. ~~**Automerge delta API for `update --from`.**~~ Resolved via [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) → peat-mesh rc.28 (2026-05-29). `AutomergeStore::diff(current, proposed) -> AutomergeDelta` plus `store.apply_delta(key, &delta)` ship the round-trip-edit path; `crates/peat-cli/src/cli/update.rs` reads `--from`, computes the minimal delta against the stored doc, and applies it — preserving ADR-021's "create once, evolve through deltas" invariant. Upsert on missing doc still falls through to `put`.
+4. ~~**Lamport-clock source for tombstone authorship.**~~ Resolved via [peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192) → peat-mesh rc.28 (2026-05-29). `AutomergeBackend::next_lamport()` (claim-and-advance), `current_lamport()` (read), and `observe_lamport()` (wired into the receive-side tombstone path via peat-mesh#196) ship a node-local Lamport source. `crates/peat-cli/src/cli/delete.rs` now stamps tombstones via `session.backend().next_lamport()`; the wall-clock-nanos proxy is gone.
+5. ~~**Typed renderer dispatch.**~~ Resolved via [peat#946](https://github.com/defenseunicorns/peat/issues/946) / [peat#947](https://github.com/defenseunicorns/peat/pull/947) (merged 2026-05-29). `peat-schema` ships a runtime `TypeRegistry` with `TypeDescriptor.fields` field metadata; `peat-cli`'s `text` mode of `query` dispatches typed when the collection is known (`for_collection` returns a descriptor) and falls back to the generic CRDT walk otherwise. Write paths (`create` / `update`) run `validate_json` against the registry — known collections enforce field-level constraints, unknown collections accept structurally. `--no-validate` skips with a stderr warning. peat-cli consumes peat-schema via the workspace `>=0.9.0-rc.19, <0.9.1` range as of rc.19.
+6. **Output schema versioning mechanism.** `json` and `ndjson` are a stability contract for downstream scripts, and the Risks section flags drift. The mechanism — embedded version field in each record, top-level envelope, `--output-schema-version` flag pinning, release-notes-only with semver discipline, or some combination — is not yet chosen.
+7. ~~**`peat observe` does not see remote tombstone arrivals.**~~ Resolved via [peat-mesh#202](https://github.com/defenseunicorns/peat-mesh/issues/202) → peat-mesh rc.29 (2026-05-30). `AutomergeStore::delete` now fires the full broadcast pipeline (`observer_tx` + `change_tx` + `gossip_tx`), closing the documented "fires for ALL document changes" contract on `subscribe_to_observer_changes`. The receive-side `apply_tombstone` → `remove` → `store.delete` path therefore wakes the observer channel, and `cli/observe.rs:94-102` renders the event via `render_observe_deleted` (`{"key": "...", "deleted": true}` ndjson). E2E coverage at `scenarios::observe_subprocess_streams_delete_from_second_subprocess`.
+8. ~~**`--set` partial payloads fail on registered types.**~~ Resolved via [peat-node#112](https://github.com/defenseunicorns/peat-node/issues/112) on this PR. `crates/peat-cli/src/cli/writes.rs::apply_proto3_defaults` underlays proto3 zero-defaults for every field of a known registered collection before validation, then merges the operator's `--set` overlay on top (operator wins per field). All 5 builtin types (`capabilities`, `node-configs`, `node-states`, `cell-configs`, `cell-states`) accept partial `--set` payloads end-to-end; coverage in `tests/e2e/scenarios.rs::lifecycle_*` exercises the full lifecycle through `--set`. Defaults table is hardcoded per-collection (`FieldFormat::JsonString` is ambiguous between real `string` and `optional Message` in the rc.19 registry, so a generic descriptor-driven default would be wrong); the `defaults_pure_pass_prost_deserialize_for_every_registered_type` unit test catches drift if peat-schema adds a required field upstream. Long-term shape (deferred): `peat-schema` exposes `proto3_zero()` per `TypeDescriptor` and peat-cli's table becomes registry-driven.
 
 ---
 
@@ -533,7 +549,7 @@ The following design decisions were settled during ADR review and are reflected 
 - **No `query --deltas`.** `query` returns the rows, not the WAL — same model as `psql` on a `SELECT`. Operation-stream consumption lives on `observe --mode full-history`, which is the surface for change-stream / CDC-style use.
 - **No `apply` command.** `create` is strict-create (errors if doc exists); `update` is upsert (creates if missing, applies delta if present). ADR-021's "create once, evolve through deltas" invariant holds because initial `update` on a missing doc is initial creation, not recreation.
 - **Node posture varies by command.** Reads are passive observers; writes are active participants. Both ephemeral, both identity-stamped, both short-TTL.
-- **Credentials.** YAML config file (path via `--creds` argument, `PEAT_CREDS` env var, or platform default config location). Bundle format per ADR-006.
+- **Credentials.** YAML config file (path via `--creds` argument, `PEAT_CREDS` env var, or platform default config location). Bundle format shipped in `crates/peat-cli/src/creds.rs` as a placeholder pending the ADR-006 amendment tracked in [peat#940](https://github.com/defenseunicorns/peat/issues/940).
 - **`observe --since`.** Deferred to future work pending ADR-019 sync mode replay semantics.
 - **No pagination.** `--limit <N>` on `query` for capping output; no cursor.
 - **Type identification.** Via document metadata emitted by `peat-schema`-defined types.
@@ -546,14 +562,14 @@ The following design decisions were settled during ADR review and are reflected 
 
 Before this ADR moves from Proposed to Accepted:
 
-- [ ] Write authorization scope model confirmed against ADR-006
+- [x] ~~Write authorization scope model confirmed against ADR-006~~ — **deferred**: authorization model needs ADR-006 Layer 1 (Device Identity) first; tracked at [peat#941](https://github.com/defenseunicorns/peat/issues/941). This ADR no longer commits to exit-3-before-content-parse in near-term scope; the surface (CliError variant + exit code) stays as scaffolding.
 - [ ] Output schema versioning approach signed off
 
 Before this ADR moves from Accepted to Implemented:
 
-- [ ] All thirty E2E scenarios passing in CI
-- [ ] Coverage target met
-- [ ] `peat` binary present in container image
+- [ ] E2E scenarios passing in CI (8 representative scenarios landed in Phase 5). Remaining ADR scenarios are scoped as follows: scenarios 7 + 29 (write authorization → exit 3) are **out of near-term scope** per the deferred authorization model in Open Question 2; scenarios that depend on `update --from` or `observe --since` are gated on the upstream issues filed under Open Questions.
+- [ ] Coverage target met (`cargo llvm-cov -p peat-cli` ≥ 90 %)
+- [x] `peat` binary present in container image (Phase 6 — Dockerfile builds `--workspace` and copies `/usr/local/bin/peat`)
 - [ ] Cross-platform builds green
 - [ ] Operator quickstart documented (including round-trip edit pattern)
 
