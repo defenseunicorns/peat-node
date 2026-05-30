@@ -69,8 +69,14 @@ pub fn validate_against_schema(collection: &str, value: &Value) -> Result<(), Cl
 ///
 /// Long-term shape: `peat-schema` exposes a per-type `proto3_zero()` on
 /// `TypeDescriptor` and this function becomes registry-driven. Tracked
-/// as a follow-up at the bottom of [peat-node#112].
+/// at [peat#953] (with sibling context at [peat-node#112]). When peat#953
+/// lands, swap the body of this function for `desc.proto3_zero()` and
+/// drop both [`proto3_defaults_for`] and the
+/// `defaults_pure_pass_prost_deserialize_for_every_registered_type`
+/// unit test (the round-trip property holds by construction once the
+/// defaults come from the same codegen path as the validator).
 ///
+/// [peat#953]: https://github.com/defenseunicorns/peat/issues/953
 /// [peat-node#112]: https://github.com/defenseunicorns/peat-node/issues/112
 pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
     let Some(defaults) = proto3_defaults_for(collection) else {
