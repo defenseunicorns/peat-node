@@ -106,13 +106,14 @@ jobs:
           "$PEAT" create contacts --id c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
           grep -q '"op": "create"' stdout.txt
           grep -q '"key": "contacts:c-1"' stdout.txt
-          # update --from is gated on peat-mesh#187 — confirm error wiring.
+          # update --from reads the proposed JSON before the join prelude
+          # (peat-mesh#187 / rc.28). A missing path surfaces as exit 4
+          # (Malformed) with no mesh handshake attempted.
           set +e
-          "$PEAT" update contacts/c-1 --from doc.json > /dev/null 2> stderr.txt
+          "$PEAT" update contacts/c-1 --from /nonexistent.json > /dev/null 2> stderr.txt
           code=$?
           set -e
-          test "$code" = "1"
-          grep -q "peat-mesh#187" stderr.txt
+          test "$code" = "4"
 
   cross-platform:
     # Phase 6 of peat-node ADR-001: confirms peat-cli builds (and tests, on

@@ -243,6 +243,61 @@ async fn update_from_applies_delta_to_existing_doc() {
 
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
+async fn update_rejects_known_collection_with_invalid_post_merge_shape() {
+    // `update`'s validation surface is meaningfully distinct from
+    // `create`'s: it gates the *post-merge* JSON, so a `--set` that
+    // leaves a known-typed collection missing a required field surfaces
+    // as `CliError::Malformed` (exit 4) only here. Drives the
+    // `validate_against_schema` rejection arm in `cli/update.rs`.
+    //
+    // "capabilities" is a registered collection (peat-schema); building
+    // only `name` against a missing doc upserts into `{name: "thermal"}`,
+    // which fails `validate_capability` with `MissingField(id)`.
+    let peer = TestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let creds_path = creds.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("peat")
+            .unwrap()
+            .args([
+                "--creds",
+                &creds_path,
+                "--timeout",
+                "15s",
+                "update",
+                "capabilities/cap-fresh",
+                "--set",
+                "name=thermal",
+            ])
+            .timeout(SCENARIO_TIMEOUT)
+            .output()
+            .expect("spawn peat")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "expected exit 4 (Malformed)\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("schema validation failed"),
+        "stderr missing `schema validation failed`: {stderr}"
+    );
+    assert!(
+        stderr.contains("Capability"),
+        "stderr missing type name `Capability`: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn update_from_against_missing_doc_creates_it() {
     // Upsert semantics: missing doc → initial creation via `put` (no
     // delta to compute against).
