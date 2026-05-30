@@ -3,7 +3,6 @@
 use clap::Args;
 use peat_mesh::qos::Tombstone;
 use peat_mesh::storage::SyncTransport;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::query::parse_target;
 use crate::cli::writes::POST_WRITE_SYNC_WAIT;
@@ -41,20 +40,12 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
     )
     .await?;
 
-    // Lamport: a proper distributed Lamport source isn't exposed by
-    // peat-mesh at any consumer-facing surface today, so v1 uses
-    // wall-clock nanoseconds since epoch as a single-node-collision-safe
-    // proxy. Two CLI invocations on different hosts deleting the same
-    // key near-simultaneously will order by NTP skew rather than causal
-    // precedence, which is wrong but bounded: the documents-table delete
-    // applies on receipt regardless of Lamport, so the tombstone's
-    // ordering matters only for tie-breaking across concurrent writes.
-    // Tracked at <https://github.com/defenseunicorns/peat-mesh/issues/192>;
-    // swap this for `backend.next_lamport()` when the upstream API lands.
-    let lamport = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+    // Stamp the tombstone with the backend's node-local Lamport clock
+    // (peat-mesh#192). `next_lamport()` claims-and-advances atomically,
+    // and `observe_lamport` in the tombstone-receive path (peat-mesh#196)
+    // means peers' clocks bump on receipt — ordering across hosts now
+    // follows causal precedence rather than NTP skew.
+    let lamport = session.backend().next_lamport();
 
     let tombstone = Tombstone::new(doc_id, collection, session.node_id(), lamport);
     session

@@ -3508,7 +3508,7 @@ dependencies = [
  "libc",
  "peat-mesh",
  "peat-protocol",
- "peat-schema 0.9.0-rc.18",
+ "peat-schema",
  "predicates",
  "serde",
  "serde_json",
@@ -3524,9 +3524,9 @@ dependencies = [
 
 [[package]]
 name = "peat-mesh"
-version = "0.9.0-rc.27"
+version = "0.9.0-rc.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "686a9bc333837f0a17883ff8b5a6d5d906c78e0edec5734650f2d47111728d71"
+checksum = "df13abf4bec0451a2e5a8c429a253b6ec99c71506e100e5ec1e9da8343cf106c"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3606,9 +3606,9 @@ dependencies = [
 
 [[package]]
 name = "peat-protocol"
-version = "0.9.0-rc.17"
+version = "0.9.0-rc.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f3675c1e9fc0b62016b263a5209f9996bc909d6d430af62ddde24eae092c76"
+checksum = "d7313745f8b3ea69ff87e6b229d8e6169c4b3ad2c87a9de23d2993c731464643"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3626,7 +3626,7 @@ dependencies = [
  "lru 0.16.4",
  "negentropy",
  "peat-mesh",
- "peat-schema 0.9.0-rc.17",
+ "peat-schema",
  "postcard",
  "prost",
  "quick-xml 0.37.5",
@@ -3648,26 +3648,9 @@ dependencies = [
 
 [[package]]
 name = "peat-schema"
-version = "0.9.0-rc.17"
+version = "0.9.0-rc.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfb71da138f9034ceb71cc5645b43283da645f9e141667467b9ab9776677ba87"
-dependencies = [
- "chrono",
- "prost",
- "prost-build",
- "prost-types",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tonic-build",
- "uuid",
-]
-
-[[package]]
-name = "peat-schema"
-version = "0.9.0-rc.18"
-source = "git+https://github.com/defenseunicorns/peat?rev=14d16a97#14d16a970422eba616a5af99d8aa9577d263c97f"
+checksum = "ff334676e7a2a38da6e37b4d249e620e838fe3f5cc06b2ed5cf1bdb1dd5818d5"
 dependencies = [
  "chrono",
  "prost",

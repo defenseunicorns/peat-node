@@ -92,8 +92,6 @@ peat update <COLLECTION>/<DOC_ID> --set PATH=VALUE... \
 peat delete <COLLECTION>/<DOC_ID> [--wait-for-sync]
 ```
 
-`peat update --from <PATH>` is gated on [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) (Automerge delta API). Use `--set` until that lands.
-
 ### Output formats
 
 | Format | Use |
@@ -136,14 +134,15 @@ peat update contacts/c-1234 --set rank=2 --wait-for-sync
 peat delete contacts/c-1234
 ```
 
-### Round-trip edit (planned)
+### Round-trip edit
 
 ```sh
-# Currently gated on peat-mesh#187 — listed here so the pattern survives in docs.
 peat query contacts/c-1234 --output json \
   | jq '.position.lat = 40.7128' \
   | peat update contacts/c-1234 --from -
 ```
+
+`update --from` computes a minimal Automerge delta against the document's current state and applies only the new changes — the existing operation history is preserved. Updates against a missing doc fall back to initial creation.
 
 ## Operational notes
 
@@ -174,10 +173,6 @@ The bundle sets `encryption_key`, but the at-rest cipher path is still being res
 - The `host:port` resolves and the host is reachable on UDP (Iroh transport).
 - `--timeout` is long enough — default `10s` is brief on cold links; pass `--timeout 60s` for slow networks.
 
-**Exit 1 — `not yet implemented: update --from …`**
-
-`update --from` is gated on [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187). Use `peat update <target> --set path=value` until the upstream Automerge delta API lands.
-
 **Query returns empty / observe never fires**
 
 `peat` polls its local store after joining. If the seeded data lives on a peer that doesn't push proactively, the CLI's `--timeout` budget may expire before sync drains the doc into the local store. Bump `--timeout` for slow links; confirm the peer is actively syncing (`peat observe <collection>` will show non-zero traffic if it is).
@@ -192,5 +187,3 @@ The bundle sets `encryption_key`, but the at-rest cipher path is still being res
 |---|---|---|
 | [peat#940](https://github.com/defenseunicorns/peat/issues/940) | ADR-006 amendment for the credential bundle format | `peat-cli` ships a placeholder format until this lands |
 | [peat#941](https://github.com/defenseunicorns/peat/issues/941) | Per-collection write authorization scopes | Phase 4a's exit-3 path is coarse-grained today |
-| [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) | Automerge delta API | Blocks `update --from` |
-| [peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192) | Lamport-clock source for tombstone authorship | `peat delete` uses wall-clock nanoseconds as a single-node-safe proxy until this lands |

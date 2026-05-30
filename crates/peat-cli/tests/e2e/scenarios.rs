@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
-use super::topology::TestPeer;
+use super::topology::{self, TestPeer};
 
 /// Spawn `peat <args>` against `creds`, asserting it exits 0, and return
 /// `(stdout, stderr)` as UTF-8. Centralises the subprocess plumbing so each
@@ -201,6 +201,81 @@ async fn update_set_against_missing_doc_creates_it() {
 
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
+async fn update_from_applies_delta_to_existing_doc() {
+    // Round-trip-edit (ADR-001 Phase 4b, peat-mesh#187): write a doc on
+    // the peer, then `update --from` against the proposed shape. The
+    // peer should observe the merged state — both the prior fields and
+    // the edited field — proving the delta path applied changes rather
+    // than recreating the doc.
+    let peer = TestPeer::start().await;
+    let doc = json_to_automerge(&json!({"name": "alice", "rank": 1}), None).unwrap();
+    peer.backend.store().put("contacts:c-1", &doc).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    // Write the proposed full doc to a tempfile; the CLI reads it and
+    // diffs against current.
+    let proposed_path = dir.path().join("proposed.json");
+    std::fs::write(
+        &proposed_path,
+        serde_json::to_string(&json!({"name": "alice", "rank": 5, "tag": "lead"})).unwrap(),
+    )
+    .unwrap();
+
+    run_peat(
+        &creds,
+        &[
+            "update",
+            "contacts/c-1",
+            "--from",
+            proposed_path.to_str().unwrap(),
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    let merged = await_key(&peer, "contacts:c-1", Duration::from_secs(10)).await;
+    assert_eq!(merged["name"], json!("alice"));
+    assert_eq!(merged["rank"], json!(5), "rank should be updated to 5");
+    assert_eq!(merged["tag"], json!("lead"), "new field should be present");
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn update_from_against_missing_doc_creates_it() {
+    // Upsert semantics: missing doc → initial creation via `put` (no
+    // delta to compute against).
+    let peer = TestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let proposed_path = dir.path().join("proposed.json");
+    std::fs::write(
+        &proposed_path,
+        serde_json::to_string(&json!({"name": "frank", "rank": 9})).unwrap(),
+    )
+    .unwrap();
+
+    run_peat(
+        &creds,
+        &[
+            "update",
+            "contacts/c-new",
+            "--from",
+            proposed_path.to_str().unwrap(),
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    let created = await_key(&peer, "contacts:c-new", Duration::from_secs(10)).await;
+    assert_eq!(created["name"], json!("frank"));
+    assert_eq!(created["rank"], json!(9));
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn delete_tombstones_doc_on_peer() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice"}), None).unwrap();
@@ -286,4 +361,110 @@ async fn query_limit_caps_result_count() {
         3,
         "--limit 3 should cap to 3 docs"
     );
+}
+
+// ---------------------------------------------------------------------
+// Multi-binary scenarios: two real `peat` binary instances running
+// concurrently or sequentially against the same in-process [`TestPeer`]
+// rendezvous. Validates that data flows end-to-end across separate
+// process boundaries — not just CLI ↔ in-process backend.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn observe_subprocess_streams_create_from_second_subprocess() {
+    // Two real `peat` binaries: one running `observe`, one running
+    // `create`. The observer must see the writer's record stream past on
+    // stdout, proving the CLI's receive-side stream pump works when the
+    // traffic is authored by another CLI binary (not by a direct
+    // `TestPeer.store.put` shortcut).
+    let peer = TestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let mut observer =
+        topology::spawn_peat_streaming(&creds, &["observe", "contacts", "--output", "ndjson"]);
+
+    // Give the observer's join handshake + subscription registration a
+    // moment to complete before the writer subprocess starts. Without
+    // this, the writer races the subscribe and the observer can miss
+    // the event.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    run_peat(
+        &creds,
+        &[
+            "create",
+            "contacts",
+            "--id",
+            "c-bridge",
+            "--set",
+            "name=alice",
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    topology::await_stdout_contains(&mut observer, "c-bridge", Duration::from_secs(15)).await;
+    // observer is killed on Drop (kill_on_drop=true).
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn update_from_round_trip_across_two_subprocesses() {
+    // Sequential cross-CLI round-trip-edit: CLI #1 seeds via `create`,
+    // CLI #2 fetches the current state via `query --output json`, edits
+    // it, and feeds it back via `update --from -`. Mirrors the operator
+    // workflow documented in `crates/peat-cli/README.md` — every step is
+    // a real subprocess invocation, no `TestPeer.store.put` shortcuts.
+    let peer = TestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    // CLI #1: seed.
+    run_peat(
+        &creds,
+        &[
+            "create",
+            "contacts",
+            "--id",
+            "c-round",
+            "--set",
+            "name=alice",
+            "--set",
+            "rank=1",
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+    // Wait for the seed to materialise on the peer before reading it back.
+    await_key(&peer, "contacts:c-round", Duration::from_secs(10)).await;
+
+    // CLI #2: fetch current state as canonical JSON.
+    let (fetched_stdout, _) =
+        run_peat(&creds, &["--output", "json", "query", "contacts/c-round"]).await;
+    let mut fetched: Value = serde_json::from_str(&fetched_stdout).expect("query stdout is JSON");
+    fetched["rank"] = json!(7);
+    fetched["tag"] = json!("lead");
+
+    let proposed_path = dir.path().join("edited.json");
+    std::fs::write(&proposed_path, serde_json::to_string(&fetched).unwrap()).unwrap();
+
+    // CLI #3: apply the edit via the delta path.
+    run_peat(
+        &creds,
+        &[
+            "update",
+            "contacts/c-round",
+            "--from",
+            proposed_path.to_str().unwrap(),
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    let merged = await_key(&peer, "contacts:c-round", Duration::from_secs(10)).await;
+    assert_eq!(merged["name"], json!("alice"), "unedited field preserved");
+    assert_eq!(merged["rank"], json!(7), "edited field updated");
+    assert_eq!(merged["tag"], json!("lead"), "new field appended");
 }

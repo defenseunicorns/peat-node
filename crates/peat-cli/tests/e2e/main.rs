@@ -197,17 +197,20 @@ fn create_with_no_validate_skips_schema_gate_for_known_collection() {
 }
 
 #[test]
-fn update_from_returns_not_implemented_with_upstream_link() {
-    // --from is gated on peat-mesh#187; the error names the issue so
-    // operators know where to look. Note: clap parses --from before the
-    // handler runs, so we need a valid --from arg shape even though we
-    // never read the file.
+fn update_from_missing_file_is_malformed() {
+    // `--from` is parsed *before* the join prelude (peat-mesh#187 landed
+    // the delta API, so this is real now). A bad path surfaces as
+    // CliError::Malformed → exit 4 before we attempt any mesh handshake,
+    // so passing a path that doesn't exist exercises the eager-read path.
     peat()
-        .args(["update", "contacts/c-1", "--from", "doc.json"])
+        .args([
+            "update",
+            "contacts/c-1",
+            "--from",
+            "/definitely/does/not/exist.json",
+        ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("update --from"))
-        .stderr(predicate::str::contains("peat-mesh#187"));
+        .code(4);
 }
 
 #[test]
