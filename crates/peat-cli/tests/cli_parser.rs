@@ -25,11 +25,88 @@ fn query_minimal() {
     let cli = parse(&["query", "contacts"]);
     match cli.command {
         Command::Query(q) => {
-            assert_eq!(q.target, "contacts");
+            assert_eq!(q.target.as_deref(), Some("contacts"));
+            assert!(!q.all_collections);
             assert_eq!(q.limit, None);
         }
         _ => panic!("wrong subcommand"),
     }
+}
+
+#[test]
+fn query_all_collections_via_long_flag() {
+    let cli = parse(&["query", "--all-collections"]);
+    match cli.command {
+        Command::Query(q) => {
+            assert_eq!(q.target, None);
+            assert!(q.all_collections);
+        }
+        _ => panic!("wrong subcommand"),
+    }
+}
+
+#[test]
+fn query_all_collections_via_alias() {
+    let cli = parse(&["query", "--all"]);
+    match cli.command {
+        Command::Query(q) => {
+            assert_eq!(q.target, None);
+            assert!(q.all_collections);
+        }
+        _ => panic!("wrong subcommand"),
+    }
+}
+
+#[test]
+fn query_requires_target_or_all() {
+    let err = parse_err(&["query"]);
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "{err}"
+    );
+}
+
+#[test]
+fn query_rejects_target_combined_with_all() {
+    let err = parse_err(&["query", "contacts", "--all"]);
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ArgumentConflict,
+        "{err}"
+    );
+}
+
+#[test]
+fn observe_all_collections_via_long_flag() {
+    let cli = parse(&["observe", "--all-collections"]);
+    match cli.command {
+        Command::Observe(o) => {
+            assert_eq!(o.target, None);
+            assert!(o.all_collections);
+        }
+        _ => panic!("wrong subcommand"),
+    }
+}
+
+#[test]
+fn observe_requires_target_or_all() {
+    let err = parse_err(&["observe"]);
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument,
+        "{err}"
+    );
+}
+
+#[test]
+fn observe_rejects_target_combined_with_all() {
+    let err = parse_err(&["observe", "contacts", "--all"]);
+    assert_eq!(
+        err.kind(),
+        clap::error::ErrorKind::ArgumentConflict,
+        "{err}"
+    );
 }
 
 #[test]

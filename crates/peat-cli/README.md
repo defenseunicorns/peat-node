@@ -70,12 +70,22 @@ peers:
 ### Read
 
 ```sh
-# Materialised current state.
+# Materialised current state for one collection or doc.
 peat query <COLLECTION>[/<DOC_ID>] [--limit N] [--output text|json|ndjson]
+
+# Scan every collection reachable with the credential bundle.
+peat query --all-collections [--limit N] [--output text|json|ndjson]
+peat query --all              [--limit N] [--output text|json|ndjson]   # short alias
 
 # Live stream of updates until SIGINT.
 peat observe <COLLECTION>[/<DOC_ID>] [--mode latest-only|windowed|full-history]
+
+# Live stream across every collection.
+peat observe --all-collections [--mode latest-only|windowed|full-history]
+peat observe --all             [--mode latest-only|windowed|full-history]
 ```
+
+Exactly one of `<TARGET>` or `--all-collections` is required; combining them is a parse-time error.
 
 ### Write
 
@@ -121,8 +131,14 @@ Data goes to **stdout**; logs, errors, and status to **stderr**. `peat … > fil
 # Show the current state of a doc.
 peat query contacts/c-1234 --output json
 
+# Sweep every collection reachable with the bundle.
+peat query --all --output json | jq 'keys'
+
 # Stream every update to the contacts collection as ndjson.
 peat observe contacts --output ndjson | jq 'select(.doc.rank > 3)'
+
+# Cross-collection observer — route on the key field.
+peat observe --all --output ndjson | jq 'select(.key | startswith("contacts:"))'
 
 # Create a doc from a JSON file.
 peat create contacts --id c-1234 --from contact.json --wait-for-sync

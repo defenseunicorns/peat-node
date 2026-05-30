@@ -165,19 +165,29 @@ Common options:
 **Read commands**
 
 ```
-peat query <COLLECTION>[/<DOC_ID>] [OPTIONS]
+peat query <TARGET | --all-collections> [OPTIONS]
+  <TARGET>                  <COLLECTION>[/<DOC_ID>]
+  --all-collections, --all  Scan every collection reachable with the
+                            supplied credentials (mutually exclusive
+                            with <TARGET>)
   --limit <N>               Cap the number of records emitted
 ```
 
-`query` returns the materialized current state of the target — a collection of documents if `<COLLECTION>` alone is given, a single document if `<COLLECTION>/<DOC_ID>` is given. There is no operation-log mode and no pagination cursor; if more selectivity is needed, narrow the target or use `--limit`. This mirrors how `psql` handles a `SELECT`: the result is the rows, not the WAL that produced them.
+`query` returns the materialized current state of the target — a collection of documents if `<COLLECTION>` alone is given, a single document if `<COLLECTION>/<DOC_ID>` is given. `--all-collections` (alias `--all`) scans the full mesh store and returns docs keyed by `<collection>:<doc_id>`; combine with `--limit` to cap. Exactly one of `<TARGET>` or `--all-collections` is required — clap rejects the bare command and the combined-flags case at parse time. There is no operation-log mode and no pagination cursor; if more selectivity is needed, narrow the target or use `--limit`. This mirrors how `psql` handles a `SELECT`: the result is the rows, not the WAL that produced them.
 
 For change-stream / CDC-style consumption, see `observe --mode full-history` below.
 
 ```
-peat observe <COLLECTION>[/<DOC_ID>] [OPTIONS]
+peat observe <TARGET | --all-collections> [OPTIONS]
+  <TARGET>                  <COLLECTION>[/<DOC_ID>]
+  --all-collections, --all  Subscribe across every collection reachable
+                            with the supplied credentials (mutually
+                            exclusive with <TARGET>)
   --mode <SYNC_MODE>        latest-only | windowed | full-history
                             (default: latest-only)
 ```
+
+Same target grammar as `query`: exactly one of `<TARGET>` or `--all-collections` is required. `--all-collections` turns the prefix filter off; every observer event reaches the renderer with the full `<collection>:<doc_id>` key intact, so a downstream `jq` consumer can route on the `key` field. Authorization is formation-key custody today (ADR-006, peat#941 deferred), so "all collections reachable with the supplied credentials" equals the full store.
 
 `observe --since <TIMESTAMP>` is deferred; it requires sync mode replay semantics still being finalized in ADR-019. Captured as future work.
 

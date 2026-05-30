@@ -18,9 +18,19 @@ use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("scope").required(true).args(["target", "all_collections"]))]
 pub struct ObserveArgs {
-    /// Target as `<COLLECTION>` or `<COLLECTION>/<DOC_ID>`.
-    pub target: String,
+    /// Target as `<COLLECTION>` or `<COLLECTION>/<DOC_ID>`. Mutually exclusive with `--all-collections`.
+    pub target: Option<String>,
+
+    /// Observe every collection reachable with the supplied credentials.
+    /// Equivalent to subscribing to the full mesh changes stream.
+    #[arg(
+        long = "all-collections",
+        visible_alias = "all",
+        conflicts_with = "target"
+    )]
+    pub all_collections: bool,
 
     /// Sync mode (maps to ADR-019 sync modes).
     #[arg(long, value_enum, default_value_t = SyncMode::LatestOnly)]
@@ -38,9 +48,23 @@ pub enum SyncMode {
 }
 
 pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> {
-    let (collection, doc_id) = parse_target(&args.target)?;
-    let prefix = format!("{collection}:");
-    let target_key = doc_id.map(|id| format!("{collection}:{id}"));
+    // `--all-collections` skips per-collection prefix filtering — every
+    // observer event reaches the renderer. Authorization is formation-key-
+    // only today (peat#941 deferred), so the bundle's read scope is the
+    // entire store.
+    let (prefix, target_key) = if args.all_collections {
+        (String::new(), None)
+    } else {
+        let target = args
+            .target
+            .as_deref()
+            .expect("ArgGroup `scope` guarantees target when all_collections is false");
+        let (collection, doc_id) = parse_target(target)?;
+        (
+            format!("{collection}:"),
+            doc_id.map(|id| format!("{collection}:{id}")),
+        )
+    };
 
     if args.mode != SyncMode::LatestOnly {
         tracing::warn!(

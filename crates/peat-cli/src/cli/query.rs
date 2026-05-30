@@ -9,9 +9,19 @@ use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("scope").required(true).args(["target", "all_collections"]))]
 pub struct QueryArgs {
-    /// Target as `<COLLECTION>` or `<COLLECTION>/<DOC_ID>`.
-    pub target: String,
+    /// Target as `<COLLECTION>` or `<COLLECTION>/<DOC_ID>`. Mutually exclusive with `--all-collections`.
+    pub target: Option<String>,
+
+    /// Query every collection reachable with the supplied credentials.
+    /// Equivalent to scanning the full mesh store keyed by `<collection>:<doc_id>`.
+    #[arg(
+        long = "all-collections",
+        visible_alias = "all",
+        conflicts_with = "target"
+    )]
+    pub all_collections: bool,
 
     /// Cap the number of records emitted.
     #[arg(long, value_name = "N")]
@@ -27,8 +37,29 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// a head start so the very first scan isn't racing the handshake.
 const INITIAL_SETTLE: Duration = Duration::from_millis(250);
 
+/// Resolved scope for a query — either a single collection (optionally
+/// pinned to a doc-id) or the full store. clap's ArgGroup guarantees
+/// exactly one branch is reachable.
+enum Scope<'a> {
+    Single {
+        collection: &'a str,
+        doc_id: Option<&'a str>,
+    },
+    All,
+}
+
 pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
-    let (collection, doc_id) = parse_target(&args.target)?;
+    let scope = if args.all_collections {
+        Scope::All
+    } else {
+        // clap ArgGroup requires `target` when `--all-collections` is absent.
+        let target = args
+            .target
+            .as_deref()
+            .expect("ArgGroup `scope` guarantees target when all_collections is false");
+        let (collection, doc_id) = parse_target(target)?;
+        Scope::Single { collection, doc_id }
+    };
 
     let creds = creds::load(common.creds.as_deref())?;
     let timeout = parse_timeout(&common.timeout)?;
@@ -51,8 +82,11 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
     // valid result (the target genuinely has no matching documents).
     let deadline = Instant::now() + timeout;
     loop {
-        let docs = match doc_id {
-            Some(id) => {
+        let docs = match scope {
+            Scope::Single {
+                collection,
+                doc_id: Some(id),
+            } => {
                 let key = format!("{collection}:{id}");
                 match store
                     .get(&key)
@@ -62,11 +96,27 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
                     None => Vec::new(),
                 }
             }
-            None => {
+            Scope::Single {
+                collection,
+                doc_id: None,
+            } => {
                 let prefix = format!("{collection}:");
                 let mut entries = store
                     .scan_prefix(&prefix)
                     .map_err(|e| CliError::Generic(format!("scan `{prefix}`: {e}")))?;
+                if let Some(n) = args.limit {
+                    entries.truncate(n);
+                }
+                entries
+            }
+            Scope::All => {
+                // Empty prefix → every document in the store. Authorization
+                // gating is formation-key-only today (peat#941 deferred),
+                // so "all collections this credential bundle can reach" =
+                // "everything the store will scan."
+                let mut entries = store
+                    .scan_prefix("")
+                    .map_err(|e| CliError::Generic(format!("scan all: {e}")))?;
                 if let Some(n) = args.limit {
                     entries.truncate(n);
                 }

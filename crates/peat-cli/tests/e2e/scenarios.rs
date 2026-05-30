@@ -703,6 +703,106 @@ async fn lifecycle_cell_config_registered_type() {
 
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
+async fn query_all_collections_returns_keys_from_every_collection() {
+    // `--all-collections` scans the full mesh store, returning docs
+    // keyed by `<collection>:<doc_id>` across every reachable
+    // collection. Authorization gating is formation-key-only today
+    // (peat#941 deferred), so the bundle's read scope = the full store.
+    let peer = TestPeer::start().await;
+    peer.backend
+        .store()
+        .put(
+            "contacts:c-1",
+            &json_to_automerge(&json!({"name": "alice"}), None).unwrap(),
+        )
+        .unwrap();
+    peer.backend
+        .store()
+        .put(
+            "things:t-1",
+            &json_to_automerge(&json!({"label": "widget"}), None).unwrap(),
+        )
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let (stdout, _) = run_peat(&creds, &["--output", "json", "query", "--all-collections"]).await;
+    let parsed: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    let obj = parsed
+        .as_object()
+        .expect("--all-collections emits keyed object");
+    assert!(
+        obj.contains_key("contacts:c-1"),
+        "expected contacts entry; got keys {:?}",
+        obj.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        obj.contains_key("things:t-1"),
+        "expected things entry; got keys {:?}",
+        obj.keys().collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn observe_all_collections_streams_events_from_every_collection() {
+    // Cross-collection observer: one `peat observe --all` subprocess
+    // should see ndjson events for writes against multiple
+    // collections, not just one.
+    let peer = TestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let mut observer = topology::spawn_peat_streaming(
+        &creds,
+        &["observe", "--all-collections", "--output", "ndjson"],
+    );
+
+    // Allow the observer's join handshake + subscription to settle
+    // before the writers fire.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    run_peat(
+        &creds,
+        &[
+            "create",
+            "contacts",
+            "--id",
+            "c-2",
+            "--set",
+            "name=carol",
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+    run_peat(
+        &creds,
+        &[
+            "create",
+            "things",
+            "--id",
+            "t-2",
+            "--set",
+            "label=gadget",
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    // Observer must see BOTH collections in its stdout — the
+    // `--all-collections` flag turns off the prefix filter so every
+    // event reaches the renderer.
+    let seen =
+        topology::await_stdout_contains(&mut observer, "things:t-2", Duration::from_secs(20)).await;
+    assert!(
+        seen.contains("contacts:c-2"),
+        "expected contacts event in observer stdout; saw:\n{seen}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_cell_state_registered_type() {
     // CellState has no required scalar fields; defaults alone are valid.
     // `leader_id` would force a paired `members` mutation (the validator
