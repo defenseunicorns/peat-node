@@ -334,6 +334,18 @@ EOF
     if echo "${CLI_DOC}" | grep -q "via-cli"; then
         pass "GetDocument on alpha sees the CLI-authored doc"
     else
+        # Self-diagnostic dump on failure: show the alpha sidecar's
+        # recent logs (did it receive an inbound Iroh handshake from
+        # the CLI? did sync messages arrive?) and re-query via the
+        # CLI itself (does the CLI's own ephemeral store have the
+        # doc? — answers "did the local put actually happen?").
+        echo "--- alpha sidecar logs (last 50 lines) ---"
+        kubectl --context "${CTX_A}" logs -n peat -l app.kubernetes.io/name=peat-node \
+            -c peat-node --tail=50 2>&1 || true
+        echo "--- re-run peat query inside alpha pod with debug logs ---"
+        kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
+            sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=info peat --creds /tmp/creds.yaml --timeout 30s --output json query contacts/cli-smoke 2>&1' \
+            || true
         fail "GetDocument on alpha missing CLI doc after 15s (got: ${CLI_DOC})"
     fi
 

@@ -107,11 +107,19 @@ log "Step 2: 'peat query --all-collections' from inside peat-node-a"
 # demo.sh already wrote hello/world on node-a; --all-collections should
 # include it. The query goes via the CLI's own joined session, not
 # node-a's local store, so this proves the handshake works.
-# Bumped to --timeout 60s because cold Iroh handshake on a CI runner
-# can take >30s before sync drains the first scan.
-out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml \
+#
+# RUST_LOG includes peat_cli + peat_mesh debug so the next failure
+# carries the actual peer-connect error (the join prelude logs
+# `peer connection failed: <e>` at warn level — without `peat_cli`
+# in the filter, the wrapper "no peers reachable" message is all
+# we see). Bumped to --timeout 60s because cold Iroh handshake on
+# a CI runner can take >30s before sync drains the first scan.
+out=$(docker exec -e RUST_LOG=peat_cli=debug,peat_mesh=info,peat_protocol=info \
+        peat-node-a peat --creds /tmp/creds.yaml \
         --timeout 60s --output json query --all-collections 2>&1) || {
-    fail "query --all-collections failed; output: ${out}"
+    log "Step 2 failed; full output:"
+    echo "${out}" | sed 's/^/    /'
+    fail "query --all-collections failed"
 }
 echo "${out}" | jq -e '.["hello:world"]' >/dev/null \
     || fail "query --all-collections didn't include hello/world (got ${out})"
