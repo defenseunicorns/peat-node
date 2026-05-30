@@ -269,6 +269,64 @@ run_test() {
     [ "${BYTES_A}" -gt 0 ] && pass "Alpha bytesSent=${BYTES_A}" || fail "Alpha bytesSent=${BYTES_A} (expected >0)"
     [ "${BYTES_B}" -gt 0 ] && pass "Bravo bytesSent=${BYTES_B}" || fail "Bravo bytesSent=${BYTES_B} (expected >0)"
 
+    # ── Test 6: peat CLI inside the pod (QUICKSTART Path B) ───
+    # Verifies the operator workflow the root QUICKSTART claims:
+    # bootstrap a CLI credential bundle inside the sidecar, then
+    # drive CRUD via `kubectl exec deploy/peat-peat-node -- peat …`.
+    # Without this assertion the QUICKSTART Path B walkthrough would
+    # have no executable contract — any drift in the CLI's wire
+    # behaviour, the chart's deployment naming, or the in-pod
+    # binary path would silently break the docs.
+    log "Test 6: peat CLI in-pod workflow"
+
+    # Bootstrap creds.yaml inside the alpha pod. App_id + shared_key
+    # must match what the chart set the sidecar to. `deploy_to`
+    # passes only --set sharedKey=…; appId defaults to the chart's
+    # `peat-default` in values.yaml.
+    if ! kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- sh -c "
+        cat > /tmp/creds.yaml <<EOF
+app_id: peat-default
+shared_key: ${SHARED_KEY}
+peers:
+  - \$(curl -s -X POST http://localhost:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
+      -H 'Content-Type: application/json' -d '{}' \
+      | grep -o '\"endpointAddr\":\"[^\"]*\"' | cut -d'\"' -f4)@localhost:${IROH_PORT}
+EOF
+        chmod 600 /tmp/creds.yaml
+    " >/dev/null 2>&1; then
+        fail "could not bootstrap /tmp/creds.yaml in alpha pod"
+    else
+        pass "creds.yaml bootstrapped in alpha pod"
+    fi
+
+    # Offline sanity: schema list must work without joining a mesh.
+    if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
+        peat schema list 2>&1 | grep -q "capabilities"; then
+        pass "peat schema list runs offline inside the pod"
+    else
+        fail "peat schema list failed inside the pod"
+    fi
+
+    # Drive a write through the CLI; assert the doc lands on the
+    # sidecar's own store (via GetDocument over Connect RPC).
+    if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
+        peat --creds /tmp/creds.yaml --timeout 30s \
+            create contacts --id cli-smoke --set name=via-cli --wait-for-sync \
+            >/dev/null 2>&1; then
+        pass "peat create via kubectl exec succeeded"
+    else
+        fail "peat create via kubectl exec failed"
+    fi
+
+    # Confirm the sidecar's own store has it (the CLI joined the
+    # mesh and synced the write back to its peer).
+    CLI_DOC=$(rpc_on "${CTX_A}" GetDocument '{"collection":"contacts","docId":"cli-smoke"}')
+    if echo "${CLI_DOC}" | grep -q "via-cli"; then
+        pass "GetDocument on alpha sees the CLI-authored doc"
+    else
+        fail "GetDocument on alpha missing CLI doc (got: ${CLI_DOC})"
+    fi
+
     echo ""
     if ${FAILED}; then
         log "SOME TESTS FAILED"

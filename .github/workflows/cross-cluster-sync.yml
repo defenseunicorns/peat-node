@@ -24,6 +24,10 @@ on:
       - "chart/**"
       - "test/cross-cluster-sync.sh"
       - ".github/workflows/cross-cluster-sync.yml"
+      # QUICKSTART Path B is exercised by Test 6 in cross-cluster-sync.sh;
+      # doc changes that touch the walkthrough re-run the gate.
+      - "QUICKSTART.md"
+      - "crates/peat-cli/QUICKSTART.md"
   workflow_dispatch:
     inputs:
       ref:
