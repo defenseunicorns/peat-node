@@ -7,7 +7,7 @@
 //! come from `--from`.
 
 use peat_schema::type_registry::{BuiltinRegistry, TypeRegistry};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -56,30 +56,15 @@ pub fn validate_against_schema(collection: &str, value: &Value) -> Result<(), Cl
 /// fix is to give prost the wire zero for every field, then layer the
 /// operator's `--set` overlay on top so partial intent survives.
 ///
-/// Why a hardcoded per-collection table rather than a generic
-/// `FieldFormat`-driven default function: `FieldFormat::JsonString` is
-/// ambiguous — `Capability::metadata_json` (real `string`, default `""`)
-/// and `NodeConfig::operator_binding` (real `optional HumanMachinePair`,
-/// default `null`) both carry the same `JsonString` format in the
-/// rc.19 registry. A descriptor-driven default would be wrong for one
-/// or the other; an explicit per-type table is correct for both. The
-/// table is small (5 types) and stable, and `defaults_match_proto3_round_trip`
-/// in this module's tests catches drift against the registry's
-/// validators.
-///
-/// Long-term shape: `peat-schema` exposes a per-type `proto3_zero()` on
-/// `TypeDescriptor` and this function becomes registry-driven. Tracked
-/// at [peat#953] (with sibling context at [peat-node#112]). When peat#953
-/// lands, swap the body of this function for `desc.proto3_zero()` and
-/// drop both [`proto3_defaults_for`] and the
-/// `defaults_pure_pass_prost_deserialize_for_every_registered_type`
-/// unit test (the round-trip property holds by construction once the
-/// defaults come from the same codegen path as the validator).
-///
-/// [peat#953]: https://github.com/defenseunicorns/peat/issues/953
-/// [peat-node#112]: https://github.com/defenseunicorns/peat-node/issues/112
+/// The defaults come from `TypeDescriptor::proto3_zero()` (peat#953 /
+/// peat#954, shipped in peat-schema rc.21). The descriptor exposes
+/// the canonical wire zero for the type, generated from the same
+/// codegen path as the validator — so the round-trip property
+/// (`proto3_zero` ⊆ `validate_json::Ok`) holds by construction and
+/// can't drift.
 pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
-    let Some(defaults) = proto3_defaults_for(collection) else {
+    let registry = BuiltinRegistry::with_peat_schema_types();
+    let Some(desc) = registry.for_collection(collection) else {
         return value;
     };
     let Value::Object(ref mut user) = value else {
@@ -87,61 +72,16 @@ pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
         // scalar). Validation will reject; nothing for us to merge.
         return value;
     };
-    let Value::Object(default_map) = defaults else {
+    let Value::Object(default_map) = desc.proto3_zero() else {
+        // `proto3_zero` is contracted to return a JSON object for
+        // every registered type; treat anything else as a no-op merge
+        // rather than panicking — validation will surface the misshape.
         return Value::Object(user.clone());
     };
     for (k, default_v) in default_map {
         user.entry(k).or_insert(default_v);
     }
     value
-}
-
-/// Per-collection proto3 zero map for the 5 builtin peat-schema types
-/// (peat-schema rc.19). Returns `None` for unknown collections.
-fn proto3_defaults_for(collection: &str) -> Option<Value> {
-    match collection {
-        "capabilities" => Some(json!({
-            "id": "",
-            "name": "",
-            "capability_type": 0,
-            "confidence": 0.0,
-            "metadata_json": "",
-            "registered_at": null,
-        })),
-        "node-configs" => Some(json!({
-            "id": "",
-            "platform_type": "",
-            "capabilities": [],
-            "comm_range_m": 0.0,
-            "max_speed_mps": 0.0,
-            "operator_binding": null,
-            "created_at": null,
-        })),
-        "node-states" => Some(json!({
-            "position": null,
-            "fuel_minutes": 0,
-            "health": 0,
-            "phase": 0,
-            "cell_id": null,
-            "zone_id": null,
-            "timestamp": null,
-        })),
-        "cell-configs" => Some(json!({
-            "id": "",
-            "max_size": 0,
-            "min_size": 0,
-            "created_at": null,
-        })),
-        "cell-states" => Some(json!({
-            "config": null,
-            "leader_id": null,
-            "members": [],
-            "capabilities": [],
-            "platoon_id": null,
-            "timestamp": null,
-        })),
-        _ => None,
-    }
 }
 
 /// Fixed-period wait that approximates ADR-001 `--wait-for-sync` semantics.
@@ -319,45 +259,6 @@ mod tests {
         let user = json!({"name": "alice"});
         let merged = apply_proto3_defaults("contacts", user.clone());
         assert_eq!(merged, user, "unknown collections pass through unchanged");
-    }
-
-    #[test]
-    fn defaults_pure_pass_prost_deserialize_for_every_registered_type() {
-        // Drift catcher (peat-node#112): proves each per-collection
-        // proto3-defaults map round-trips through prost's Deserialize.
-        // If peat-schema adds a required field to one of the 5 builtin
-        // types and this crate's `proto3_defaults_for` lags, this test
-        // fails with prost's "missing field" error pointing at the new
-        // field — the same error operators would otherwise see when
-        // running `peat create <collection> --set ...`.
-        for collection in [
-            "capabilities",
-            "node-configs",
-            "node-states",
-            "cell-configs",
-            "cell-states",
-        ] {
-            let defaults = apply_proto3_defaults(collection, Value::Object(Default::default()));
-            // Call validate_json directly so prost's deserialize error,
-            // not the validator's "MissingField", surfaces if the
-            // defaults are incomplete.
-            let registry = BuiltinRegistry::with_peat_schema_types();
-            let desc = registry
-                .for_collection(collection)
-                .unwrap_or_else(|| panic!("{collection} not registered"));
-            // Validators reject empty required strings (e.g. id), but
-            // that's an `Err(MissingField)` from the validator AFTER a
-            // successful prost deserialize. Drift would surface as an
-            // `Err(InvalidValue("could not deserialise as …"))` from
-            // the deserialize step — the substring is the signature.
-            if let Err(err) = (desc.validate_json)(&defaults) {
-                let msg = format!("{err}");
-                assert!(
-                    !msg.contains("could not deserialise"),
-                    "defaults for `{collection}` are out of sync with the registry: {msg}"
-                );
-            }
-        }
     }
 
     #[test]
