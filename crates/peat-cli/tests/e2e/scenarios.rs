@@ -649,15 +649,15 @@ async fn lifecycle_node_config_registered_type() {
         "NodeConfig",
         &[
             "id=node-1",
-            "platform_type=ground-rover",
+            "platform_type=platform-a",
             "comm_range_m=1500.0",
             "max_speed_mps=12.5",
         ],
-        &["NodeConfig", "ground-rover"],
-        "platform_type=aerial-quad",
+        &["NodeConfig", "platform-a"],
+        "platform_type=platform-b",
         |merged| {
             assert_eq!(merged["id"], json!("node-1"));
-            assert_eq!(merged["platform_type"], json!("aerial-quad"));
+            assert_eq!(merged["platform_type"], json!("platform-b"));
         },
     )
     .await;
@@ -707,16 +707,17 @@ async fn lifecycle_cell_state_registered_type() {
     // CellState has no required scalar fields; defaults alone are valid.
     // `leader_id` would force a paired `members` mutation (the validator
     // demands leader_id ∈ members), so anchor on `platoon_id` instead —
-    // it's an `optional string` with no cross-field constraint.
+    // it's an `optional string` with no cross-field constraint, suitable
+    // for round-tripping an arbitrary opaque identifier.
     run_typed_lifecycle(
         "cell-states",
         "cs-1",
         "CellState",
-        &["platoon_id=alpha"],
+        &["platoon_id=g-1"],
         &["CellState"],
-        "platoon_id=bravo",
+        "platoon_id=g-2",
         |merged| {
-            assert_eq!(merged["platoon_id"], json!("bravo"));
+            assert_eq!(merged["platoon_id"], json!("g-2"));
         },
     )
     .await;
