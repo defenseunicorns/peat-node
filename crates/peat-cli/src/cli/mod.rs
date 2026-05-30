@@ -3,6 +3,7 @@ pub mod delete;
 pub mod observe;
 pub mod output;
 pub mod query;
+pub mod schema;
 pub mod update;
 pub mod writes;
 
@@ -74,6 +75,9 @@ pub enum Command {
 
     /// Tombstone a document.
     Delete(delete::DeleteArgs),
+
+    /// Inspect the peat-schema type registry (offline — no creds or mesh).
+    Schema(schema::SchemaArgs),
 }
 
 /// Exit-code-bearing CLI error. Codes match the table in peat-node ADR-001.
@@ -125,6 +129,10 @@ impl Cli {
             Command::Create(args) => create::run(args, self.common).await,
             Command::Update(args) => update::run(args, self.common).await,
             Command::Delete(args) => delete::run(args, self.common).await,
+            // `schema` is local — no mesh handshake, doesn't read
+            // `CommonArgs::creds` / `--as` / `--timeout`. Output format
+            // is the only common-arg piece it threads through.
+            Command::Schema(args) => schema::run(args, self.common.output),
         }
     }
 }

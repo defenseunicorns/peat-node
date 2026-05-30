@@ -223,6 +223,15 @@ peat delete <COLLECTION>/<DOC_ID> [OPTIONS]
 
 `delete` does not prompt; the explicit `<COLLECTION>/<DOC_ID>` requirement is the safeguard. Tombstone semantics per ADR-034.
 
+**Schema-discovery commands** (local — no creds, no mesh):
+
+```
+peat schema list
+peat schema describe <COLLECTION | TYPE_ID>
+```
+
+`schema list` enumerates every `peat-schema` type the CLI knows about (the `BuiltinRegistry::with_peat_schema_types()` set), one row per type with collection name, type name, version, and canonical id. `schema describe` prints the field-level shape of a single type — addressable by either its conventional collection name (`capabilities`) or its canonical id (`peat.capability.v1.Capability`). Both commands run offline so an operator can audit the registry before staging a credential bundle. Output respects `--output text|json|ndjson`; the JSON shape (per-type object with `id`/`name`/`version`/`collection`/`fields[]`) is a stability contract for scripts.
+
 ### Lifecycle
 
 All commands share a single prelude:
