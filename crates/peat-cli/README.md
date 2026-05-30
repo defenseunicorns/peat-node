@@ -102,6 +102,18 @@ peat update <COLLECTION>/<DOC_ID> --set PATH=VALUE... \
 peat delete <COLLECTION>/<DOC_ID> [--wait-for-sync]
 ```
 
+### Schema discovery
+
+```sh
+# List every peat-schema type the CLI knows about.
+peat schema list [--output text|json|ndjson]
+
+# Describe one type's field-level shape (label, format, proto field name).
+peat schema describe <COLLECTION | TYPE_ID>
+```
+
+Both run offline — no credential bundle required. Useful to audit which types are registered before staging a write, or to discover field names + formats for a `--set` payload. Address by collection (`capabilities`) or canonical id (`peat.capability.v1.Capability`); a typo returns exit 4 with `no registered type matches`.
+
 ### Output formats
 
 | Format | Use |

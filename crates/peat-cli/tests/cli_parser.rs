@@ -234,6 +234,48 @@ fn delete_minimal() {
 }
 
 #[test]
+fn schema_list_parses() {
+    use peat_cli::cli::schema::SchemaSubcommand;
+    let cli = parse(&["schema", "list"]);
+    match cli.command {
+        Command::Schema(s) => assert!(matches!(s.sub, SchemaSubcommand::List)),
+        _ => panic!("wrong subcommand"),
+    }
+}
+
+#[test]
+fn schema_describe_parses_with_target() {
+    use peat_cli::cli::schema::SchemaSubcommand;
+    let cli = parse(&["schema", "describe", "capabilities"]);
+    match cli.command {
+        Command::Schema(s) => match s.sub {
+            SchemaSubcommand::Describe { target } => assert_eq!(target, "capabilities"),
+            _ => panic!("wrong schema sub"),
+        },
+        _ => panic!("wrong subcommand"),
+    }
+}
+
+#[test]
+fn schema_describe_requires_target() {
+    let err = parse_err(&["schema", "describe"]);
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+}
+
+#[test]
+fn schema_requires_sub() {
+    let err = parse_err(&["schema"]);
+    assert!(
+        matches!(
+            err.kind(),
+            clap::error::ErrorKind::MissingSubcommand
+                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        ),
+        "unexpected error kind: {err}"
+    );
+}
+
+#[test]
 fn common_args_defaults() {
     let cli = parse(&["query", "contacts"]);
     assert_eq!(cli.common.timeout, "10s");

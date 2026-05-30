@@ -37,7 +37,79 @@ fn help_renders_with_all_subcommands() {
         .stdout(predicate::str::contains("observe"))
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("update"))
-        .stdout(predicate::str::contains("delete"));
+        .stdout(predicate::str::contains("delete"))
+        .stdout(predicate::str::contains("schema"));
+}
+
+#[test]
+fn schema_list_runs_offline_without_creds() {
+    // `schema list` is a local registry inspector — no creds, no
+    // mesh handshake. Confirms an operator can discover registered
+    // types before they have a credential bundle in hand.
+    peat()
+        .args(["schema", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("COLLECTION"))
+        .stdout(predicate::str::contains("capabilities"))
+        .stdout(predicate::str::contains("Capability"));
+}
+
+#[test]
+fn schema_describe_renders_field_shape() {
+    // Field-level table for one type. Asserts on the format strings
+    // exercised by Capability so the renderer's contract is pinned.
+    peat()
+        .args(["schema", "describe", "capabilities"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Capability (v1)"))
+        .stdout(predicate::str::contains("collection: capabilities"))
+        .stdout(predicate::str::contains("confidence"))
+        .stdout(predicate::str::contains("percentage"))
+        .stdout(predicate::str::contains("Sensor"));
+}
+
+#[test]
+fn schema_describe_resolves_by_canonical_id() {
+    peat()
+        .args(["schema", "describe", "peat.capability.v1.Capability"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Capability"));
+}
+
+#[test]
+fn schema_describe_unknown_target_is_malformed() {
+    peat()
+        .args(["schema", "describe", "no-such-collection"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("no registered type matches"));
+}
+
+#[test]
+fn schema_list_json_output_is_array() {
+    // `--output json` contract: a JSON array, one element per type,
+    // each element carrying the documented keys. Scripts depend on this.
+    let output = peat()
+        .args(["--output", "json", "schema", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("stdout is JSON");
+    let arr = parsed.as_array().expect("schema list json is an array");
+    assert!(!arr.is_empty(), "expected non-empty registered-types array");
+    for entry in arr {
+        for key in ["id", "name", "version", "collection", "fields"] {
+            assert!(
+                entry.get(key).is_some(),
+                "missing key `{key}` in schema list entry: {entry}"
+            );
+        }
+    }
 }
 
 #[test]
