@@ -537,37 +537,40 @@ async fn update_from_round_trip_across_two_subprocesses() {
 // ---------------------------------------------------------------------
 // peat-schema registered-type lifecycles. One scenario per builtin
 // type (Capability / NodeConfig / NodeState / CellConfig / CellState):
-// create → query (typed text render) → update --from → query (json
+// create → query (typed text render) → update --set → query (json
 // verify) → delete → verify gone. Drives the
-// `validate_against_schema` accept arm + `render_typed_doc` dispatch
-// + the full sync round-trip for each registered descriptor.
+// `apply_proto3_defaults` + `validate_against_schema` accept arms +
+// `render_typed_doc` dispatch + the full sync round-trip for each
+// registered descriptor.
 //
-// All registered types route through prost's serde derive, which
-// rejects missing fields (no `#[serde(default)]`). So both create and
-// update must supply a complete proto3 JSON value — `--set` partial
-// payloads fail. The helper writes the supplied JSON to a tempfile and
-// uses `--from` for that reason. peat-cli's UX for these types would
-// be improved by zero-defaulting on `--set`; tracked as a follow-up.
+// Both create and update use `--set <field>=<value>` for the
+// operator-ergonomic path. peat-node#112 lands the proto3 zero-
+// defaulting that makes `--set` work on registered types — without it,
+// prost's strict deserialize rejects partial payloads. These tests
+// double as the integration-side proof that the defaults wire-up holds
+// across the full sync round trip.
 // ---------------------------------------------------------------------
 
 /// Shared lifecycle driver for a registered Peat type.
 ///
 /// Each call performs an independent six-step lifecycle on a fresh
 /// `TestPeer`:
-///   1. `create --from <path>` with a complete valid proto3 JSON value,
+///   1. `create --set k=v…` supplying only the validator-required
+///      fields. proto3 zero-defaults for siblings are populated by
+///      peat-cli (peat-node#112).
 ///   2. `query --output text` — assert the typed renderer emits the
 ///      type-name header + the expected label/value substrings,
 ///   3. `query --output json` — assert structural parse,
-///   4. `update --from <path>` with the mutated value (real delta path),
+///   4. `update --set k=v` to mutate one field (delta path),
 ///   5. `query --output json` confirms the merge landed,
 ///   6. `delete` and confirm the peer tombstones the doc.
 async fn run_typed_lifecycle(
     collection: &str,
     doc_id: &str,
     type_name: &str,
-    initial: Value,
-    mutated: Value,
+    create_sets: &[&str],
     expect_text_contains: &[&str],
+    update_set: &str,
     expect_json_after_update: impl Fn(&Value),
 ) {
     let peer = TestPeer::start().await;
@@ -576,25 +579,14 @@ async fn run_typed_lifecycle(
     let key = format!("{collection}:{doc_id}");
     let target = format!("{collection}/{doc_id}");
 
-    let initial_path = dir.path().join(format!("{doc_id}-initial.json"));
-    let mutated_path = dir.path().join(format!("{doc_id}-mutated.json"));
-    std::fs::write(&initial_path, serde_json::to_string(&initial).unwrap()).unwrap();
-    std::fs::write(&mutated_path, serde_json::to_string(&mutated).unwrap()).unwrap();
-
-    // 1. create.
-    run_peat(
-        &creds,
-        &[
-            "create",
-            collection,
-            "--id",
-            doc_id,
-            "--from",
-            initial_path.to_str().unwrap(),
-            "--wait-for-sync",
-        ],
-    )
-    .await;
+    // 1. create — only the validator-required fields, defaults fill the rest.
+    let mut create_args: Vec<&str> = vec!["create", collection, "--id", doc_id];
+    for s in create_sets {
+        create_args.push("--set");
+        create_args.push(s);
+    }
+    create_args.push("--wait-for-sync");
+    run_peat(&creds, &create_args).await;
     await_key(&peer, &key, Duration::from_secs(10)).await;
 
     // 2. query --output text (typed render dispatch).
@@ -614,16 +606,10 @@ async fn run_typed_lifecycle(
     let (json_stdout, _) = run_peat(&creds, &["--output", "json", "query", &target]).await;
     let _: Value = serde_json::from_str(&json_stdout).expect("query json stdout parses");
 
-    // 4. update --from (real delta path via AutomergeStore::diff).
+    // 4. update --set (delta path via AutomergeStore::diff).
     run_peat(
         &creds,
-        &[
-            "update",
-            &target,
-            "--from",
-            mutated_path.to_str().unwrap(),
-            "--wait-for-sync",
-        ],
+        &["update", &target, "--set", update_set, "--wait-for-sync"],
     )
     .await;
 
@@ -636,20 +622,6 @@ async fn run_typed_lifecycle(
     await_key_gone(&peer, &key, Duration::from_secs(10)).await;
 }
 
-/// Minimal valid Capability — `id`, `name` required; `confidence` in
-/// [0, 1]; sibling proto3 fields zero-defaulted to satisfy prost's
-/// strict deserialiser.
-fn capability_value(id: &str, name: &str, confidence: f64) -> Value {
-    json!({
-        "id": id,
-        "name": name,
-        "capability_type": 0,
-        "confidence": confidence,
-        "metadata_json": "",
-        "registered_at": null,
-    })
-}
-
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_capability_registered_type() {
@@ -657,9 +629,9 @@ async fn lifecycle_capability_registered_type() {
         "capabilities",
         "cap-1",
         "Capability",
-        capability_value("cap-1", "thermal-sensor", 0.9),
-        capability_value("cap-1", "thermal-sensor-v2", 0.95),
+        &["id=cap-1", "name=thermal-sensor", "confidence=0.9"],
         &["Capability", "thermal-sensor"],
+        "name=thermal-sensor-v2",
         |merged| {
             assert_eq!(merged["id"], json!("cap-1"));
             assert_eq!(merged["name"], json!("thermal-sensor-v2"));
@@ -671,28 +643,18 @@ async fn lifecycle_capability_registered_type() {
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_node_config_registered_type() {
-    // NodeConfig fields per proto: id, platform_type, capabilities[],
-    // comm_range_m (must be > 0), max_speed_mps (must be > 0),
-    // operator_binding (optional), created_at.
-    let initial = json!({
-        "id": "node-1",
-        "platform_type": "ground-rover",
-        "capabilities": [],
-        "comm_range_m": 1500.0,
-        "max_speed_mps": 12.5,
-        "operator_binding": null,
-        "created_at": null,
-    });
-    let mut mutated = initial.clone();
-    mutated["platform_type"] = json!("aerial-quad");
-    mutated["max_speed_mps"] = json!(30.0);
     run_typed_lifecycle(
         "node-configs",
         "node-1",
         "NodeConfig",
-        initial,
-        mutated,
+        &[
+            "id=node-1",
+            "platform_type=ground-rover",
+            "comm_range_m=1500.0",
+            "max_speed_mps=12.5",
+        ],
         &["NodeConfig", "ground-rover"],
+        "platform_type=aerial-quad",
         |merged| {
             assert_eq!(merged["id"], json!("node-1"));
             assert_eq!(merged["platform_type"], json!("aerial-quad"));
@@ -704,29 +666,16 @@ async fn lifecycle_node_config_registered_type() {
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_node_state_registered_type() {
-    // NodeState has no `id` field — the doc-id (`ns-1`) lives in the
-    // store key. Validation only kicks in for position lat/lon range;
-    // every proto3 sibling (including enum-typed fields like `health`
-    // and `phase`, which prost requires) is populated with its zero
-    // value to satisfy the strict deserialiser.
-    let initial = json!({
-        "position": null,
-        "fuel_minutes": 0,
-        "health": 0,
-        "phase": 0,
-        "cell_id": null,
-        "zone_id": null,
-        "timestamp": null,
-    });
-    let mut mutated = initial.clone();
-    mutated["fuel_minutes"] = json!(45);
+    // NodeState has no required scalar fields; defaults alone are a
+    // valid document. Validator only constrains position lat/lon if
+    // position is set — keep it null.
     run_typed_lifecycle(
         "node-states",
         "ns-1",
         "NodeState",
-        initial,
-        mutated,
+        &["fuel_minutes=30"],
         &["NodeState"],
+        "fuel_minutes=45",
         |merged| {
             assert_eq!(merged["fuel_minutes"], json!(45));
         },
@@ -737,23 +686,13 @@ async fn lifecycle_node_state_registered_type() {
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_cell_config_registered_type() {
-    // CellConfig fields per proto: id, max_size, min_size, created_at.
-    // Validation: id non-empty, max_size >= min_size, min_size >= 2.
-    let initial = json!({
-        "id": "cc-1",
-        "max_size": 8,
-        "min_size": 2,
-        "created_at": null,
-    });
-    let mut mutated = initial.clone();
-    mutated["max_size"] = json!(12);
     run_typed_lifecycle(
         "cell-configs",
         "cc-1",
         "CellConfig",
-        initial,
-        mutated,
+        &["id=cc-1", "min_size=2", "max_size=8"],
         &["CellConfig"],
+        "max_size=12",
         |merged| {
             assert_eq!(merged["id"], json!("cc-1"));
             assert_eq!(merged["max_size"], json!(12));
@@ -765,31 +704,19 @@ async fn lifecycle_cell_config_registered_type() {
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn lifecycle_cell_state_registered_type() {
-    // CellState fields per proto: config, leader_id (optional),
-    // members[], capabilities[], platoon_id (optional), timestamp.
-    // No `id` field — doc-id (`cs-1`) lives in the store key.
-    // Validation kicks in only when `config`, `capabilities`, or
-    // `leader_id` are populated; keeping them empty exercises the
-    // wiring without entangling validation logic from sibling types.
-    let initial = json!({
-        "config": null,
-        "leader_id": null,
-        "members": [],
-        "capabilities": [],
-        "platoon_id": null,
-        "timestamp": null,
-    });
-    let mut mutated = initial.clone();
-    mutated["members"] = json!(["node-1", "node-2"]);
+    // CellState has no required scalar fields; defaults alone are valid.
+    // `leader_id` would force a paired `members` mutation (the validator
+    // demands leader_id ∈ members), so anchor on `platoon_id` instead —
+    // it's an `optional string` with no cross-field constraint.
     run_typed_lifecycle(
         "cell-states",
         "cs-1",
         "CellState",
-        initial,
-        mutated,
+        &["platoon_id=alpha"],
         &["CellState"],
+        "platoon_id=bravo",
         |merged| {
-            assert_eq!(merged["members"], json!(["node-1", "node-2"]));
+            assert_eq!(merged["platoon_id"], json!("bravo"));
         },
     )
     .await;

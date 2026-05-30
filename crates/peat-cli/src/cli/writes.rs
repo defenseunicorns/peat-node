@@ -7,7 +7,7 @@
 //! come from `--from`.
 
 use peat_schema::type_registry::{BuiltinRegistry, TypeRegistry};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
@@ -44,6 +44,98 @@ pub fn validate_against_schema(collection: &str, value: &Value) -> Result<(), Cl
             desc.name
         ))
     })
+}
+
+/// Apply proto3 zero-defaults for every field of a registered peat-schema
+/// type, then merge the caller's value on top (caller wins per top-level
+/// field). For unknown collections the value is returned unchanged.
+///
+/// Closes peat-node#112: `--set` partial payloads on registered types
+/// were failing prost's strict `Deserialize` derive with "missing field"
+/// errors because prost-generated impls have no `#[serde(default)]`. The
+/// fix is to give prost the wire zero for every field, then layer the
+/// operator's `--set` overlay on top so partial intent survives.
+///
+/// Why a hardcoded per-collection table rather than a generic
+/// `FieldFormat`-driven default function: `FieldFormat::JsonString` is
+/// ambiguous — `Capability::metadata_json` (real `string`, default `""`)
+/// and `NodeConfig::operator_binding` (real `optional HumanMachinePair`,
+/// default `null`) both carry the same `JsonString` format in the
+/// rc.19 registry. A descriptor-driven default would be wrong for one
+/// or the other; an explicit per-type table is correct for both. The
+/// table is small (5 types) and stable, and `defaults_match_proto3_round_trip`
+/// in this module's tests catches drift against the registry's
+/// validators.
+///
+/// Long-term shape: `peat-schema` exposes a per-type `proto3_zero()` on
+/// `TypeDescriptor` and this function becomes registry-driven. Tracked
+/// as a follow-up at the bottom of [peat-node#112].
+///
+/// [peat-node#112]: https://github.com/defenseunicorns/peat-node/issues/112
+pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
+    let Some(defaults) = proto3_defaults_for(collection) else {
+        return value;
+    };
+    let Value::Object(ref mut user) = value else {
+        // Caller handed us a non-object (e.g. they `--from`-loaded a
+        // scalar). Validation will reject; nothing for us to merge.
+        return value;
+    };
+    let Value::Object(default_map) = defaults else {
+        return Value::Object(user.clone());
+    };
+    for (k, default_v) in default_map {
+        user.entry(k).or_insert(default_v);
+    }
+    value
+}
+
+/// Per-collection proto3 zero map for the 5 builtin peat-schema types
+/// (peat-schema rc.19). Returns `None` for unknown collections.
+fn proto3_defaults_for(collection: &str) -> Option<Value> {
+    match collection {
+        "capabilities" => Some(json!({
+            "id": "",
+            "name": "",
+            "capability_type": 0,
+            "confidence": 0.0,
+            "metadata_json": "",
+            "registered_at": null,
+        })),
+        "node-configs" => Some(json!({
+            "id": "",
+            "platform_type": "",
+            "capabilities": [],
+            "comm_range_m": 0.0,
+            "max_speed_mps": 0.0,
+            "operator_binding": null,
+            "created_at": null,
+        })),
+        "node-states" => Some(json!({
+            "position": null,
+            "fuel_minutes": 0,
+            "health": 0,
+            "phase": 0,
+            "cell_id": null,
+            "zone_id": null,
+            "timestamp": null,
+        })),
+        "cell-configs" => Some(json!({
+            "id": "",
+            "max_size": 0,
+            "min_size": 0,
+            "created_at": null,
+        })),
+        "cell-states" => Some(json!({
+            "config": null,
+            "leader_id": null,
+            "members": [],
+            "capabilities": [],
+            "platoon_id": null,
+            "timestamp": null,
+        })),
+        _ => None,
+    }
 }
 
 /// Fixed-period wait that approximates ADR-001 `--wait-for-sync` semantics.
@@ -199,6 +291,103 @@ mod tests {
     fn set_rejects_empty_segment() {
         let err = apply_sets(json!({}), &["a..b=v".into()]).unwrap_err();
         assert_eq!(err.exit_code(), 4);
+    }
+
+    #[test]
+    fn defaults_underlay_keeps_user_set_values_winning() {
+        let user = json!({"name": "thermal", "confidence": 0.5});
+        let merged = apply_proto3_defaults("capabilities", user);
+        let obj = merged.as_object().unwrap();
+        assert_eq!(obj["id"], json!(""), "default fills missing field");
+        assert_eq!(obj["name"], json!("thermal"), "user value wins");
+        assert_eq!(obj["confidence"], json!(0.5), "user value wins on numerics");
+        assert_eq!(
+            obj["registered_at"],
+            json!(null),
+            "optional message defaults to null"
+        );
+    }
+
+    #[test]
+    fn defaults_underlay_is_no_op_for_unknown_collection() {
+        let user = json!({"name": "alice"});
+        let merged = apply_proto3_defaults("contacts", user.clone());
+        assert_eq!(merged, user, "unknown collections pass through unchanged");
+    }
+
+    #[test]
+    fn defaults_pure_pass_prost_deserialize_for_every_registered_type() {
+        // Drift catcher (peat-node#112): proves each per-collection
+        // proto3-defaults map round-trips through prost's Deserialize.
+        // If peat-schema adds a required field to one of the 5 builtin
+        // types and this crate's `proto3_defaults_for` lags, this test
+        // fails with prost's "missing field" error pointing at the new
+        // field — the same error operators would otherwise see when
+        // running `peat create <collection> --set ...`.
+        for collection in [
+            "capabilities",
+            "node-configs",
+            "node-states",
+            "cell-configs",
+            "cell-states",
+        ] {
+            let defaults = apply_proto3_defaults(collection, Value::Object(Default::default()));
+            // Call validate_json directly so prost's deserialize error,
+            // not the validator's "MissingField", surfaces if the
+            // defaults are incomplete.
+            let registry = BuiltinRegistry::with_peat_schema_types();
+            let desc = registry
+                .for_collection(collection)
+                .unwrap_or_else(|| panic!("{collection} not registered"));
+            // Validators reject empty required strings (e.g. id), but
+            // that's an `Err(MissingField)` from the validator AFTER a
+            // successful prost deserialize. Drift would surface as an
+            // `Err(InvalidValue("could not deserialise as …"))` from
+            // the deserialize step — the substring is the signature.
+            if let Err(err) = (desc.validate_json)(&defaults) {
+                let msg = format!("{err}");
+                assert!(
+                    !msg.contains("could not deserialise"),
+                    "defaults for `{collection}` are out of sync with the registry: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn defaults_plus_min_required_validates_for_capability() {
+        let user = json!({"id": "cap-1", "name": "thermal"});
+        let merged = apply_proto3_defaults("capabilities", user);
+        validate_against_schema("capabilities", &merged).expect("min Capability validates");
+    }
+
+    #[test]
+    fn defaults_plus_min_required_validates_for_node_config() {
+        let user = json!({
+            "id": "node-1",
+            "platform_type": "rover",
+            "comm_range_m": 1500.0,
+            "max_speed_mps": 12.0,
+        });
+        let merged = apply_proto3_defaults("node-configs", user);
+        validate_against_schema("node-configs", &merged).expect("min NodeConfig validates");
+    }
+
+    #[test]
+    fn defaults_plus_min_required_validates_for_cell_config() {
+        let user = json!({"id": "cc-1", "min_size": 2, "max_size": 8});
+        let merged = apply_proto3_defaults("cell-configs", user);
+        validate_against_schema("cell-configs", &merged).expect("min CellConfig validates");
+    }
+
+    #[test]
+    fn defaults_alone_validate_for_node_state_and_cell_state() {
+        // NodeState + CellState have no required scalar fields; pure
+        // defaults are a valid document.
+        let ns = apply_proto3_defaults("node-states", Value::Object(Default::default()));
+        validate_against_schema("node-states", &ns).expect("default NodeState validates");
+        let cs = apply_proto3_defaults("cell-states", Value::Object(Default::default()));
+        validate_against_schema("cell-states", &cs).expect("default CellState validates");
     }
 
     #[test]

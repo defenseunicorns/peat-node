@@ -6,7 +6,9 @@ use peat_mesh::storage::json_convert::json_to_automerge;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::cli::writes::{apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT};
+use crate::cli::writes::{
+    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+};
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -52,6 +54,13 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         (None, sets) if !sets.is_empty() => apply_sets(Value::Object(Default::default()), sets)?,
         _ => unreachable!("clap ArgGroup requires --from or --set"),
     };
+
+    // For registered peat-schema types, underlay proto3 zero-defaults for
+    // every field the user did not specify (peat-node#112). Without this,
+    // `peat create capabilities --set id=cap-1 --set name=thermal` fails
+    // prost's strict deserialize on sibling-field absence. User-supplied
+    // fields always win.
+    let json_value = apply_proto3_defaults(&args.collection, json_value);
 
     // Schema gate (ADR-001 §"Write semantics" → "Validation"). Runs against
     // the peat-schema type registry: known collections enforce the

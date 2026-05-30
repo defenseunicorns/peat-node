@@ -15,7 +15,9 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::cli::query::parse_target;
-use crate::cli::writes::{apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT};
+use crate::cli::writes::{
+    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+};
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -97,6 +99,13 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             apply_sets(base, &args.set)?
         }
     };
+
+    // For registered peat-schema types, underlay proto3 zero-defaults
+    // (peat-node#112). When `existing` is `Some`, `base` already carries
+    // every field, so the underlay is a no-op — defaults only fill the
+    // upsert-on-missing case where the user's `--set` overlay started
+    // from an empty object.
+    let updated = apply_proto3_defaults(collection, updated);
 
     // Schema gate (ADR-001 §"Write semantics" → "Validation"). Validate
     // the *post-update* shape against the registry. Unknown collections
