@@ -524,15 +524,46 @@ async fn update_from_round_trip_across_two_subprocesses() {
     assert_eq!(merged["tag"], json!("lead"), "new field appended");
 }
 
-// Note: observer-side reception of a remote tombstone is intentionally NOT
-// exercised by an e2e scenario. peat-mesh's `apply_tombstone` receive path
-// calls `store.delete()`, which does not fire `observer_tx` — the channel
-// `peat observe` subscribes to. The `render_observe_deleted` arm in
-// `cli/observe.rs` is therefore unreachable from a remote tombstone
-// arrival today; the same code does fire correctly on a locally-observed
-// concurrent put-then-tombstone race, but that's not reproducible
-// deterministically from an e2e harness. Tracked as an upstream
-// peat-mesh API gap in ADR-001 Open Questions §7.
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn observe_subprocess_streams_delete_from_second_subprocess() {
+    // CDC delete-visibility, end-to-end (peat-mesh#202, rc.29). Two
+    // real `peat` binaries: one running `observe`, one running
+    // `delete`. The observer's stdout carries a
+    // `{"key": "...", "deleted": true}` ndjson line for the tombstoned
+    // doc — driving the `render_observe_deleted` path from a remote
+    // tombstone arrival, not just a locally-observed race.
+    //
+    // The fix is upstream: peat-mesh `AutomergeStore::delete` now
+    // fires `observer_tx`, so the tombstone-receive path
+    // (`apply_tombstone` → `self.remove` → `store.delete`) wakes the
+    // observer channel — matching the CDC contract documented on
+    // `subscribe_to_observer_changes` ("fires for ALL document
+    // changes"). ADR-001 Open Question §7 resolved.
+    let peer = TestPeer::start().await;
+    let seed = json_to_automerge(&json!({"name": "alice"}), None).unwrap();
+    peer.backend.store().put("contacts:c-tomb", &seed).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let creds = peer.creds_tempfile(&dir);
+
+    let mut observer =
+        topology::spawn_peat_streaming(&creds, &["observe", "contacts", "--output", "ndjson"]);
+
+    // Let the observer's join handshake + subscription settle before
+    // the delete fires, otherwise the delete races the subscribe.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    run_peat(&creds, &["delete", "contacts/c-tomb", "--wait-for-sync"]).await;
+
+    let seen =
+        topology::await_stdout_contains(&mut observer, "\"deleted\":true", Duration::from_secs(15))
+            .await;
+    assert!(
+        seen.contains("contacts:c-tomb"),
+        "expected tombstone for c-tomb in observer stdout; saw:\n{seen}"
+    );
+}
 
 // ---------------------------------------------------------------------
 // peat-schema registered-type lifecycles. One scenario per builtin

@@ -113,18 +113,36 @@ impl TestPeer {
         let backend = Arc::clone(backend);
         tokio::spawn(async move {
             while let Ok(change) = rx.recv().await {
+                // peat-mesh rc.29 also fires this channel on tombstone-
+                // driven deletes (peat-mesh#202). Distinguish insert/
+                // update from delete by reading the store — a `None`
+                // return means the key is gone, so the relay needs to
+                // use the tombstone push channel rather than the
+                // Automerge document sync channel.
+                let is_tombstone = matches!(backend.store().get(&change.key), Ok(None));
+
                 match change.origin {
                     ChangeOrigin::Local => {
-                        // Local write: relay to every connected peer
-                        // (the sync coordinator's per-peer sync state
-                        // makes redundant pushes a no-op).
-                        let _ = coord.sync_document_with_all_peers(&change.key).await;
+                        if is_tombstone {
+                            // Push tombstones to every connected peer.
+                            // The tombstone channel is global-per-peer
+                            // (not per-key), so one call covers any
+                            // recent tombstones in flight.
+                            for peer in backend.transport().connected_peers() {
+                                let _ = coord.send_tombstones_to_peer(peer).await;
+                            }
+                        } else {
+                            // Local doc write: relay to every peer
+                            // (per-peer sync state makes redundant
+                            // pushes a no-op).
+                            let _ = coord.sync_document_with_all_peers(&change.key).await;
+                        }
                     }
                     ChangeOrigin::Remote(source) => {
                         // Sync-received write: relay to every peer
-                        // except the source. The `ChangeOrigin`
-                        // contract (peat-mesh `automerge_store.rs` doc
-                        // comment) pins the stringification to
+                        // except the source. The `ChangeOrigin` contract
+                        // (peat-mesh `automerge_store.rs` doc comment)
+                        // pins the stringification to
                         // `EndpointId::to_string()` on the Iroh
                         // transport, so direct string equality is the
                         // sanctioned suppression test.
@@ -132,7 +150,11 @@ impl TestPeer {
                             if peer.to_string() == source {
                                 continue;
                             }
-                            let _ = coord.sync_document_with_peer(&change.key, peer).await;
+                            if is_tombstone {
+                                let _ = coord.send_tombstones_to_peer(peer).await;
+                            } else {
+                                let _ = coord.sync_document_with_peer(&change.key, peer).await;
+                            }
                         }
                     }
                 }
