@@ -220,17 +220,63 @@ async fn connect_peer(
         .memory_lookup()
         .add_endpoint_info(peer_addr);
 
-    let connection = tokio::time::timeout(
-        timeout,
-        backend.transport().connect_and_authenticate(peer_id),
-    )
-    .await
-    .map_err(|_| {
-        CliError::Generic(format!(
-            "connect to `{peer_id}` timed out after {timeout:?}"
-        ))
-    })?
-    .map_err(|e| CliError::Generic(format!("connect/auth to `{peer_id}`: {e}")))?;
+    // Retry loop mirrors peat-node's `dial_and_attach`
+    // (`src/node.rs::dial_and_attach`) to paper over the upstream
+    // peat#759 formation-auth handshake race: the initiator's
+    // `open_bi()` and the acceptor's `accept_bi()` don't always pair
+    // on the first attempt during HMAC challenge-response, returning
+    // a fast `formation auth failed (code 1)` close (or an Iroh
+    // QUIC handshake timeout). Long-running sidecars almost never
+    // lose on the race; a one-shot CLI invocation losing the race
+    // would fail the whole join, which is what was happening here
+    // on CI runners. Three attempts with a 200ms backoff matches
+    // the sidecar's empirically-validated workaround.
+    //
+    // Each attempt gets the full caller-supplied timeout — the race
+    // typically fails fast (~200ms) when it loses, so the overall
+    // budget rarely exceeds the per-attempt timeout in practice.
+    const CONNECT_RETRY_ATTEMPTS: usize = 3;
+    const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+    let mut attempt = 0;
+    let connection = loop {
+        attempt += 1;
+        let result = tokio::time::timeout(
+            timeout,
+            backend.transport().connect_and_authenticate(peer_id),
+        )
+        .await;
+        match result {
+            Ok(Ok(c)) => break c,
+            Ok(Err(e)) if attempt < CONNECT_RETRY_ATTEMPTS => {
+                tracing::warn!(
+                    peer = %peer_id,
+                    attempt,
+                    max_attempts = CONNECT_RETRY_ATTEMPTS,
+                    "connect_and_authenticate failed, retrying: {e}"
+                );
+                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+            }
+            Ok(Err(e)) => {
+                return Err(CliError::Generic(format!(
+                    "connect/auth to `{peer_id}` failed after {attempt} attempts: {e}"
+                )));
+            }
+            Err(_) if attempt < CONNECT_RETRY_ATTEMPTS => {
+                tracing::warn!(
+                    peer = %peer_id,
+                    attempt,
+                    max_attempts = CONNECT_RETRY_ATTEMPTS,
+                    "connect to `{peer_id}` timed out after {timeout:?}, retrying"
+                );
+                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+            }
+            Err(_) => {
+                return Err(CliError::Generic(format!(
+                    "connect to `{peer_id}` timed out after {timeout:?} (attempt {attempt})"
+                )));
+            }
+        }
+    };
 
     backend
         .transport()
