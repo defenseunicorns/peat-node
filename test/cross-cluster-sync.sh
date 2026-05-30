@@ -310,13 +310,18 @@ EOF
     # Drive a write through the CLI; assert the doc lands on the
     # sidecar's own store. --timeout 60s gives the CLI's cold-link
     # handshake headroom (default 10s is tight on CI runners).
-    if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
-        peat --creds /tmp/creds.yaml --timeout 60s \
-            create contacts --id cli-smoke --set name=via-cli --wait-for-sync \
-            >/dev/null 2>&1; then
+    # RUST_LOG=debug surfaces the on-change-pusher's
+    # sync_document_with_all_peers call so the next failure tells us
+    # whether the push fires before process exit kills the task.
+    log "Step (Test 6): create with debug logs"
+    CREATE_OUT=$(kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
+        sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=info peat --creds /tmp/creds.yaml --timeout 60s \
+            create contacts --id cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
+    echo "${CREATE_OUT}" | sed 's/^/    /'
+    if echo "${CREATE_OUT}" | grep -q "contacts:cli-smoke"; then
         pass "peat create via kubectl exec succeeded"
     else
-        fail "peat create via kubectl exec failed"
+        fail "peat create via kubectl exec failed (see output above)"
     fi
 
     # Confirm the sidecar's own store has it. `--wait-for-sync` on
