@@ -75,19 +75,30 @@ pass "schema describe renders Capability fields"
 # ---- Step 1: bootstrap creds.yaml inside peat-node-a ----------------
 
 log "Step 1: bootstrapping /tmp/creds.yaml inside peat-node-a"
-# Use the exact recipe from the QUICKSTART. Strips the endpointAddr
-# from GetStatus on peat-node-b (over the compose bridge DNS).
-docker exec peat-node-a sh -c '
+# Extract peat-node-b's Iroh NodeId via GetStatus on the host, then
+# write the bundle inside the container. `jq` on the host is more
+# robust than grep+cut against JSON whitespace/ordering. We then
+# write the resolved value into the heredoc directly (no $() inside
+# the docker-exec'd shell, which avoids cross-shell quoting risk).
+RAW_STATUS=$(curl -s -X POST http://localhost:50062/peat.sidecar.v1.PeatSidecar/GetStatus \
+    -H 'Content-Type: application/json' -d '{}')
+NODE_B_ID=$(echo "${RAW_STATUS}" | jq -r .endpointAddr)
+if [ -z "${NODE_B_ID}" ] || [ "${NODE_B_ID}" = "null" ]; then
+    fail "could not extract peat-node-b endpointAddr (got: '${NODE_B_ID}', raw: '${RAW_STATUS}')"
+fi
+docker exec peat-node-a sh -c "
   cat > /tmp/creds.yaml <<EOF
 app_id: compose-demo
 shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 peers:
-  - $(curl -s -X POST http://peat-node-b:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
-      -H "Content-Type: application/json" -d "{}" \
-      | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@peat-node-b:51071
+  - ${NODE_B_ID}@peat-node-b:51071
 EOF
-  chmod 600 /tmp/creds.yaml'
+  chmod 600 /tmp/creds.yaml"
 docker exec peat-node-a test -r /tmp/creds.yaml || fail "creds.yaml not readable"
+# Debug: show what was actually written. Loud on CI logs makes the
+# next failure self-diagnostic.
+log "Step 1 wrote:"
+docker exec peat-node-a cat /tmp/creds.yaml | sed 's/^/    /'
 pass "creds.yaml written, mode 0600"
 
 # ---- Step 2: read state from the mesh -------------------------------
@@ -96,8 +107,12 @@ log "Step 2: 'peat query --all-collections' from inside peat-node-a"
 # demo.sh already wrote hello/world on node-a; --all-collections should
 # include it. The query goes via the CLI's own joined session, not
 # node-a's local store, so this proves the handshake works.
+# Bumped to --timeout 60s because cold Iroh handshake on a CI runner
+# can take >30s before sync drains the first scan.
 out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml \
-        --timeout 30s --output json query --all-collections)
+        --timeout 60s --output json query --all-collections 2>&1) || {
+    fail "query --all-collections failed; output: ${out}"
+}
 echo "${out}" | jq -e '.["hello:world"]' >/dev/null \
     || fail "query --all-collections didn't include hello/world (got ${out})"
 pass "query --all-collections sees the demo doc"
@@ -105,7 +120,7 @@ pass "query --all-collections sees the demo doc"
 # ---- Step 3: write a document via CLI -------------------------------
 
 log "Step 3: 'peat create capabilities/cap-thermal' from inside peat-node-a"
-docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
     create capabilities --id cap-thermal \
     --set id=cap-thermal \
     --set name=thermal-sensor \
@@ -114,23 +129,23 @@ docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
 pass "create capabilities/cap-thermal succeeded"
 
 log "Step 3b: read it back"
-out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
         --output json query capabilities/cap-thermal)
 echo "${out}" | jq -e '.name == "thermal-sensor"' >/dev/null \
     || fail "query did not return thermal-sensor (got ${out})"
 pass "query confirms the new doc"
 
 log "Step 3c: 'peat update' edits one field"
-docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
     update capabilities/cap-thermal --set confidence=0.98 --wait-for-sync >/dev/null
-out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+out=$(docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
         --output json query capabilities/cap-thermal)
 echo "${out}" | jq -e '.confidence == 0.98' >/dev/null \
     || fail "update did not land confidence=0.98 (got ${out})"
 pass "update edits one field"
 
 log "Step 3d: 'peat delete' tombstones the doc"
-docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
     delete capabilities/cap-thermal --wait-for-sync >/dev/null
 # Verify via the CLI itself: after a brief sync window, query should
 # return nothing for the tombstoned doc.
@@ -157,14 +172,14 @@ log "Step 4: 'peat observe' streams events from another writer"
 # stdin close; the PID lands in /tmp/observed.pid so we can clean up.
 docker exec peat-node-a sh -c '
   rm -f /tmp/observed.log /tmp/observed.pid
-  nohup peat --creds /tmp/creds.yaml --timeout 30s --output ndjson \
+  nohup peat --creds /tmp/creds.yaml --timeout 60s --output ndjson \
        observe capabilities > /tmp/observed.log 2>&1 &
   echo $! > /tmp/observed.pid'
 
 # Brief settle window for the observer's join handshake + subscription.
 sleep 3
 
-docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 30s \
+docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
     create capabilities --id cap-radio \
     --set id=cap-radio --set name=radio --set confidence=0.5 \
     --wait-for-sync >/dev/null

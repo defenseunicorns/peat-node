@@ -308,9 +308,10 @@ EOF
     fi
 
     # Drive a write through the CLI; assert the doc lands on the
-    # sidecar's own store (via GetDocument over Connect RPC).
+    # sidecar's own store. --timeout 60s gives the CLI's cold-link
+    # handshake headroom (default 10s is tight on CI runners).
     if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
-        peat --creds /tmp/creds.yaml --timeout 30s \
+        peat --creds /tmp/creds.yaml --timeout 60s \
             create contacts --id cli-smoke --set name=via-cli --wait-for-sync \
             >/dev/null 2>&1; then
         pass "peat create via kubectl exec succeeded"
@@ -318,13 +319,22 @@ EOF
         fail "peat create via kubectl exec failed"
     fi
 
-    # Confirm the sidecar's own store has it (the CLI joined the
-    # mesh and synced the write back to its peer).
-    CLI_DOC=$(rpc_on "${CTX_A}" GetDocument '{"collection":"contacts","docId":"cli-smoke"}')
+    # Confirm the sidecar's own store has it. `--wait-for-sync` on
+    # the CLI is a fixed 750ms post-write sleep, not a real ack, so
+    # the doc may arrive on alpha shortly after the CLI exits.
+    # Retry up to 15s before declaring failure.
+    CLI_DOC=""
+    for _ in $(seq 1 15); do
+        CLI_DOC=$(rpc_on "${CTX_A}" GetDocument '{"collection":"contacts","docId":"cli-smoke"}')
+        if echo "${CLI_DOC}" | grep -q "via-cli"; then
+            break
+        fi
+        sleep 1
+    done
     if echo "${CLI_DOC}" | grep -q "via-cli"; then
         pass "GetDocument on alpha sees the CLI-authored doc"
     else
-        fail "GetDocument on alpha missing CLI doc (got: ${CLI_DOC})"
+        fail "GetDocument on alpha missing CLI doc after 15s (got: ${CLI_DOC})"
     fi
 
     echo ""
