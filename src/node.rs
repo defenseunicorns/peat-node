@@ -902,11 +902,28 @@ impl SidecarNode {
         let key = format!("{collection}:{doc_id}");
         match self.backend.store().get(&key)? {
             Some(doc) => {
-                let value = automerge_to_json(&doc)
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                Ok(self.maybe_decrypt(value)?)
+                let json = automerge_to_json(&doc);
+                // Two doc shapes co-exist in the same store:
+                //
+                //   - PutDocument (gRPC) writes `{"value": "<json-string>"}`
+                //     — the user's original JSON payload encoded as a string
+                //     in a single Automerge field. Optionally encrypted at
+                //     rest when a cipher is configured (peat-mesh#124).
+                //   - peat-cli (`create --set`/`update --set`) writes the
+                //     user's data directly as structural Automerge fields
+                //     (e.g. `{"name": "alice"}`). No string-encoding, no
+                //     encryption — the doc IS the user's data.
+                //
+                // Return the inner string for value-wrapped docs (the
+                // existing contract); fall back to serializing the doc as
+                // JSON for CLI-written docs so GetDocument is a single
+                // entry point regardless of which writer produced the
+                // record.
+                if let Some(s) = json.get("value").and_then(|v| v.as_str()) {
+                    Ok(self.maybe_decrypt(Some(s.to_string()))?)
+                } else {
+                    Ok(Some(serde_json::to_string(&json)?))
+                }
             }
             None => Ok(None),
         }
