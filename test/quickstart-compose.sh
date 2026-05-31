@@ -157,10 +157,18 @@ log "Step 2: 'peat query --all-collections' from inside peat-node-a"
 # in the filter, the wrapper "no peers reachable" message is all
 # we see). Bumped to --timeout 60s because cold Iroh handshake on
 # a CI runner can take >30s before sync drains the first scan.
+#
+# Capture stdout only — the CLI streams its JSON result to stdout
+# and all the debug/info logging to stderr. Merging them (with
+# `2>&1`) breaks jq: the first stderr line starts with a `2026-`
+# timestamp, jq reads it as the start of a numeric literal, and
+# fails parse before ever seeing the JSON. Let stderr pass
+# through to the GitHub Actions log naturally; on CLI exit != 0
+# we still dump the captured stdout.
 out=$(docker exec -e RUST_LOG=peat_cli=debug,peat_mesh=debug,iroh=debug \
         peat-node-a peat --creds /tmp/creds.yaml \
-        --timeout 60s --output json query --all-collections 2>&1) || {
-    log "Step 2 failed; CLI output:"
+        --timeout 60s --output json query --all-collections) || {
+    log "Step 2 failed; CLI stdout (stderr is interleaved above this in the GH Actions log):"
     echo "${out}" | sed 's/^/    /'
     log "Step 2 failed; peat-node-b sidecar logs (receive side):"
     docker logs peat-node-b --tail 80 2>&1 | sed 's/^/    /'
