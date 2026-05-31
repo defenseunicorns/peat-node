@@ -233,9 +233,21 @@ async fn connect_peer(
         )));
     }
 
-    tracing::debug!(
+    // Diagnostic: log the exact resolved IP(s) we're handing iroh.
+    // PR #114's last failing run on the post-#205 fix showed iroh
+    // receiving `ip_addresses=[172.18.0.2:51071]` but peat-node-b's
+    // sidecar never seeing any inbound — open question is whether
+    // tokio's resolver in peat-node-a's container resolved
+    // `peat-node-b` to peat-node-b's actual IP, or to a sibling /
+    // local-container IP. This info-level log makes the resolved
+    // socket(s) visible at CI-default logging so we don't need
+    // RUST_LOG=debug to read them.
+    tracing::info!(
         peer = %peer_id,
-        peer_addr = ?peer_addr,
+        peer_addr_id = %peer_addr.id,
+        peer_addr_addrs = ?peer_addr.addrs,
+        peer_addr_relay = ?peer_addr.relay_urls().collect::<Vec<_>>(),
+        spec = %spec,
         "dialing peer with fully-populated EndpointAddr (peat-mesh#205 path)"
     );
 

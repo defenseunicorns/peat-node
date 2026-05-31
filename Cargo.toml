@@ -9,7 +9,7 @@ resolver = "2"
 # `peat-mesh = "=0.9.0-rc.30"` (or whatever cuts) once a release
 # carrying f698665 lands on crates.io.
 [patch.crates-io]
-peat-mesh = { git = "https://github.com/defenseunicorns/peat-mesh", rev = "9857862" }
+peat-mesh = { git = "https://github.com/defenseunicorns/peat-mesh", rev = "9115f79" }
 
 [package]
 name = "peat-node"
