@@ -92,6 +92,32 @@ echo "    peat-node-b actual bridge IP: ${PEAT_NODE_B_IP}"
 echo "==> What peat-node-a's resolver returns for 'peat-node-b':"
 docker exec peat-node-a sh -c 'getent hosts peat-node-b' | sed 's/^/    /' || true
 
+# Probe container-to-container reachability in the a→b direction
+# (the exact direction the CLI's iroh dial uses). On PR #114's
+# failing runs, iroh sends QUIC to peat-node-b's correct bridge IP
+# but peat-node-b's listener sees nothing. Two candidate explanations:
+# (i) compose bridge isn't routing a→b traffic for some reason
+# (Docker bridge usually does, but GHA runner sandbox is different
+# from local), or (ii) iroh's accept layer is silently dropping
+# inbound from fresh ephemeral peers.
+#
+# This probe separates the two: curl peat-node-b's gRPC TCP port
+# from inside peat-node-a's container. If TCP a→b works, container
+# routing is fine (UDP follows), so the bug is in iroh. If TCP a→b
+# fails too, the bridge is the bug.
+echo "==> Probe a→b TCP reachability via IP (peat-node-a → ${PEAT_NODE_B_IP}:50051):"
+docker exec peat-node-a curl -s -m 5 --write-out '\n    HTTP status: %{http_code}\n' \
+    -X POST "http://${PEAT_NODE_B_IP}:50051/peat.sidecar.v1.PeatSidecar/GetStatus" \
+    -H 'Content-Type: application/json' -d '{}' \
+    2>&1 | head -c 300 | sed 's/^/    /' || true
+echo
+echo "==> Probe a→b TCP via Docker service name (peat-node-a → peat-node-b:50051):"
+docker exec peat-node-a curl -s -m 5 --write-out '\n    HTTP status: %{http_code}\n' \
+    -X POST http://peat-node-b:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
+    -H 'Content-Type: application/json' -d '{}' \
+    2>&1 | head -c 300 | sed 's/^/    /' || true
+echo
+
 # Extract peat-node-b's Iroh NodeId via GetStatus on the host, then
 # write the bundle inside the container. `jq` on the host is more
 # robust than grep+cut against JSON whitespace/ordering. We then
