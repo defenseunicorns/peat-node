@@ -89,12 +89,17 @@ The [`examples/compose/`](../../examples/compose/) demo only maps the gRPC TCP p
 
 ```sh
 # Write a creds.yaml inside the container — host paths don't help here.
+# The peer we're dialing is peat-node-b, so fetch *its* NodeId (via
+# Docker DNS to its in-container gRPC on 50051) and pair it with the
+# port peat-node-b's iroh actually binds to (51072 in the compose
+# example — peat-node-a uses 51071, b uses 51072 to avoid a port
+# clash on the shared bridge).
 docker exec peat-node-a sh -c 'cat > /tmp/creds.yaml <<EOF
 app_id: compose-demo
 shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 peers:
-  - $(curl -s -X POST http://localhost:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
-      -H "Content-Type: application/json" -d "{}" | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@peat-node-b:51071
+  - $(curl -s -X POST http://peat-node-b:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
+      -H "Content-Type: application/json" -d "{}" | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@peat-node-b:51072
 EOF
 chmod 600 /tmp/creds.yaml'
 ```

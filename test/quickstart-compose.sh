@@ -134,7 +134,7 @@ docker exec peat-node-a sh -c "
 app_id: compose-demo
 shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
 peers:
-  - ${NODE_B_ID}@peat-node-b:51071
+  - ${NODE_B_ID}@peat-node-b:51072
 EOF
   chmod 600 /tmp/creds.yaml"
 docker exec peat-node-a test -r /tmp/creds.yaml || fail "creds.yaml not readable"
@@ -162,12 +162,8 @@ out=$(docker exec -e RUST_LOG=peat_cli=debug,peat_mesh=debug,iroh=debug \
         --timeout 60s --output json query --all-collections 2>&1) || {
     log "Step 2 failed; CLI output:"
     echo "${out}" | sed 's/^/    /'
-    log "Step 2 failed; peat-node-b sidecar logs (receive side, TRACE per docker-compose.dev.yml):"
-    # Wider tail because iroh=trace is verbose; the 90s dial window
-    # (3 × 30s) produces thousands of lines on b. Bound it but make
-    # sure we capture the accept-path activity (or its absence) for
-    # the CLI's NodeId during the dial attempts.
-    docker logs peat-node-b --tail 600 2>&1 | sed 's/^/    /'
+    log "Step 2 failed; peat-node-b sidecar logs (receive side):"
+    docker logs peat-node-b --tail 80 2>&1 | sed 's/^/    /'
     log "Step 2 failed; peat-node-a sidecar logs (CLI's own container):"
     docker logs peat-node-a --tail 40 2>&1 | sed 's/^/    /'
     fail "query --all-collections failed"

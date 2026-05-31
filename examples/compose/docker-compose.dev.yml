@@ -33,12 +33,5 @@ services:
     image: peat-node:dev
     build:
       context: ../..
-    # peat-mesh#205 follow-up: TRACE the iroh + peat-mesh accept path
-    # on peat-node-b so we can see whether the CLI's QUIC initial
-    # packets arrive at iroh's accept layer and where they're being
-    # dropped. PR #114's TCP probe confirmed container-to-container
-    # routing works; the remaining question is what iroh's accept
-    # does with the inbound. Trace is on receive side only to keep
-    # log volume manageable.
     environment:
-      RUST_LOG: peat_node=info,peat_mesh=trace,iroh=trace
+      RUST_LOG: peat_node=info,peat_mesh=debug,iroh=info
