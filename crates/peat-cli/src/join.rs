@@ -233,6 +233,15 @@ async fn connect_peer(
         )));
     }
 
+    // Surface what we're handing iroh's address lookup. The bug
+    // we're chasing on PR #114 is that iroh's connect logs
+    // `ip_addresses=[]` even after we add a populated peer_addr —
+    // this log says exactly what add_endpoint_info received.
+    tracing::info!(
+        peer = %peer_id,
+        peer_addr = ?peer_addr,
+        "registering peer address via memory_lookup.add_endpoint_info"
+    );
     backend
         .blob_store()
         .memory_lookup()
