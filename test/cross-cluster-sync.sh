@@ -91,6 +91,7 @@ deploy_to() {
         --set autoSync=true \
         --set irohUdpPort="${IROH_PORT}" \
         --set irohUdpHostPort=true \
+        --set verbose=true \
         --wait --timeout 90s; then
         # Helm install timed out or rolled back. Capture diagnostics
         # before the cleanup trap nukes the cluster so the next CI
@@ -315,7 +316,7 @@ EOF
     # whether the push fires before process exit kills the task.
     log "Step (Test 6): create with debug logs"
     CREATE_OUT=$(kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
-        sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=info peat --creds /tmp/creds.yaml --timeout 60s \
+        sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=debug peat --creds /tmp/creds.yaml --timeout 60s \
             create contacts --id cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
     echo "${CREATE_OUT}" | sed 's/^/    /'
     if echo "${CREATE_OUT}" | grep -q "contacts:cli-smoke"; then

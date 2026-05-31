@@ -205,13 +205,31 @@ async fn connect_peer(
     let resolved = tokio::net::lookup_host(addr_str).await.map_err(|e| {
         CliError::Generic(format!("resolve `{addr_str}` for peer `{peer_id}`: {e}"))
     })?;
+    // Filter to IPv4 only. Docker / k3d / generic bridge networks
+    // routinely advertise both A and AAAA records for service-name
+    // hostnames, but the IPv6 half is often non-routable across the
+    // bridge (no SLAAC, no neighbour discovery into the container).
+    // Iroh's `EndpointAddr` accepts all candidates and races them in
+    // parallel, but its hold-time on a dead IPv6 candidate eats the
+    // whole 30 s QUIC handshake budget before falling back — which
+    // is precisely the failure shape we see on PR #114's Quickstart
+    // Path A (CLI in peat-node-a → peat-node-b dual-stack resolve
+    // → 3 × 30 s retries, all timed out). Restricting to IPv4 here
+    // is the same simplification the compose example's bootstrap
+    // script implicitly relies on by handing peat-node a single
+    // `peat-node-a:51071` hint that resolves IPv4-first under
+    // Docker's embedded DNS.
     for socket in resolved {
+        if !socket.is_ipv4() {
+            tracing::debug!(peer = %peer_id, ?socket, "skipping non-IPv4 candidate");
+            continue;
+        }
         peer_addr = peer_addr.with_ip_addr(socket);
         any_added = true;
     }
     if !any_added {
         return Err(CliError::Generic(format!(
-            "no addresses resolved for `{addr_str}`"
+            "no IPv4 addresses resolved for `{addr_str}` (got only IPv6 candidates?)"
         )));
     }
 

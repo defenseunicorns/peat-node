@@ -114,7 +114,7 @@ log "Step 2: 'peat query --all-collections' from inside peat-node-a"
 # in the filter, the wrapper "no peers reachable" message is all
 # we see). Bumped to --timeout 60s because cold Iroh handshake on
 # a CI runner can take >30s before sync drains the first scan.
-out=$(docker exec -e RUST_LOG=peat_cli=debug,peat_mesh=info,peat_protocol=info \
+out=$(docker exec -e RUST_LOG=peat_cli=debug,peat_mesh=debug,peat_protocol=info \
         peat-node-a peat --creds /tmp/creds.yaml \
         --timeout 60s --output json query --all-collections 2>&1) || {
     log "Step 2 failed; full output:"
