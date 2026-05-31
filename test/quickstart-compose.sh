@@ -75,6 +75,23 @@ pass "schema describe renders Capability fields"
 # ---- Step 1: bootstrap creds.yaml inside peat-node-a ----------------
 
 log "Step 1: bootstrapping /tmp/creds.yaml inside peat-node-a"
+# Diagnostic — print each container's actual bridge IP so we can
+# cross-reference against what `tokio::net::lookup_host` resolves
+# `peat-node-b` to from inside peat-node-a's container. PR #114's
+# CI run on 129624a showed iroh got `ip_addresses=[172.18.0.2:51071]`
+# but peat-node-b's listener never saw inbound — possible
+# explanation is that resolving `peat-node-b` from inside
+# peat-node-a returns peat-node-a's OWN bridge IP (so the dial
+# loopbacks to peat-node-a's listener, TLS NodeId mismatch,
+# 30s slow-fail).
+echo "==> Container IP cross-reference:"
+PEAT_NODE_A_IP=$(docker inspect peat-node-a --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+PEAT_NODE_B_IP=$(docker inspect peat-node-b --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+echo "    peat-node-a actual bridge IP: ${PEAT_NODE_A_IP}"
+echo "    peat-node-b actual bridge IP: ${PEAT_NODE_B_IP}"
+echo "==> What peat-node-a's resolver returns for 'peat-node-b':"
+docker exec peat-node-a sh -c 'getent hosts peat-node-b' | sed 's/^/    /' || true
+
 # Extract peat-node-b's Iroh NodeId via GetStatus on the host, then
 # write the bundle inside the container. `jq` on the host is more
 # robust than grep+cut against JSON whitespace/ordering. We then
