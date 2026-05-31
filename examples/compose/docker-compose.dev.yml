@@ -21,7 +21,17 @@ services:
     image: peat-node:dev
     build:
       context: ../..
+    # Quickstart Path A's CLI-driven workflow has been hard to debug
+    # because the receive side's iroh / peat-mesh logs were at the
+    # base compose's `peat_mesh=warn` — invisible. Bump to debug on
+    # both sides for the test path so cross-process handshake +
+    # sync-message flow are observable. The override is dev-only,
+    # so steady-state production logs stay at the saner default.
+    environment:
+      RUST_LOG: peat_node=info,peat_mesh=debug,iroh=info
   peat-node-b:
     image: peat-node:dev
     build:
       context: ../..
+    environment:
+      RUST_LOG: peat_node=info,peat_mesh=debug,iroh=info
