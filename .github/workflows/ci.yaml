@@ -47,7 +47,21 @@ jobs:
           cache-on-failure: true
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo test --workspace
+      # peat-cli's e2e binary spawns the real `peat` binary as a
+      # subprocess for every test and exercises a live mesh sync
+      # against an in-process TestPeer over loopback Iroh. Running it
+      # alongside `peat-node`'s heavier integration tests on a 2-core
+      # GitHub Linux runner produces enough contention to starve the
+      # subprocesses' tokio runtimes — initial sync drains miss the
+      # CLI's POST_JOIN_SETTLE window and tests that pre-seed via
+      # `peer.store.put` race the CLI's join handshake. The
+      # `Cross-platform (macos-14)` job (further down this workflow)
+      # already isolates peat-cli with `cargo test -p peat-cli`; mirror
+      # that here so the Linux signal matches the macOS one. The other
+      # workspace members keep the parallel `--workspace` path.
+      - run: cargo test --workspace --exclude peat-cli
+      - name: Run peat-cli tests in isolation
+        run: cargo test -p peat-cli
 
   build:
     name: Build
