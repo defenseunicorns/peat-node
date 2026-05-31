@@ -85,6 +85,45 @@ set -e
 pass "unknown-target exits 4 (Malformed)"
 
 log "All quickstart steps in current scope validated."
+
+# ---- Diagnostic-only: capture peat-mesh#205 receipt ----------------
+#
+# Intentionally fires the broken cross-process CLI dial so the
+# `memory_lookup.get_endpoint_info(peer_id)` readback diagnostic at
+# crates/peat-cli/src/join.rs lands in the CI log. The receipt
+# distinguishes peat-mesh#205 hypothesis A (wiring) from B
+# (iroh chain-dispatch).
+#
+# Failures here are EXPECTED and do not fail the test — `|| true`
+# preserves the green build. Drop this whole block when peat-mesh#205
+# is resolved and the standard Steps 2-4 (currently held out) come
+# back.
+
+log "Diagnostic: capture peat-mesh#205 receipt (failing dial expected)"
+
+# Build creds.yaml inside the container, same as the held-out
+# walkthrough would.
+RAW_STATUS=$(curl -s -X POST http://localhost:50062/peat.sidecar.v1.PeatSidecar/GetStatus \
+    -H 'Content-Type: application/json' -d '{}')
+NODE_B_ID=$(echo "${RAW_STATUS}" | jq -r .endpointAddr)
+if [ -n "${NODE_B_ID}" ] && [ "${NODE_B_ID}" != "null" ]; then
+    docker exec peat-node-a sh -c "
+      cat > /tmp/creds.yaml <<EOF
+app_id: compose-demo
+shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+peers:
+  - ${NODE_B_ID}@peat-node-b:51071
+EOF
+      chmod 600 /tmp/creds.yaml"
+
+    echo "==> peat-mesh#205 diagnostic — CLI output with readback log:"
+    docker exec -e RUST_LOG=peat_cli=info,peat_mesh=info,iroh=info \
+        peat-node-a peat --creds /tmp/creds.yaml \
+        --timeout 15s --output json query --all-collections 2>&1 \
+        | sed 's/^/    /' || true
+    echo "==> peat-mesh#205 diagnostic — end"
+fi
+
 echo
 echo "Path A QUICKSTART (compose) is functionally correct for the in-scope"
 echo "steps. CLI-driven CRUD against the mesh is blocked on peat-mesh#205;"

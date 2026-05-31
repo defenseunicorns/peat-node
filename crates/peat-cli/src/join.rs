@@ -247,6 +247,30 @@ async fn connect_peer(
         .memory_lookup()
         .add_endpoint_info(peer_addr);
 
+    // Read-back diagnostic for peat-mesh#205. The hypothesis we're
+    // distinguishing:
+    //   A. MemoryLookup::resolve returns None  → shared-state /
+    //      wiring bug (the `Arc<RwLock<...>>` `.clone()` semantics
+    //      don't actually share state in our wiring).
+    //   B. MemoryLookup::resolve returns Some  → iroh's
+    //      AddressLookupStream merge isn't first-yield-wins as
+    //      documented; the DNS-step duration consumes the dial
+    //      budget even though MemoryLookup has the entry.
+    //
+    // If `get_endpoint_info(peer_id)` returns Some right after the
+    // add, the wiring is fine and the bug is unambiguously upstream
+    // (B). If it returns None, the bug is in peat-mesh's wiring (A).
+    let readback = backend
+        .blob_store()
+        .memory_lookup()
+        .get_endpoint_info(peer_id);
+    tracing::info!(
+        peer = %peer_id,
+        readback = ?readback,
+        readback_is_some = readback.is_some(),
+        "post-add: memory_lookup.get_endpoint_info(peer_id)"
+    );
+
     // Retry loop mirrors peat-node's `dial_and_attach`
     // (`src/node.rs::dial_and_attach`) to paper over the upstream
     // peat#759 formation-auth handshake race: the initiator's
