@@ -233,59 +233,25 @@ async fn connect_peer(
         )));
     }
 
-    // Surface what we're handing iroh's address lookup. The bug
-    // we're chasing on PR #114 is that iroh's connect logs
-    // `ip_addresses=[]` even after we add a populated peer_addr —
-    // this log says exactly what add_endpoint_info received.
-    tracing::info!(
+    tracing::debug!(
         peer = %peer_id,
         peer_addr = ?peer_addr,
-        "registering peer address via memory_lookup.add_endpoint_info"
-    );
-    backend
-        .blob_store()
-        .memory_lookup()
-        .add_endpoint_info(peer_addr);
-
-    // Read-back diagnostic for peat-mesh#205. The hypothesis we're
-    // distinguishing:
-    //   A. MemoryLookup::resolve returns None  → shared-state /
-    //      wiring bug (the `Arc<RwLock<...>>` `.clone()` semantics
-    //      don't actually share state in our wiring).
-    //   B. MemoryLookup::resolve returns Some  → iroh's
-    //      AddressLookupStream merge isn't first-yield-wins as
-    //      documented; the DNS-step duration consumes the dial
-    //      budget even though MemoryLookup has the entry.
-    //
-    // If `get_endpoint_info(peer_id)` returns Some right after the
-    // add, the wiring is fine and the bug is unambiguously upstream
-    // (B). If it returns None, the bug is in peat-mesh's wiring (A).
-    let readback = backend
-        .blob_store()
-        .memory_lookup()
-        .get_endpoint_info(peer_id);
-    tracing::info!(
-        peer = %peer_id,
-        readback = ?readback,
-        readback_is_some = readback.is_some(),
-        "post-add: memory_lookup.get_endpoint_info(peer_id)"
+        "dialing peer with fully-populated EndpointAddr (peat-mesh#205 path)"
     );
 
-    // Retry loop mirrors peat-node's `dial_and_attach`
-    // (`src/node.rs::dial_and_attach`) to paper over the upstream
-    // peat#759 formation-auth handshake race: the initiator's
-    // `open_bi()` and the acceptor's `accept_bi()` don't always pair
-    // on the first attempt during HMAC challenge-response, returning
-    // a fast `formation auth failed (code 1)` close (or an Iroh
-    // QUIC handshake timeout). Long-running sidecars almost never
-    // lose on the race; a one-shot CLI invocation losing the race
-    // would fail the whole join, which is what was happening here
-    // on CI runners. Three attempts with a 200ms backoff matches
-    // the sidecar's empirically-validated workaround.
+    // Retry loop covers peat#759's HMAC challenge-response race that
+    // peat-node's `dial_and_attach` already papers over with the
+    // same shape. Each attempt gets the full caller-supplied
+    // timeout; the race typically fails fast (~200ms) when it loses,
+    // so the overall budget rarely exceeds the per-attempt timeout
+    // in practice.
     //
-    // Each attempt gets the full caller-supplied timeout — the race
-    // typically fails fast (~200ms) when it loses, so the overall
-    // budget rarely exceeds the per-attempt timeout in practice.
+    // We call `connect_and_authenticate_with_addr(peer_addr)` —
+    // shipped on peat-mesh's `fix-205-connect-with-addr` branch
+    // (peat-mesh#206 / closes peat-mesh#205). Passing the full
+    // `EndpointAddr` (with the resolved IPv4 socket) bypasses iroh's
+    // `address_lookup` chain entirely: no DNS attempt, no chain-
+    // dispatch race, direct UDP dial.
     const CONNECT_RETRY_ATTEMPTS: usize = 3;
     const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
     let mut attempt = 0;
@@ -293,7 +259,9 @@ async fn connect_peer(
         attempt += 1;
         let result = tokio::time::timeout(
             timeout,
-            backend.transport().connect_and_authenticate(peer_id),
+            backend
+                .transport()
+                .connect_and_authenticate_with_addr(peer_addr.clone()),
         )
         .await;
         match result {
@@ -303,7 +271,7 @@ async fn connect_peer(
                     peer = %peer_id,
                     attempt,
                     max_attempts = CONNECT_RETRY_ATTEMPTS,
-                    "connect_and_authenticate failed, retrying: {e}"
+                    "connect_and_authenticate_with_addr failed, retrying: {e}"
                 );
                 tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
             }

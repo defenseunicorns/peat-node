@@ -2,6 +2,15 @@
 members = ["crates/*"]
 resolver = "2"
 
+# Source-pin peat-mesh to the peat-mesh#205 fix branch
+# (`connect_and_authenticate_with_addr`) ahead of the rc.30 release
+# cut. Same dance as the peat#946 pin we ran while waiting for
+# rc.19 to ship. Flip back to a semver requirement on
+# `peat-mesh = "=0.9.0-rc.30"` (or whatever cuts) once a release
+# carrying f698665 lands on crates.io.
+[patch.crates-io]
+peat-mesh = { git = "https://github.com/defenseunicorns/peat-mesh", rev = "9857862" }
+
 [package]
 name = "peat-node"
 version = "0.3.6"
