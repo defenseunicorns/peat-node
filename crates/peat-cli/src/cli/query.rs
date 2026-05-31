@@ -125,7 +125,20 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
         };
 
         if !docs.is_empty() || Instant::now() >= deadline {
-            return render_query(&docs, common.output);
+            // Keyed unless the user asked for a specific doc by id. A
+            // collection scan or `--all-collections` query must keep
+            // the `collection:id` key so consumers can identify each
+            // record (and so `jq '.["collection:id"]'` works); only an
+            // explicit doc-id target gets bare rendering since the
+            // caller already knows which doc they requested.
+            let keyed = !matches!(
+                scope,
+                Scope::Single {
+                    doc_id: Some(_),
+                    ..
+                }
+            );
+            return render_query(&docs, common.output, keyed);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
