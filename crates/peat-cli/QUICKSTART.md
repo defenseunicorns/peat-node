@@ -1,6 +1,6 @@
 # peat CLI — Quickstart
 
-A 5-minute walkthrough from zero to reading/writing documents on a Peat mesh. Stops along the way exercise everything you'll actually use in day-to-day operations.
+A walkthrough from zero to using the `peat` CLI. Currently covers the offline-discovery half (registry inspection — no mesh dial required). The mesh-dialling half (read / write / observe against a running sidecar) is held out pending [peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205) — a peat-mesh `address_lookup`-chain bug that prevents the CLI's iroh dial from reaching peers via `MemoryLookup`-registered direct addresses in airgapped contexts. When that lands the dial-required steps will be restored verbatim (the in-process Rust e2e tests cover the same code paths and pass).
 
 > **What is `peat`?** A CRUD-shaped operator CLI that joins a Peat mesh as a real node, runs one command, and exits. Same protocol stack as `peat-node` — no admin-side API. See [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md) for the design.
 
@@ -57,6 +57,8 @@ Capability (v1)
 ```
 
 The field column on the right is the `--set` path you'll use in step 3.
+
+> **Steps 1-5 below are blocked on [peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205).** They describe the operator workflow as designed — the in-process Rust e2e tests (`cargo test -p peat-cli`) confirm the same code paths work — but cross-process iroh dial from the `peat` CLI to a separate sidecar process currently times out in airgapped contexts. The steps will be functional verbatim once peat-mesh ships the fix.
 
 ---
 

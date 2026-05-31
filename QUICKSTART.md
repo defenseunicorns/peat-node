@@ -1,11 +1,13 @@
 # peat-node — Quickstart
 
-A 10-minute walkthrough from zero to a running two-node mesh, with documents syncing between peers and the `peat` CLI talking to them. Two paths:
+A 10-minute walkthrough from zero to a running two-node mesh, with documents syncing between peers. Two paths:
 
 - **Path A — Docker Compose** (single host, two sidecars). Easiest. ~3 minutes. Good for a smoke test or local development.
 - **Path B — Helm + k3d** (two Kubernetes clusters, sidecars in each). ~10 minutes. Mirrors the production sidecar pattern.
 
-Pick the one that matches what you're trying to validate. Both leave you with a mesh you can drive from the [`peat` CLI](crates/peat-cli/QUICKSTART.md).
+Pick the one that matches what you're trying to validate.
+
+> **Known limitation.** Driving the running mesh from the `peat` CLI in the same container or pod is currently blocked on [peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205) — `connect_and_authenticate` resolves peer addresses through iroh's `address_lookup` chain in an order that doesn't reach `MemoryLookup`-registered direct addresses in airgapped contexts. The two walkthroughs below validate the sidecar↔sidecar CRDT sync via the production gRPC + Iroh path; `peat schema list` / `peat schema describe` run offline inside the container without dialling the mesh. CLI-driven CRUD against a running sidecar will be restored when peat-mesh#205 ships.
 
 > **What is `peat-node`?** A Rust sidecar that runs alongside an application, participates as a full CRDT mesh node (Automerge + Iroh QUIC), and exposes a gRPC API for the co-located app to read/write shared state. State syncs across clusters automatically. See [`README.md`](README.md) for the architectural overview and [`docs/DESIGN.md`](docs/DESIGN.md) for the integration design.
 
@@ -52,29 +54,19 @@ Expected `./demo.sh` output (last few lines):
 
 The document was authored on node-a and reached node-b over the loopback Iroh QUIC mesh — no central server, no relay. This is the same code path that runs in production.
 
-### Drive it with the CLI
+### Offline schema discovery inside the container
 
-Compose only maps the gRPC TCP ports to the host (50061/50062); Iroh UDP stays on the compose bridge network. The `peat` CLI joins the mesh as a full peer, so it needs UDP — easiest to run it from *inside* one of the sidecar containers, where the network is already correct (the `peat-node` image ships `/usr/local/bin/peat`):
+The `peat` binary ships at `/usr/local/bin/peat` in the sidecar image. Two subcommands run **offline** (no creds, no mesh dial) and are useful for confirming the build and discovering registered types:
 
 ```sh
-# Build a creds.yaml inside peat-node-a and use it to talk to peat-node-b.
-docker exec peat-node-a sh -c 'cat > /tmp/creds.yaml <<EOF
-app_id: compose-demo
-shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-peers:
-  - $(curl -s -X POST http://peat-node-b:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
-      -H "Content-Type: application/json" -d "{}" \
-      | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@peat-node-b:51071
-EOF
-chmod 600 /tmp/creds.yaml'
+# Enumerate every peat-schema type the CLI knows about.
+docker exec peat-node-a peat schema list
 
-# Now drive the CLI through docker exec.
-docker exec peat-node-a peat --creds /tmp/creds.yaml query hello/world --output json
+# Drill into one type's field shape.
+docker exec peat-node-a peat schema describe capabilities
 ```
 
-Should print `{ "greeting": "hi from node-a" }`.
-
-From here, follow the [CLI quickstart](crates/peat-cli/QUICKSTART.md) from step 3 onward — `create`, `update`, `delete`, `observe` all work against this mesh (prefix every invocation with `docker exec peat-node-a` and the `--creds /tmp/creds.yaml` flag).
+Driving the running mesh through the CLI from inside the container (`peat query`, `peat create`, etc. against a sidecar) is currently blocked on [peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205); the CLI commands themselves work and the offline subcommands cover the discovery half of the operator workflow.
 
 ### Teardown
 
@@ -140,53 +132,19 @@ kubectl --context k3d-peat-sync-alpha logs -n peat -l app.kubernetes.io/name=pea
 kubectl --context k3d-peat-sync-bravo get pods -n peat
 ```
 
-### Drive it with the CLI from inside the pod
+### Offline schema discovery inside the pod
 
-The `peat` binary ships inside the `peat-node` container at `/usr/local/bin/peat`. The Helm chart doesn't auto-mount a credentials bundle (the sidecar itself reads its formation config from env vars, not the CLI bundle format), so write one inside the pod on the fly:
-
-```sh
-# Build creds.yaml inside the alpha pod. The sidecar's own endpoint is
-# the natural local peer for the CLI — `localhost:51071` over loopback.
-kubectl --context k3d-peat-sync-alpha exec -n peat deploy/peat-peat-node -c peat-node -- sh -c '
-  cat > /tmp/creds.yaml <<EOF
-app_id: peat-default
-shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-peers:
-  - $(curl -s -X POST http://localhost:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
-      -H "Content-Type: application/json" -d "{}" \
-      | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@localhost:51071
-EOF
-  chmod 600 /tmp/creds.yaml'
-
-# Now use the CLI through `kubectl exec`.
-kubectl --context k3d-peat-sync-alpha exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml query --all-collections --output json
-```
-
-(The `app_id`/`shared_key` must match what the chart set the sidecar to. `test/cross-cluster-sync.sh` doesn't override `appId`, so the sidecar uses the chart's default `peat-default` from [`chart/peat-node/values.yaml`](chart/peat-node/values.yaml). For a real deployment, supply matching values via `--set appId=… --set sharedKey=…` and pull both from your operator's secrets management.)
-
-Write on alpha, read on bravo:
+The `peat` binary ships inside the `peat-node` container at `/usr/local/bin/peat`. Two subcommands run **offline** (no creds, no mesh dial) and are useful for confirming the build and discovering registered types:
 
 ```sh
-# Write on alpha
-kubectl --context k3d-peat-sync-alpha exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml create contacts --id alice --set name=alice --wait-for-sync
+kubectl --context k3d-peat-sync-alpha exec -n peat deploy/peat-peat-node -c peat-node -- \
+  peat schema list
 
-# Bootstrap the bravo-side creds the same way (different endpoint id) and read
-kubectl --context k3d-peat-sync-bravo exec -n peat deploy/peat-peat-node -c peat-node -- sh -c '
-  cat > /tmp/creds.yaml <<EOF
-app_id: peat-default
-shared_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-peers:
-  - $(curl -s -X POST http://localhost:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
-      -H "Content-Type: application/json" -d "{}" \
-      | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@localhost:51071
-EOF
-  chmod 600 /tmp/creds.yaml'
-
-kubectl --context k3d-peat-sync-bravo exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml query contacts/alice --output json
+kubectl --context k3d-peat-sync-alpha exec -n peat deploy/peat-peat-node -c peat-node -- \
+  peat schema describe capabilities
 ```
+
+Driving the running mesh through the CLI from inside the pod (`peat query`, `peat create`, etc. against the sidecar at `localhost:51071`) is currently blocked on [peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205) — same root cause as Path A. Sidecar-to-sidecar CRDT sync via the production gRPC + Iroh path (what `cross-cluster-sync.sh` Tests 1-5 verify) works in this scenario; CLI-driven CRUD will be restored when peat-mesh#205 ships.
 
 > **Helm release / deployment naming.** The chart's `fullname` is `<release>-<chart>` — with release name `peat` it produces `peat-peat-node`. Adjust if you installed with a different release name.
 
@@ -198,7 +156,7 @@ kubectl --context k3d-peat-sync-bravo exec -n peat -it deploy/peat-peat-node -c 
 
 ### Automated end-to-end check
 
-`./test/cross-cluster-sync.sh all` is the executable contract for Path B — it spins up both clusters, runs every CRDT-sync assertion (Tests 1-5), and now also runs Test 6 which exercises the `kubectl exec deploy/peat-peat-node -- peat …` workflow this section describes (creds bootstrap, `peat schema list` offline, CLI-authored write visible on the sidecar's own store). The `Cross-cluster sync` GitHub Actions workflow runs the same script on every PR that touches `chart/`, `src/`, `Cargo.toml`/`Cargo.lock`, or the script itself.
+`./test/cross-cluster-sync.sh all` is the executable contract for Path B — it spins up both clusters and runs Tests 1-5 against the production gRPC + Iroh path (peer connectivity, document sync, fleet convergence, sync-byte counters). The `Cross-cluster sync` GitHub Actions workflow runs the same script on every PR that touches `chart/`, `src/`, `Cargo.toml`/`Cargo.lock`, or the script itself. The CLI-in-pod workflow (formerly Test 6) is held out pending peat-mesh#205.
 
 ---
 
