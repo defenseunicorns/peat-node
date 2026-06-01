@@ -71,6 +71,23 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
             tracing::warn!(peer = %peer_id, "send_tombstones_to_peer failed: {e}");
             continue;
         }
+
+        if args.wait_for_sync {
+            // `send_tombstones_to_peer` writes to the QUIC send buffer but
+            // returns before the peer ACKs. A subsequent document-sync
+            // round-trip creates a request/response cycle that only
+            // completes after the peer has processed the connection's
+            // prior data, giving us a delivery confirmation without
+            // needing an explicit tombstone-ack API in peat-mesh.
+            if let Err(e) = session
+                .backend()
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
+                tracing::warn!(peer = %peer_id, "post-delete sync round-trip failed: {e}");
+            }
+        }
     }
 
     if args.wait_for_sync {

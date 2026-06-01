@@ -49,6 +49,12 @@ pub struct TestPeer {
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for TestPeer {
+    fn drop(&mut self) {
+        self.abort_tasks();
+    }
+}
+
 impl TestPeer {
     /// Boot a peer on a kernel-assigned ephemeral UDP port. `Iroh` picks
     /// the port; we read it back via the bound endpoint.
@@ -187,6 +193,16 @@ impl TestPeer {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
+    }
+
+    /// Abort all background tasks and wait for them to stop.
+    ///
+    /// Called automatically on Drop, but can be called early to release
+    /// resources before the TestPeer variable goes out of scope.
+    pub fn abort_tasks(&self) {
+        for task in &self._tasks {
+            task.abort();
+        }
     }
 
     /// Write a credentials YAML that points the spawned CLI back at this
