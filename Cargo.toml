@@ -18,6 +18,23 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
+# rc.30 (peat-mesh#205/#206): accept-side push of existing docs +
+#   `connect_and_authenticate_with_addr(EndpointAddr)` bypass for the
+#   `AddressLookupServices` chain. Two bugs in one release:
+#   1. Connect-side: dial-with-known-address went through chain
+#      discovery (DnsAddressLookup ahead of MemoryLookup), so
+#      airgapped consumers timed out waiting on DNS. The new
+#      `connect_and_authenticate_with_addr` entry point takes a
+#      fully-populated `EndpointAddr` and skips the chain entirely.
+#   2. Accept-side: `SyncProtocolHandler::accept` registered the
+#      inbound connection but never proactively pushed its own docs.
+#      Worked fine for sidecar-pair bootstrap (the dialer happens to
+#      have docs too); broke the moment an ephemeral-empty-store peer
+#      (peat-cli) dialed an established sidecar. Now symmetric with
+#      the dial side — both sides push their local docs on connect.
+#   Unblocks peat-cli's full read/write/observe walkthroughs in
+#   `QUICKSTART.md` (Path A compose + Path B Helm/k3d).
+#
 # rc.29 (peat-mesh#202): `AutomergeStore::delete` now fires
 #   `observer_tx`, satisfying the CDC contract documented on
 #   `subscribe_to_observer_changes` ("fires for ALL document changes").
@@ -74,7 +91,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.29", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.30", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,

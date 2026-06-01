@@ -1,0 +1,37 @@
+# Compose override for development/QUICKSTART use.
+#
+# Use this in addition to the base docker-compose.yml when you need
+# the `peat` CLI (peat-cli) inside the sidecar containers — which is
+# what `crates/peat-cli/QUICKSTART.md` and the root `QUICKSTART.md`
+# Path A walkthrough both rely on. The CLI binary first shipped after
+# peat-node v0.3.6, so the base compose's pinned v0.3.0 image doesn't
+# have it.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Builds peat-node from the repo root and uses that image for both
+# sidecars. ~2-min first build, then cached.
+#
+# Once a release post-v0.3.6 publishes, the base compose can pin to
+# that tag and this override file becomes unnecessary.
+
+services:
+  peat-node-a:
+    image: peat-node:dev
+    build:
+      context: ../..
+    # Quickstart Path A's CLI-driven workflow has been hard to debug
+    # because the receive side's iroh / peat-mesh logs were at the
+    # base compose's `peat_mesh=warn` — invisible. Bump to debug on
+    # both sides for the test path so cross-process handshake +
+    # sync-message flow are observable. The override is dev-only,
+    # so steady-state production logs stay at the saner default.
+    environment:
+      RUST_LOG: peat_node=info,peat_mesh=debug,iroh=info
+  peat-node-b:
+    image: peat-node:dev
+    build:
+      context: ../..
+    environment:
+      RUST_LOG: peat_node=info,peat_mesh=debug,iroh=info

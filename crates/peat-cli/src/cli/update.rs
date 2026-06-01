@@ -162,6 +162,18 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
     }
 
     if args.wait_for_sync {
+        // Inline push (see create.rs for rationale): the on-change-
+        // pusher races the main task's exit; awaiting
+        // sync_document_with_all_peers here guarantees the QUIC send
+        // completes before the CLI returns.
+        if let Err(e) = session
+            .backend()
+            .coordinator()
+            .sync_document_with_all_peers(&key)
+            .await
+        {
+            tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+        }
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
 

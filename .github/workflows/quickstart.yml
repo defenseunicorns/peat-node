@@ -1,0 +1,48 @@
+name: Quickstart (compose)
+
+# Functional test for the QUICKSTART Path A walkthrough (Docker
+# Compose). The script in `test/quickstart-compose.sh` is the
+# executable contract for `QUICKSTART.md` Path A: every command it
+# runs is one the QUICKSTART tells operators to run, in the same
+# order, with the same arguments. If this job is green, the walkthrough
+# is honest end-to-end.
+#
+# Triggers:
+#   - every push to `main` (gates main on QUICKSTART correctness)
+#   - every PR (catches doc drift at PR time, ~3-5 min cost)
+#   - manually via Actions UI for off-branch verification
+#
+# Runtime: ~3-5 min on a cold runner (most of that is the local
+# peat-node image build).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quickstart-compose-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compose:
+    name: Quickstart Path A (compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Confirm docker + compose are present
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run quickstart-compose.sh
+        run: ./test/quickstart-compose.sh

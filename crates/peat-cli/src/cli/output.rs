@@ -230,47 +230,59 @@ fn write_stream_line(line: &str) -> Result<(), CliError> {
 /// always the structural JSON form regardless of registry hits — they're the
 /// stable contract surface for downstream scripts (ADR-001 §"Document
 /// rendering" → "Output formats").
-pub fn render_query(docs: &[(String, Automerge)], fmt: OutputFormat) -> Result<(), CliError> {
+pub fn render_query(
+    docs: &[(String, Automerge)],
+    fmt: OutputFormat,
+    keyed: bool,
+) -> Result<(), CliError> {
     let registry = BuiltinRegistry::with_peat_schema_types();
+    // Build the value used by Text (when typed dispatch doesn't fire) and
+    // by Json. `keyed` means "I asked for a collection or the whole store,
+    // so render every doc with its `collection:id` key — don't drop the
+    // key just because the result happens to be one doc." Bare rendering
+    // is reserved for explicit-doc-id queries (`query contacts/alice`)
+    // where the user already knows which doc they asked for.
+    let structural_value = || -> Value {
+        if keyed {
+            return Value::Object(
+                docs.iter()
+                    .map(|(k, d)| (k.clone(), automerge_to_json(d)))
+                    .collect(),
+            );
+        }
+        match docs {
+            [(_, doc)] => automerge_to_json(doc),
+            [] => Value::Object(Default::default()),
+            _ => Value::Object(
+                docs.iter()
+                    .map(|(k, d)| (k.clone(), automerge_to_json(d)))
+                    .collect(),
+            ),
+        }
+    };
     match fmt {
         OutputFormat::Text => {
-            // Try typed rendering per doc when the collection is known.
-            // Single-doc + known type → typed render directly.
-            // Anything else → fall through to structural JSON.
-            if let [(key, doc)] = docs {
-                if let Some(desc) = collection_of(key).and_then(|c| registry.for_collection(c)) {
-                    let json = automerge_to_json(doc);
-                    let rendered = render_typed_doc(&json, desc);
-                    print!("{rendered}");
-                    return Ok(());
+            // Typed renderer only fires on explicit-doc-id queries
+            // (`!keyed` + single doc + known collection). For
+            // collection-or-all scopes the user wants to see the key
+            // alongside the body — typed rendering would lose that.
+            if !keyed {
+                if let [(key, doc)] = docs {
+                    if let Some(desc) = collection_of(key).and_then(|c| registry.for_collection(c))
+                    {
+                        let json = automerge_to_json(doc);
+                        let rendered = render_typed_doc(&json, desc);
+                        print!("{rendered}");
+                        return Ok(());
+                    }
                 }
             }
-            // Multi-doc OR unknown collection → existing structural JSON
-            // path. (Multi-doc typed rendering is a follow-on; the issue
-            // is producing readable multi-doc output, not a registry gap.)
-            let value = match docs {
-                [(_, doc)] => automerge_to_json(doc),
-                _ => Value::Object(
-                    docs.iter()
-                        .map(|(k, d)| (k.clone(), automerge_to_json(d)))
-                        .collect(),
-                ),
-            };
-            let out = serde_json::to_string_pretty(&value)
+            let out = serde_json::to_string_pretty(&structural_value())
                 .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?;
             println!("{out}");
         }
         OutputFormat::Json => {
-            // Stable structural contract — no typed dispatch.
-            let value = match docs {
-                [(_, doc)] => automerge_to_json(doc),
-                _ => Value::Object(
-                    docs.iter()
-                        .map(|(k, d)| (k.clone(), automerge_to_json(d)))
-                        .collect(),
-                ),
-            };
-            let out = serde_json::to_string_pretty(&value)
+            let out = serde_json::to_string_pretty(&structural_value())
                 .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?;
             println!("{out}");
         }

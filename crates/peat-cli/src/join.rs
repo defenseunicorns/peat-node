@@ -205,32 +205,109 @@ async fn connect_peer(
     let resolved = tokio::net::lookup_host(addr_str).await.map_err(|e| {
         CliError::Generic(format!("resolve `{addr_str}` for peer `{peer_id}`: {e}"))
     })?;
+    // Filter to IPv4 only. Docker / k3d / generic bridge networks
+    // routinely advertise both A and AAAA records for service-name
+    // hostnames, but the IPv6 half is often non-routable across the
+    // bridge (no SLAAC, no neighbour discovery into the container).
+    // Iroh's `EndpointAddr` accepts all candidates and races them in
+    // parallel, but its hold-time on a dead IPv6 candidate eats the
+    // whole 30 s QUIC handshake budget before falling back — which
+    // is precisely the failure shape we see on PR #114's Quickstart
+    // Path A (CLI in peat-node-a → peat-node-b dual-stack resolve
+    // → 3 × 30 s retries, all timed out). Restricting to IPv4 here
+    // is the same simplification the compose example's bootstrap
+    // script implicitly relies on by handing peat-node a single
+    // `peat-node-a:51071` hint that resolves IPv4-first under
+    // Docker's embedded DNS.
     for socket in resolved {
+        if !socket.is_ipv4() {
+            tracing::debug!(peer = %peer_id, ?socket, "skipping non-IPv4 candidate");
+            continue;
+        }
         peer_addr = peer_addr.with_ip_addr(socket);
         any_added = true;
     }
     if !any_added {
         return Err(CliError::Generic(format!(
-            "no addresses resolved for `{addr_str}`"
+            "no IPv4 addresses resolved for `{addr_str}` (got only IPv6 candidates?)"
         )));
     }
 
-    backend
-        .blob_store()
-        .memory_lookup()
-        .add_endpoint_info(peer_addr);
+    // Diagnostic: log the exact resolved IP(s) we're handing iroh.
+    // PR #114's last failing run on the post-#205 fix showed iroh
+    // receiving `ip_addresses=[172.18.0.2:51071]` but peat-node-b's
+    // sidecar never seeing any inbound — open question is whether
+    // tokio's resolver in peat-node-a's container resolved
+    // `peat-node-b` to peat-node-b's actual IP, or to a sibling /
+    // local-container IP. This info-level log makes the resolved
+    // socket(s) visible at CI-default logging so we don't need
+    // RUST_LOG=debug to read them.
+    tracing::info!(
+        peer = %peer_id,
+        peer_addr_id = %peer_addr.id,
+        peer_addr_addrs = ?peer_addr.addrs,
+        peer_addr_relay = ?peer_addr.relay_urls().collect::<Vec<_>>(),
+        spec = %spec,
+        "dialing peer with fully-populated EndpointAddr (peat-mesh#205 path)"
+    );
 
-    let connection = tokio::time::timeout(
-        timeout,
-        backend.transport().connect_and_authenticate(peer_id),
-    )
-    .await
-    .map_err(|_| {
-        CliError::Generic(format!(
-            "connect to `{peer_id}` timed out after {timeout:?}"
-        ))
-    })?
-    .map_err(|e| CliError::Generic(format!("connect/auth to `{peer_id}`: {e}")))?;
+    // Retry loop covers peat#759's HMAC challenge-response race that
+    // peat-node's `dial_and_attach` already papers over with the
+    // same shape. Each attempt gets the full caller-supplied
+    // timeout; the race typically fails fast (~200ms) when it loses,
+    // so the overall budget rarely exceeds the per-attempt timeout
+    // in practice.
+    //
+    // We call `connect_and_authenticate_with_addr(peer_addr)` —
+    // shipped on peat-mesh's `fix-205-connect-with-addr` branch
+    // (peat-mesh#206 / closes peat-mesh#205). Passing the full
+    // `EndpointAddr` (with the resolved IPv4 socket) bypasses iroh's
+    // `address_lookup` chain entirely: no DNS attempt, no chain-
+    // dispatch race, direct UDP dial.
+    const CONNECT_RETRY_ATTEMPTS: usize = 3;
+    const CONNECT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+    let mut attempt = 0;
+    let connection = loop {
+        attempt += 1;
+        let result = tokio::time::timeout(
+            timeout,
+            backend
+                .transport()
+                .connect_and_authenticate_with_addr(peer_addr.clone()),
+        )
+        .await;
+        match result {
+            Ok(Ok(c)) => break c,
+            Ok(Err(e)) if attempt < CONNECT_RETRY_ATTEMPTS => {
+                tracing::warn!(
+                    peer = %peer_id,
+                    attempt,
+                    max_attempts = CONNECT_RETRY_ATTEMPTS,
+                    "connect_and_authenticate_with_addr failed, retrying: {e}"
+                );
+                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+            }
+            Ok(Err(e)) => {
+                return Err(CliError::Generic(format!(
+                    "connect/auth to `{peer_id}` failed after {attempt} attempts: {e}"
+                )));
+            }
+            Err(_) if attempt < CONNECT_RETRY_ATTEMPTS => {
+                tracing::warn!(
+                    peer = %peer_id,
+                    attempt,
+                    max_attempts = CONNECT_RETRY_ATTEMPTS,
+                    "connect to `{peer_id}` timed out after {timeout:?}, retrying"
+                );
+                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+            }
+            Err(_) => {
+                return Err(CliError::Generic(format!(
+                    "connect to `{peer_id}` timed out after {timeout:?} (attempt {attempt})"
+                )));
+            }
+        }
+    };
 
     backend
         .transport()

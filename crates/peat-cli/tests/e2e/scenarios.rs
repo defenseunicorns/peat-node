@@ -62,6 +62,48 @@ async fn await_key(peer: &TestPeer, key: &str, deadline: Duration) -> Value {
     }
 }
 
+/// Poll the peer's store until the doc at `key` has converged to a value
+/// different from `baseline`, then return the post-change value.
+///
+/// Use this for "after second write" assertions where `await_key` (existence
+/// semantics) is unsafe — when the doc already exists from an earlier
+/// create/seed, `await_key` returns immediately on the first poll regardless
+/// of whether the awaited update has propagated yet. That stale-read is a
+/// real source of test flakiness whenever the merge takes longer than the
+/// CLI's `--wait-for-sync` heuristic (currently a 750ms post-write sleep,
+/// not a true ack — peat-cli plan §"--wait-for-sync"). `await_key_change`
+/// holds the loop until the peer's CRDT actually advances past `baseline`,
+/// or fires a self-diagnostic panic on timeout.
+///
+/// Caller captures `baseline` immediately before issuing the change — the
+/// "before" snapshot of the key as the peer sees it. The helper compares
+/// structural JSON equality; field reordering inside maps is normalized by
+/// `serde_json::Value`'s PartialEq.
+async fn await_key_change(
+    peer: &TestPeer,
+    key: &str,
+    baseline: &Value,
+    deadline: Duration,
+) -> Value {
+    let start = std::time::Instant::now();
+    let mut last = Value::Null;
+    loop {
+        if let Ok(Some(doc)) = peer.backend.store().get(key) {
+            last = automerge_to_json(&doc);
+            if &last != baseline {
+                return last;
+            }
+        }
+        if start.elapsed() >= deadline {
+            panic!(
+                "key `{key}` did not advance past baseline within {deadline:?}; \
+                 baseline={baseline}, last={last}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Poll the peer's store until the key is gone (tombstoned) or deadline.
 async fn await_key_gone(peer: &TestPeer, key: &str, deadline: Duration) {
     let start = std::time::Instant::now();
@@ -79,6 +121,18 @@ async fn await_key_gone(peer: &TestPeer, key: &str, deadline: Duration) {
 /// Per-scenario timeout. Tuned to be slack enough for an Iroh handshake +
 /// initial sync on a loaded CI runner but tight enough to catch hangs.
 const SCENARIO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to poll the peer's store for an expected state transition
+/// (`await_key`, `await_key_change`, `await_key_gone`) before declaring
+/// a sync hang. CLI writes ride a 750 ms heuristic post-write sleep
+/// (`POST_WRITE_SYNC_WAIT` in writes.rs) rather than a real ack — when
+/// the e2e binary's `#[serial_test::serial(peat_cli_two_party)]` block
+/// runs alongside other workspace binaries on a loaded CI runner, the
+/// receive-side merge can land seconds after the CLI exits. A 10 s
+/// deadline was tight enough to flake intermittently; 30 s is generous
+/// without competing with `SCENARIO_TIMEOUT` (which still bounds CLI
+/// subprocess wall time, not test polling).
+const POLL_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
@@ -139,7 +193,7 @@ async fn create_propagates_to_peer() {
     .await;
     assert!(stdout.trim().ends_with("contacts:c-new"));
 
-    let observed = await_key(&peer, "contacts:c-new", Duration::from_secs(10)).await;
+    let observed = await_key(&peer, "contacts:c-new", POLL_DEADLINE).await;
     assert_eq!(observed["name"], json!("dave"));
 }
 
@@ -149,6 +203,7 @@ async fn update_set_modifies_existing_doc() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice", "rank": 1}), None).unwrap();
     peer.backend.store().put("contacts:c-1", &doc).unwrap();
+    let baseline = automerge_to_json(&peer.backend.store().get("contacts:c-1").unwrap().unwrap());
 
     let dir = tempfile::tempdir().unwrap();
     let creds = peer.creds_tempfile(&dir);
@@ -165,7 +220,7 @@ async fn update_set_modifies_existing_doc() {
     )
     .await;
 
-    let updated = await_key(&peer, "contacts:c-1", Duration::from_secs(10)).await;
+    let updated = await_key_change(&peer, "contacts:c-1", &baseline, POLL_DEADLINE).await;
     assert_eq!(updated["rank"], json!(2), "rank should be updated");
     assert_eq!(
         updated["name"],
@@ -195,7 +250,7 @@ async fn update_set_against_missing_doc_creates_it() {
     )
     .await;
 
-    let created = await_key(&peer, "contacts:c-fresh", Duration::from_secs(10)).await;
+    let created = await_key(&peer, "contacts:c-fresh", POLL_DEADLINE).await;
     assert_eq!(created["name"], json!("erin"));
 }
 
@@ -210,6 +265,7 @@ async fn update_from_applies_delta_to_existing_doc() {
     let peer = TestPeer::start().await;
     let doc = json_to_automerge(&json!({"name": "alice", "rank": 1}), None).unwrap();
     peer.backend.store().put("contacts:c-1", &doc).unwrap();
+    let baseline = automerge_to_json(&peer.backend.store().get("contacts:c-1").unwrap().unwrap());
 
     let dir = tempfile::tempdir().unwrap();
     let creds = peer.creds_tempfile(&dir);
@@ -235,7 +291,7 @@ async fn update_from_applies_delta_to_existing_doc() {
     )
     .await;
 
-    let merged = await_key(&peer, "contacts:c-1", Duration::from_secs(10)).await;
+    let merged = await_key_change(&peer, "contacts:c-1", &baseline, POLL_DEADLINE).await;
     assert_eq!(merged["name"], json!("alice"));
     assert_eq!(merged["rank"], json!(5), "rank should be updated to 5");
     assert_eq!(merged["tag"], json!("lead"), "new field should be present");
@@ -324,7 +380,7 @@ async fn update_from_against_missing_doc_creates_it() {
     )
     .await;
 
-    let created = await_key(&peer, "contacts:c-new", Duration::from_secs(10)).await;
+    let created = await_key(&peer, "contacts:c-new", POLL_DEADLINE).await;
     assert_eq!(created["name"], json!("frank"));
     assert_eq!(created["rank"], json!(9));
 }
@@ -342,7 +398,7 @@ async fn delete_tombstones_doc_on_peer() {
     let (stdout, _) = run_peat(&creds, &["delete", "contacts/c-1", "--wait-for-sync"]).await;
     assert!(stdout.contains("tombstone:contacts/c-1"));
 
-    await_key_gone(&peer, "contacts:c-1", Duration::from_secs(10)).await;
+    await_key_gone(&peer, "contacts:c-1", POLL_DEADLINE).await;
 }
 
 #[tokio::test]
@@ -493,7 +549,7 @@ async fn update_from_round_trip_across_two_subprocesses() {
     )
     .await;
     // Wait for the seed to materialise on the peer before reading it back.
-    await_key(&peer, "contacts:c-round", Duration::from_secs(10)).await;
+    let baseline = await_key(&peer, "contacts:c-round", POLL_DEADLINE).await;
 
     // CLI #2: fetch current state as canonical JSON.
     let (fetched_stdout, _) =
@@ -518,7 +574,7 @@ async fn update_from_round_trip_across_two_subprocesses() {
     )
     .await;
 
-    let merged = await_key(&peer, "contacts:c-round", Duration::from_secs(10)).await;
+    let merged = await_key_change(&peer, "contacts:c-round", &baseline, POLL_DEADLINE).await;
     assert_eq!(merged["name"], json!("alice"), "unedited field preserved");
     assert_eq!(merged["rank"], json!(7), "edited field updated");
     assert_eq!(merged["tag"], json!("lead"), "new field appended");
@@ -618,7 +674,7 @@ async fn run_typed_lifecycle(
     }
     create_args.push("--wait-for-sync");
     run_peat(&creds, &create_args).await;
-    await_key(&peer, &key, Duration::from_secs(10)).await;
+    let baseline = await_key(&peer, &key, POLL_DEADLINE).await;
 
     // 2. query --output text (typed render dispatch).
     let (text_stdout, _) = run_peat(&creds, &["--output", "text", "query", &target]).await;
@@ -644,13 +700,15 @@ async fn run_typed_lifecycle(
     )
     .await;
 
-    // 5. verify the merge.
-    let merged = await_key(&peer, &key, Duration::from_secs(10)).await;
+    // 5. verify the merge. Use change-detection rather than existence —
+    // the key already exists from step 1, so plain `await_key` would
+    // return the pre-update state on the first poll.
+    let merged = await_key_change(&peer, &key, &baseline, POLL_DEADLINE).await;
     expect_json_after_update(&merged);
 
     // 6. delete + verify tombstoned.
     run_peat(&creds, &["delete", &target, "--wait-for-sync"]).await;
-    await_key_gone(&peer, &key, Duration::from_secs(10)).await;
+    await_key_gone(&peer, &key, POLL_DEADLINE).await;
 }
 
 #[tokio::test]

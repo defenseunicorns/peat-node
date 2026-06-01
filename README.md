@@ -76,7 +76,12 @@ Query either sidecar to see fleet-wide agent state from both clusters.
 
 ## Quick Start
 
-The fastest way to see CRDT sync working is the two-node Docker Compose example at [`examples/compose/`](examples/compose/) — `docker compose up -d && ./bootstrap.sh && ./demo.sh` writes a document on node-a and verifies it lands on node-b. No build required; uses the published `ghcr.io/defenseunicorns/peat-node` image.
+Two end-to-end walkthroughs:
+
+- **[`QUICKSTART.md`](QUICKSTART.md)** — stand up a two-node peat-node mesh via Docker Compose (~3 min) or Helm + k3d across two clusters (~10 min). Drive it from `kubectl exec`.
+- **[`crates/peat-cli/QUICKSTART.md`](crates/peat-cli/QUICKSTART.md)** — operator-side: install the `peat` CLI, write credentials, run schema discovery, read/write/observe documents on a live mesh.
+
+The fastest path is the two-node Docker Compose example at [`examples/compose/`](examples/compose/) — `docker compose up -d && ./bootstrap.sh && ./demo.sh` writes a document on node-a and verifies it lands on node-b. No build required; uses the published `ghcr.io/defenseunicorns/peat-node` image.
 
 To run a single node from source:
 
@@ -113,12 +118,11 @@ peat update contacts/c-1234 --set rank=2 --wait-for-sync
 peat delete contacts/c-1234
 ```
 
-The binary is included in the `peat-node` container image at `/usr/local/bin/peat`, so `kubectl exec` reaches a debug surface with no extra sidecar:
+The binary is included in the `peat-node` container image at `/usr/local/bin/peat`, so `kubectl exec` reaches a debug surface with no extra sidecar. Bootstrap a CLI credential bundle inside the pod first — see [`crates/peat-cli/README.md` § In-cluster debug surface](crates/peat-cli/README.md#in-cluster-debug-surface) for the full pattern:
 
 ```bash
-kubectl exec -n peat -it deploy/peat-node -- peat \
-  --creds /etc/peat/credentials.yaml \
-  query contacts/c-1234 --output json
+kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
+  peat --creds /tmp/creds.yaml query contacts/c-1234 --output json
 ```
 
 Standalone binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64) are attached to each tagged release.

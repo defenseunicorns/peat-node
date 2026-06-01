@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, SyncTransport};
+use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
@@ -199,13 +199,24 @@ impl SidecarNode {
                 .await;
         });
 
-        // On every local write, push the doc to all connected peers.
-        // AutomergeBackend doesn't spawn this — its `SyncEngine::start_sync`
-        // is a separate concept (a flag toggle), not the on-change push loop.
-        let sync_rx = backend.store().subscribe_to_changes();
+        // On every change (local or sync-received), push the doc to
+        // all connected peers — except the source peer when the change
+        // arrived via sync, so we don't echo back to it.
+        //
+        // We deliberately subscribe to the origin-tagged channel
+        // (`subscribe_to_changes_with_origin`) instead of the local-
+        // only `subscribe_to_changes`. The latter never fires on
+        // sync-received writes, which breaks transitive gossip: when
+        // peat-node-b receives a doc from peer A, b's local-only
+        // channel stays silent, b never fans out to its other peers,
+        // and an observer connected to b never sees the change.
+        // peat-mesh documents this channel as the gossip-driver
+        // contract (peat-mesh#891 / #907).
+        let sync_rx = backend.store().subscribe_to_changes_with_origin();
         let sync_coordinator = Arc::clone(backend.coordinator());
+        let sync_transport = Arc::clone(backend.transport());
         tokio::spawn(async move {
-            Self::sync_on_change(sync_rx, sync_coordinator).await;
+            Self::sync_on_change(sync_rx, sync_coordinator, sync_transport).await;
         });
 
         // PRD-006: bundle handle table is always present (the cheap empty
@@ -454,18 +465,35 @@ impl SidecarNode {
             .to_string()
     }
 
-    /// React to local document changes by syncing them with all connected peers.
+    /// React to document changes (local writes AND sync-received writes)
+    /// by pushing them to all connected peers except the source peer of
+    /// a remote-origin change. Echo suppression compares each connected
+    /// peer's `EndpointId::to_string()` against `ChangeOrigin::Remote(..)`'s
+    /// inner string per peat-mesh's transport-agnostic contract.
     async fn sync_on_change(
-        mut rx: broadcast::Receiver<String>,
+        mut rx: broadcast::Receiver<DocChange>,
         coordinator: Arc<peat_mesh::storage::AutomergeSyncCoordinator>,
+        transport: Arc<peat_mesh::storage::MeshSyncTransport>,
     ) {
         loop {
             match rx.recv().await {
-                Ok(doc_key) => {
-                    if let Err(e) = coordinator.sync_document_with_all_peers(&doc_key).await {
-                        warn!(doc_key, "sync to peers failed: {e}");
+                Ok(DocChange { key, origin }) => match origin {
+                    ChangeOrigin::Local => {
+                        if let Err(e) = coordinator.sync_document_with_all_peers(&key).await {
+                            warn!(doc_key = %key, "sync to peers failed: {e}");
+                        }
                     }
-                }
+                    ChangeOrigin::Remote(source) => {
+                        for peer in transport.connected_peers() {
+                            if peer.to_string() == source {
+                                continue;
+                            }
+                            if let Err(e) = coordinator.sync_document_with_peer(&key, peer).await {
+                                warn!(doc_key = %key, %peer, "fanout sync failed: {e}");
+                            }
+                        }
+                    }
+                },
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("sync change listener lagged {n} messages");
                 }
@@ -874,11 +902,28 @@ impl SidecarNode {
         let key = format!("{collection}:{doc_id}");
         match self.backend.store().get(&key)? {
             Some(doc) => {
-                let value = automerge_to_json(&doc)
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                Ok(self.maybe_decrypt(value)?)
+                let json = automerge_to_json(&doc);
+                // Two doc shapes co-exist in the same store:
+                //
+                //   - PutDocument (gRPC) writes `{"value": "<json-string>"}`
+                //     — the user's original JSON payload encoded as a string
+                //     in a single Automerge field. Optionally encrypted at
+                //     rest when a cipher is configured (peat-mesh#124).
+                //   - peat-cli (`create --set`/`update --set`) writes the
+                //     user's data directly as structural Automerge fields
+                //     (e.g. `{"name": "alice"}`). No string-encoding, no
+                //     encryption — the doc IS the user's data.
+                //
+                // Return the inner string for value-wrapped docs (the
+                // existing contract); fall back to serializing the doc as
+                // JSON for CLI-written docs so GetDocument is a single
+                // entry point regardless of which writer produced the
+                // record.
+                if let Some(s) = json.get("value").and_then(|v| v.as_str()) {
+                    Ok(self.maybe_decrypt(Some(s.to_string()))?)
+                } else {
+                    Ok(Some(serde_json::to_string(&json)?))
+                }
             }
             None => Ok(None),
         }

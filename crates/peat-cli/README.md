@@ -18,18 +18,30 @@ cargo build --release -p peat-cli
 
 ### In-cluster debug surface
 
-For a sidecar already deployed with the `peat-node` Helm chart, mount the operator credentials into the pod and `exec` against the running container:
+For a sidecar already deployed with the `peat-node` Helm chart, write a CLI credential bundle inside the pod (the chart doesn't auto-mount one — the sidecar reads its formation config from env vars) and `exec` against the running container. The chart's default deployment name is `<release>-peat-node` (e.g. `peat-peat-node` for a release named `peat`).
 
 ```sh
+# Bootstrap a creds.yaml inside the pod, pointing the CLI at the
+# sidecar's own loopback endpoint. Adjust app_id / shared_key to match
+# whatever the chart was installed with.
+kubectl exec -n peat deploy/peat-peat-node -c peat-node -- sh -c '
+  cat > /tmp/creds.yaml <<EOF
+app_id: <your-formation-id>
+shared_key: <base64-32-bytes>
+peers:
+  - $(curl -s -X POST http://localhost:50051/peat.sidecar.v1.PeatSidecar/GetStatus \
+      -H "Content-Type: application/json" -d "{}" \
+      | grep -o "\"endpointAddr\":\"[^\"]*\"" | cut -d\" -f4)@localhost:51071
+EOF
+  chmod 600 /tmp/creds.yaml'
+
 # One-shot read.
-kubectl exec -n peat -it deploy/peat-node -- peat \
-  --creds /etc/peat/credentials.yaml \
-  query contacts/c-1234 --output json
+kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
+  peat --creds /tmp/creds.yaml query contacts/c-1234 --output json
 
 # Streaming observe (Ctrl-C to exit; binary handles SIGINT cleanly).
-kubectl exec -n peat -it deploy/peat-node -- peat \
-  --creds /etc/peat/credentials.yaml \
-  observe contacts --output ndjson
+kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
+  peat --creds /tmp/creds.yaml observe contacts --output ndjson
 ```
 
 `peat` joins as an ephemeral observer node — no persistent state survives the `exec` invocation, presence records carry a short TTL, and the mesh does not plan around the CLI as a durable participant.

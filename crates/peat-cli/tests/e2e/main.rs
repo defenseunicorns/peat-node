@@ -27,6 +27,7 @@ fn peat() -> Command {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn help_renders_with_all_subcommands() {
     peat()
         .arg("--help")
@@ -42,6 +43,7 @@ fn help_renders_with_all_subcommands() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn schema_list_runs_offline_without_creds() {
     // `schema list` is a local registry inspector — no creds, no
     // mesh handshake. Confirms an operator can discover registered
@@ -56,6 +58,7 @@ fn schema_list_runs_offline_without_creds() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn schema_describe_renders_field_shape() {
     // Field-level table for one type. Asserts on the format strings
     // exercised by Capability so the renderer's contract is pinned.
@@ -71,6 +74,7 @@ fn schema_describe_renders_field_shape() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn schema_describe_resolves_by_canonical_id() {
     peat()
         .args(["schema", "describe", "peat.capability.v1.Capability"])
@@ -80,6 +84,7 @@ fn schema_describe_resolves_by_canonical_id() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn schema_describe_unknown_target_is_malformed() {
     peat()
         .args(["schema", "describe", "no-such-collection"])
@@ -89,6 +94,7 @@ fn schema_describe_unknown_target_is_malformed() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn schema_list_json_output_is_array() {
     // `--output json` contract: a JSON array, one element per type,
     // each element carrying the documented keys. Scripts depend on this.
@@ -113,6 +119,7 @@ fn schema_list_json_output_is_array() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn version_renders() {
     peat()
         .arg("--version")
@@ -122,6 +129,7 @@ fn version_renders() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn subcommand_help_renders() {
     for sub in ["query", "observe", "create", "update", "delete"] {
         peat()
@@ -133,6 +141,7 @@ fn subcommand_help_renders() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn query_without_creds_exits_auth_error() {
     // ADR-001 "Shell integration discipline": auth failure → exit 2, empty
     // stdout, explanation on stderr. Passing a path that doesn't exist
@@ -152,6 +161,7 @@ fn query_without_creds_exits_auth_error() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn observe_without_creds_exits_auth_error() {
     // Same shape as query: missing creds → exit 2 with the auth message on
     // stderr, no stdout. Confirms the streaming subcommand reaches the join
@@ -170,6 +180,7 @@ fn observe_without_creds_exits_auth_error() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_without_creds_exits_auth_error() {
     peat()
         .args([
@@ -187,6 +198,7 @@ fn create_without_creds_exits_auth_error() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_dry_run_renders_op_without_join() {
     // --dry-run skips the join prelude entirely, so missing creds don't
     // matter and we get the would-be op on stdout. Confirms the
@@ -212,6 +224,7 @@ fn create_dry_run_renders_op_without_join() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_for_unknown_collection_skips_validation() {
     // "contacts" is not a peat-schema-registered collection, so the
     // schema gate accepts the document structurally and dry-run prints.
@@ -231,6 +244,7 @@ fn create_for_unknown_collection_skips_validation() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
     // "capabilities" IS a registered collection (peat-schema). Building
     // only `name` leaves `id` and other proto3 fields at their defaults.
@@ -251,6 +265,7 @@ fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_with_no_validate_skips_schema_gate_for_known_collection() {
     // --no-validate bypasses the gate so a Capability missing `id`
     // succeeds at the dry-run stage. Warning goes to stderr.
@@ -269,6 +284,7 @@ fn create_with_no_validate_skips_schema_gate_for_known_collection() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn update_from_missing_file_is_malformed() {
     // `--from` is parsed *before* the join prelude (peat-mesh#187 landed
     // the delta API, so this is real now). A bad path surfaces as
@@ -286,6 +302,7 @@ fn update_from_missing_file_is_malformed() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn update_without_target_doc_id_is_malformed() {
     peat()
         .args(["update", "contacts", "--set", "name=alice"])
@@ -295,6 +312,7 @@ fn update_without_target_doc_id_is_malformed() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn delete_without_target_doc_id_is_malformed() {
     peat()
         .args(["delete", "contacts"])
@@ -304,6 +322,7 @@ fn delete_without_target_doc_id_is_malformed() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn missing_subcommand_is_a_parse_error() {
     // clap prints usage to stderr and exits non-zero when no subcommand is given.
     peat()
@@ -313,6 +332,7 @@ fn missing_subcommand_is_a_parse_error() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn unknown_subcommand_is_a_parse_error() {
     peat()
         .arg("nonexistent")
@@ -322,6 +342,7 @@ fn unknown_subcommand_is_a_parse_error() {
 }
 
 #[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_requires_from_or_set_at_binary_level() {
     // Mirrors the in-process parser test but exercises the real binary path,
     // proving the ArgGroup constraint survives compilation + linking.
