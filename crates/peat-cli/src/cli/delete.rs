@@ -91,7 +91,10 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
     }
 
     if args.wait_for_sync {
+        println!("tombstone:{collection}/{doc_id}");
+        session.close().await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
+        return Ok(());
     }
 
     println!("tombstone:{collection}/{doc_id}");

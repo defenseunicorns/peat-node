@@ -84,18 +84,11 @@ pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
     value
 }
 
-/// Fixed-period wait that approximates ADR-001 `--wait-for-sync` semantics.
-/// peat-mesh does not yet surface a per-write "acknowledged by N peers"
-/// signal — this gives the local sync coordinator a budget to push the
-/// new op to connected peers before the CLI exits. Real ack tracking
-/// lands when upstream exposes it.
-///
-/// 2 s keeps the QUIC connection alive long enough for the OS to put
-/// the outbound packets on the wire AND for the peer to ACK them, even
-/// on a loaded self-hosted CI runner where the tokio scheduler may be
-/// slow to process the outbound queue. 750 ms proved insufficient in
-/// practice (see peat-node#120).
-pub const POST_WRITE_SYNC_WAIT: Duration = Duration::from_millis(2000);
+/// Brief settle window used inside `--wait-for-sync` after the
+/// `MeshSession::close()` graceful shutdown. The QUIC CONNECTION_CLOSE
+/// guarantees delivery; this residual gives the peer's tokio runtime a
+/// moment to apply the change to its store before the CLI returns.
+pub const POST_WRITE_SYNC_WAIT: Duration = Duration::from_millis(250);
 
 /// Read the `--from` argument: a path, or `-` for stdin.
 pub fn read_from(path: &Path) -> Result<Value, CliError> {

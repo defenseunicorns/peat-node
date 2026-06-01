@@ -153,7 +153,12 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
                 tracing::warn!(peer = %peer_id, "post-create sync round-trip failed: {e}");
             }
         }
+        // Graceful QUIC close: iroh sends CONNECTION_CLOSE and waits for
+        // peer acknowledgement, ensuring all data is delivered before exit.
+        println!("{key}");
+        session.close().await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
+        return Ok(());
     }
 
     println!("{key}");
