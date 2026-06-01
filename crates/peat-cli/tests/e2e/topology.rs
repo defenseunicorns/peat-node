@@ -232,7 +232,8 @@ impl TestPeer {
         let yaml = format!(
             "app_id: {app_id}\n\
              shared_key: {key}\n\
-             peers:\n  - {peer_id}@127.0.0.1:{port}\n",
+             peers:\n  - {peer_id}@127.0.0.1:{port}\n\
+             disable_mdns: true\n",
             app_id = self.app_id,
             key = self.formation_key_b64,
             peer_id = self.endpoint_id,
