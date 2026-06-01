@@ -86,28 +86,42 @@ impl MeshSession {
     /// (or if no peers were configured — useful for read-from-self in tests).
     /// Returns `Err` if peers were configured but none could be reached.
     pub async fn open(creds: PeatCredentials, opts: SessionOptions) -> Result<Self, CliError> {
-        let node_id = opts
-            .as_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
         // Resolve data dir: CLI flag > creds bundle > ephemeral TempDir.
         let data_dir: DataDir = if let Some(p) = opts.data_dir.clone() {
-            std::fs::create_dir_all(&p).map_err(|e| {
-                CliError::Generic(format!("could not create data_dir {}: {e}", p.display()))
-            })?;
+            create_private_dir(&p)?;
             DataDir::Persistent(p)
         } else if let Some(raw) = &creds.data_dir {
             let p = expand_data_dir(raw)?;
-            std::fs::create_dir_all(&p).map_err(|e| {
-                CliError::Generic(format!("could not create data_dir {}: {e}", p.display()))
-            })?;
+            create_private_dir(&p)?;
             DataDir::Persistent(p)
         } else {
             DataDir::Ephemeral(tempfile::tempdir().map_err(|e| {
                 CliError::Generic(format!("could not create ephemeral data dir: {e}"))
             })?)
         };
+
+        // Stable actor identity for persistent stores: derive from
+        // `data_dir/identity` so the same actor ID is reused across
+        // invocations. With an ephemeral store a fresh UUID is fine because
+        // the store is thrown away on exit anyway.
+        // Automerge actors accumulate per-actor change history; reusing the
+        // same actor across invocations keeps the Automerge document lean.
+        let node_id = opts.as_id.clone().unwrap_or_else(|| {
+            if let DataDir::Persistent(p) = &data_dir {
+                let id_file = p.join("identity");
+                if let Ok(id) = std::fs::read_to_string(&id_file) {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        return id;
+                    }
+                }
+                let fresh = uuid::Uuid::new_v4().to_string();
+                let _ = std::fs::write(&id_file, &fresh);
+                fresh
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        });
 
         tracing::debug!(
             node_id = %node_id,
@@ -211,6 +225,36 @@ impl MeshSession {
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
+}
+
+/// Create `path` (and any parents) with restricted permissions.
+///
+/// On Unix the leaf directory is created with mode `0700` so the local
+/// Automerge store is not world-readable on shared hosts. On other platforms
+/// `create_dir_all` is used without further restriction.
+fn create_private_dir(path: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Create parents with default permissions, then the leaf with 0700.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+            })?;
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+            })?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|e| {
+        CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// Split an `endpoint_id@host:port` spec into its two parts and parse the

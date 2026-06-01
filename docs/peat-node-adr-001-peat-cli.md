@@ -316,7 +316,16 @@ This pattern requires that `query` output is a valid input to `update` for the s
 - **`query` and `observe`** — passive observer. No application capabilities published. Short TTL on presence records (default 60s, refreshed while running). Marked with a role hint other peers can filter from routing and QoS planning.
 - **`create`, `update`, `delete`** — active participant for the duration of the operation. The CLI authors operations stamped with its identity. Presence is still short-TTL and observer-flagged; the distinction is operation submission, not capability advertisement.
 
-In both cases, the node is short-lived and identity-stamped; the mesh does not plan around it as a durable participant.
+In both cases, the node is identity-stamped; the mesh does not plan around it as a durable participant.
+
+#### Persistent observer sub-posture
+
+When `--data-dir` (or `data_dir:` in the credentials bundle) is set, the CLI stores the local Automerge replica between invocations. This "persistent observer" sub-posture changes two things:
+
+1. **Actor identity is stable.** A `data_dir/identity` file is written on first use and reused on subsequent invocations, preventing unbounded Automerge actor accumulation in the shared CRDT history. Overridden by `--as <id>`.
+2. **Local state survives exit.** Documents written by the CLI are durably stored and will be visible on the next `query` even without a live peer, provided they were committed to the local replica before the CLI exited.
+
+The posture is still observer-flagged and short-TTL on presence. Persistent state is scoped to the local replica; the CLI does not advertise capabilities, does not participate in QoS routing, and remains outside the mesh's topology planning. The directory is created with mode `0700` on Unix to limit access to the invoking user.
 
 ### Output formats
 
