@@ -60,7 +60,7 @@ pass "demo writes on node-a, reads on node-b"
 # ---- Step 0: offline schema discovery (QUICKSTART step 0) -----------
 
 log "Step 0: 'peat schema list' inside peat-node-a (offline, no creds)"
-out=$(docker exec peat-node-a peat schema list)
+out=$(docker exec peat-node-a peat --output text schema list)
 echo "${out}" | grep -q "capabilities" || fail "schema list missing 'capabilities'"
 echo "${out}" | grep -q "node-configs" || fail "schema list missing 'node-configs'"
 pass "schema list enumerates all 5 builtin types"

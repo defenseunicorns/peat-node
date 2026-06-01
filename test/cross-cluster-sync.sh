@@ -302,7 +302,7 @@ EOF
 
     # Offline sanity: schema list must work without joining a mesh.
     if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
-        peat schema list 2>&1 | grep -q "capabilities"; then
+        peat --output text schema list 2>&1 | grep -q "capabilities"; then
         pass "peat schema list runs offline inside the pod"
     else
         fail "peat schema list failed inside the pod"
