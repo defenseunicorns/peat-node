@@ -66,7 +66,7 @@ echo "${out}" | grep -q "node-configs" || fail "schema list missing 'node-config
 pass "schema list enumerates all 5 builtin types"
 
 log "Step 0b: 'peat schema describe capabilities' renders field shape"
-out=$(docker exec peat-node-a peat schema describe capabilities)
+out=$(docker exec peat-node-a peat --output text schema describe capabilities)
 echo "${out}" | grep -q "Capability (v1)" || fail "describe missing type header"
 echo "${out}" | grep -q "confidence" || fail "describe missing confidence field"
 echo "${out}" | grep -q "percentage" || fail "describe missing percentage format"
