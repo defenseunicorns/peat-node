@@ -310,4 +310,4 @@ jobs:
           cd /tmp/peat-binaries
           ls -la
           # --clobber so a re-run of a tag replaces previous assets.
-          gh release upload "$GITHUB_REF_NAME" peat-*.tar.gz peat-*.tar.gz.sha256 peat-*.zip peat-*.zip.sha256 --clobber
+          gh release upload "$GITHUB_REF_NAME" peat-*.tar.gz peat-*.tar.gz.sha256 peat-*.zip peat-*.zip.sha256 --clobber --repo "$GITHUB_REPOSITORY"
