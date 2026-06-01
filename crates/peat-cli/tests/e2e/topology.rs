@@ -51,6 +51,8 @@ pub struct TestPeer {
 
 impl Drop for TestPeer {
     fn drop(&mut self) {
+        // Fallback: abort tasks when the peer is dropped without calling stop().
+        // Tests should call stop().await instead for deterministic cleanup.
         self.abort_tasks();
     }
 }
@@ -195,11 +197,28 @@ impl TestPeer {
         })
     }
 
-    /// Signal all background tasks to cancel. Cancellation is asynchronous —
-    /// tasks may still be running briefly after this returns.
+    /// Shut down the peer cleanly: abort background tasks, await their
+    /// cancellation, then drop the backend.
     ///
-    /// Called automatically on Drop, but can be called early to release
-    /// resources before the TestPeer variable goes out of scope.
+    /// Must be called at the end of every serial e2e test. Without this,
+    /// aborting the tasks only SCHEDULES cancellation — the tasks still hold
+    /// `Arc<AutomergeBackend>` until they actually complete. If they haven't
+    /// completed by the time the next test starts, the backend stays alive and
+    /// peat-mesh's internal sync_task (which exits when the backend drops)
+    /// keeps running. After 30+ serial tests, dozens of leaked sync_tasks
+    /// starve the tokio runtime and cause sync to time out.
+    pub async fn stop(mut self) {
+        let tasks = std::mem::take(&mut self._tasks);
+        for task in tasks {
+            task.abort();
+            let _ = task.await; // JoinError on abort is expected and fine
+        }
+        // backend field drops here → Arc count → 0 → backend drops →
+        // store channel closes → internal sync_task exits naturally.
+    }
+
+    /// Signal all background tasks to cancel (synchronous, fire-and-forget).
+    /// Prefer `stop()` at the end of each test for deterministic cleanup.
     pub fn abort_tasks(&self) {
         for task in &self._tasks {
             task.abort();

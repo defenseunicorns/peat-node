@@ -158,6 +158,7 @@ async fn query_returns_doc_written_on_peer() {
     let parsed: Value = serde_json::from_str(&stdout).expect("stdout is JSON");
     assert_eq!(parsed["name"], json!("alice"));
     assert_eq!(parsed["rank"], json!(1));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -179,6 +180,7 @@ async fn query_collection_returns_all_docs_keyed() {
     let obj = parsed.as_object().expect("query collection emits object");
     assert_eq!(obj.len(), 3, "expected 3 keyed entries; got {obj:?}");
     assert_eq!(obj["contacts:c-2"]["name"], json!("bob"));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -205,6 +207,7 @@ async fn create_propagates_to_peer() {
 
     let observed = await_key(&peer, "contacts:c-new", POLL_DEADLINE).await;
     assert_eq!(observed["name"], json!("dave"));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -237,6 +240,7 @@ async fn update_set_modifies_existing_doc() {
         json!("alice"),
         "other fields should be preserved"
     );
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -262,6 +266,7 @@ async fn update_set_against_missing_doc_creates_it() {
 
     let created = await_key(&peer, "contacts:c-fresh", POLL_DEADLINE).await;
     assert_eq!(created["name"], json!("erin"));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -305,6 +310,7 @@ async fn update_from_applies_delta_to_existing_doc() {
     assert_eq!(merged["name"], json!("alice"));
     assert_eq!(merged["rank"], json!(5), "rank should be updated to 5");
     assert_eq!(merged["tag"], json!("lead"), "new field should be present");
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -360,6 +366,7 @@ async fn update_rejects_known_collection_with_invalid_post_merge_shape() {
         stderr.contains("Capability"),
         "stderr missing type name `Capability`: {stderr}"
     );
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -393,6 +400,7 @@ async fn update_from_against_missing_doc_creates_it() {
     let created = await_key(&peer, "contacts:c-new", POLL_DEADLINE).await;
     assert_eq!(created["name"], json!("frank"));
     assert_eq!(created["rank"], json!(9));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -409,6 +417,7 @@ async fn delete_tombstones_doc_on_peer() {
     assert!(stdout.contains("tombstone:contacts/c-1"));
 
     await_key_gone(&peer, "contacts:c-1", POLL_DEADLINE).await;
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -455,6 +464,7 @@ async fn create_rejects_duplicate_id() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -482,6 +492,7 @@ async fn query_limit_caps_result_count() {
         3,
         "--limit 3 should cap to 3 docs"
     );
+    peer.stop().await;
 }
 
 // ---------------------------------------------------------------------
@@ -528,6 +539,7 @@ async fn observe_subprocess_streams_create_from_second_subprocess() {
 
     topology::await_stdout_contains(&mut observer, "c-bridge", POLL_DEADLINE).await;
     // observer is killed on Drop (kill_on_drop=true).
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -588,6 +600,7 @@ async fn update_from_round_trip_across_two_subprocesses() {
     assert_eq!(merged["name"], json!("alice"), "unedited field preserved");
     assert_eq!(merged["rank"], json!(7), "edited field updated");
     assert_eq!(merged["tag"], json!("lead"), "new field appended");
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -628,6 +641,7 @@ async fn observe_subprocess_streams_delete_from_second_subprocess() {
         seen.contains("contacts:c-tomb"),
         "expected tombstone for c-tomb in observer stdout; saw:\n{seen}"
     );
+    peer.stop().await;
 }
 
 // ---------------------------------------------------------------------
@@ -718,6 +732,7 @@ async fn run_typed_lifecycle(
     // 6. delete + verify tombstoned.
     run_peat(&creds, &["delete", &target, "--wait-for-sync"]).await;
     await_key_gone(&peer, &key, POLL_DEADLINE).await;
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -840,6 +855,7 @@ async fn query_all_collections_returns_keys_from_every_collection() {
         "expected things entry; got keys {:?}",
         obj.keys().collect::<Vec<_>>()
     );
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -896,6 +912,7 @@ async fn observe_all_collections_streams_events_from_every_collection() {
         seen.contains("contacts:c-2"),
         "expected contacts event in observer stdout; saw:\n{seen}"
     );
+    peer.stop().await;
 }
 
 #[tokio::test]

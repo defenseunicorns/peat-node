@@ -186,10 +186,7 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
                 tracing::warn!(peer = %peer_id, "post-update sync round-trip failed: {e}");
             }
         }
-        println!("{key}");
-        session.close().await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
-        return Ok(());
     }
 
     println!("{key}");
