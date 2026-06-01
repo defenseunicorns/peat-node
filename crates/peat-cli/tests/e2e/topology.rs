@@ -195,7 +195,8 @@ impl TestPeer {
         })
     }
 
-    /// Abort all background tasks and wait for them to stop.
+    /// Signal all background tasks to cancel. Cancellation is asynchronous —
+    /// tasks may still be running briefly after this returns.
     ///
     /// Called automatically on Drop, but can be called early to release
     /// resources before the TestPeer variable goes out of scope.
