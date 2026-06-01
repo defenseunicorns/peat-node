@@ -6,7 +6,6 @@
 //! narrow — bool / null / number / string only. Arrays and nested objects
 //! come from `--from`.
 
-use peat_mesh::storage::SyncTransport;
 use peat_schema::type_registry::{BuiltinRegistry, TypeRegistry};
 use serde_json::{Map, Value};
 use std::io::Read;
@@ -14,7 +13,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::cli::CliError;
-use crate::join::MeshSession;
 
 /// Validate a proposed JSON document against the type registered for
 /// `collection` in `peat-schema`. Returns `Ok(())` when:
@@ -92,33 +90,6 @@ pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
 /// new op to connected peers before the CLI exits. Real ack tracking
 /// lands when upstream exposes it.
 pub const POST_WRITE_SYNC_WAIT: Duration = Duration::from_millis(750);
-
-/// Confirm delivery of a prior write to all connected peers.
-///
-/// Write APIs (`sync_document_with_all_peers`, `send_tombstones_to_peer`)
-/// write to the QUIC send buffer and return before the peer ACKs. This
-/// function issues a `sync_all_documents_with_peer` request/response cycle
-/// to each peer; the response is only sent after the peer has processed all
-/// prior data on the connection, providing a delivery confirmation without
-/// needing an explicit ack API in peat-mesh.
-///
-/// `op_label` is included in the warning log if the round-trip fails
-/// (e.g. `"create"`, `"update"`, `"delete"`).
-pub async fn confirm_peer_delivery(session: &MeshSession, op_label: &str) {
-    for peer_id in session.backend().transport().connected_peers() {
-        if let Err(e) = session
-            .backend()
-            .coordinator()
-            .sync_all_documents_with_peer(peer_id)
-            .await
-        {
-            tracing::warn!(
-                peer = %peer_id,
-                "post-{op_label} sync round-trip failed: {e}"
-            );
-        }
-    }
-}
 
 /// Read the `--from` argument: a path, or `-` for stdin.
 pub fn read_from(path: &Path) -> Result<Value, CliError> {

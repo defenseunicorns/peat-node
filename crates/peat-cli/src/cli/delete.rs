@@ -5,7 +5,7 @@ use peat_mesh::qos::Tombstone;
 use peat_mesh::storage::SyncTransport;
 
 use crate::cli::query::parse_target;
-use crate::cli::writes::{confirm_peer_delivery, POST_WRITE_SYNC_WAIT};
+use crate::cli::writes::POST_WRITE_SYNC_WAIT;
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -71,12 +71,9 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
             tracing::warn!(peer = %peer_id, "send_tombstones_to_peer failed: {e}");
             continue;
         }
-
-        // Delivery confirmation deferred to confirm_peer_delivery below.
     }
 
     if args.wait_for_sync {
-        confirm_peer_delivery(&session, "delete").await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
 

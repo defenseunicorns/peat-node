@@ -16,8 +16,7 @@ use std::path::PathBuf;
 
 use crate::cli::query::parse_target;
 use crate::cli::writes::{
-    apply_proto3_defaults, apply_sets, confirm_peer_delivery, read_from, validate_against_schema,
-    POST_WRITE_SYNC_WAIT,
+    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
 };
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -172,7 +171,6 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
         {
             tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
         }
-        confirm_peer_delivery(&session, "update").await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
 
