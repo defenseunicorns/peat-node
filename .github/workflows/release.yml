@@ -188,9 +188,6 @@ jobs:
           - label: linux-aarch64
             os: ubuntu-24.04-arm
             archive: tar.gz
-          - label: macos-x86_64
-            os: macos-13
-            archive: tar.gz
           - label: macos-aarch64
             os: macos-14
             archive: tar.gz

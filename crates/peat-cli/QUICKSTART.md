@@ -12,7 +12,23 @@ A 5-minute walkthrough from zero to reading/writing documents on a Peat mesh. St
 | 2 | A credential bundle YAML | Identifies you to the mesh |
 | 3 | A reachable peer | Something for the CLI to sync with — can be a local `peat-node`, a compose example, or a remote cluster |
 
-For (1), `cargo install --path crates/peat-cli` from this repo, or grab a release binary for your platform.
+For (1), grab the pre-built binary for your platform from the [GitHub Releases page](https://github.com/defenseunicorns/peat-node/releases). Each release attaches archives for:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `peat-<version>-linux-x86_64.tar.gz` |
+| Linux aarch64 | `peat-<version>-linux-aarch64.tar.gz` |
+| macOS aarch64 (Apple Silicon) | `peat-<version>-macos-aarch64.tar.gz` |
+| Windows x86_64 | `peat-<version>-windows-x86_64.zip` |
+
+Each archive contains the `peat` binary, `README.md`, and `LICENSE`. Extract and place the binary somewhere on your `PATH`.
+
+**Build from source** (if you need an unreleased version or a platform not listed above): you'll need a recent stable Rust toolchain — install via [rustup](https://rustup.rs) if you don't have one. Then from the root of this repo:
+
+```sh
+cargo install --path crates/peat-cli
+# installs to ~/.cargo/bin/peat
+```
 
 For (3), if you don't already have a `peat-node` to talk to, the fastest path is the compose example at [`examples/compose/`](../../examples/compose/) — `docker compose up -d && ./bootstrap.sh` boots two sidecars on a single host in about 30 seconds. The rest of this guide assumes that's running.
 
@@ -72,16 +88,27 @@ Bundle shape:
 app_id: <your-formation-id>
 
 # Required. 32-byte shared key, base64-encoded. Must match peers.
-# Test value below; generate a real one with `openssl rand -base64 32`.
+# Generate a real one with `openssl rand -base64 32`.
 shared_key: <base64-32-bytes>
 
-# Required. List of peers to dial. Each entry is `<endpoint-id>@<host>:<port>`
-# where the host:port is the peer's Iroh UDP socket.
+# Optional. Explicit peers to dial in `<endpoint-id>@<host>:<port>` form,
+# where host:port is the peer's Iroh UDP socket. Omit entirely if peers
+# are discoverable via mDNS — the CLI will find them automatically.
 peers:
   - <endpoint-id>@<host>:<udp-port>
 ```
 
-> File-permission discipline (ADR-006): `peat` refuses to read a bundle that is world- or group-readable. `chmod 600` is the path forward.
+> **Default location:** `peat` looks for credentials in this order:
+> 1. `--creds <PATH>` flag
+> 2. `PEAT_CREDS` environment variable (path to the YAML file)
+> 3. Platform config dir — checked in order, first match wins:
+>    - `$XDG_CONFIG_HOME/peat/credentials.yaml` (if `$XDG_CONFIG_HOME` is set)
+>    - `~/Library/Application Support/peat/credentials.yaml` (macOS native)
+>    - `~/.config/peat/credentials.yaml` (Linux default; also checked on macOS as a fallback)
+>
+> Place the file at the platform default and you won't need to pass `--creds` on every invocation.
+
+> **File-permission discipline (ADR-006):** `peat` refuses to read a bundle that is world- or group-readable. `chmod 600` is the path forward.
 
 ### Concrete: drive the compose example from inside the container
 
