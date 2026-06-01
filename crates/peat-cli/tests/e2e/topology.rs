@@ -44,6 +44,15 @@ pub struct TestPeer {
     pub formation_key_b64: String,
     pub app_id: String,
     _data_dir: TempDir,
+    // Background tasks spawned by start(). Aborted on drop so they don't
+    // accumulate across test runs and starve the tokio runtime.
+    _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for TestPeer {
+    fn drop(&mut self) {
+        self.abort_tasks();
+    }
 }
 
 impl TestPeer {
@@ -94,8 +103,10 @@ impl TestPeer {
         // second CLI subprocess subscribed via `peat observe`. Without
         // (2) a CLI that joins AFTER docs are seeded sees an empty
         // store.
-        Self::spawn_transitive_gossip_pusher(&backend);
-        Self::spawn_on_connect_catchup(&backend);
+        let tasks = vec![
+            Self::spawn_transitive_gossip_pusher(&backend),
+            Self::spawn_on_connect_catchup(&backend),
+        ];
 
         Self {
             backend,
@@ -104,10 +115,13 @@ impl TestPeer {
             formation_key_b64,
             app_id,
             _data_dir: dir,
+            _tasks: tasks,
         }
     }
 
-    fn spawn_transitive_gossip_pusher(backend: &Arc<AutomergeBackend>) {
+    fn spawn_transitive_gossip_pusher(
+        backend: &Arc<AutomergeBackend>,
+    ) -> tokio::task::JoinHandle<()> {
         let mut rx = backend.store().subscribe_to_changes_with_origin();
         let coord = Arc::clone(backend.coordinator());
         let backend = Arc::clone(backend);
@@ -159,10 +173,10 @@ impl TestPeer {
                     }
                 }
             }
-        });
+        })
     }
 
-    fn spawn_on_connect_catchup(backend: &Arc<AutomergeBackend>) {
+    fn spawn_on_connect_catchup(backend: &Arc<AutomergeBackend>) -> tokio::task::JoinHandle<()> {
         let backend = Arc::clone(backend);
         tokio::spawn(async move {
             let mut seen: HashSet<iroh::EndpointId> = HashSet::new();
@@ -178,7 +192,18 @@ impl TestPeer {
                 seen = current;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-        });
+        })
+    }
+
+    /// Signal all background tasks to cancel. Cancellation is asynchronous —
+    /// tasks may still be running briefly after this returns.
+    ///
+    /// Called automatically on Drop, but can be called early to release
+    /// resources before the TestPeer variable goes out of scope.
+    pub fn abort_tasks(&self) {
+        for task in &self._tasks {
+            task.abort();
+        }
     }
 
     /// Write a credentials YAML that points the spawned CLI back at this

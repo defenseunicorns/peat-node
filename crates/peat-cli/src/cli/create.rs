@@ -127,18 +127,8 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
 
     if args.wait_for_sync {
-        // Push the doc to every connected peer inline on the main
-        // task, not via the spawned on-change-pusher. The pusher
-        // *does* race the write, but its `sync_document_with_all_peers`
-        // future is owned by a background tokio task — if the main
-        // task exits before that future resolves, the runtime drops
-        // the task mid-send and the doc never reaches the wire.
-        //
-        // Awaiting inline guarantees the QUIC send completes (or
-        // fails loudly) before the CLI exits. The POST_WRITE_SYNC_WAIT
-        // sleep below then gives the receive-side a brief settle
-        // window — the peer has the bytes, just need to apply +
-        // observer-emit before subsequent reads see them.
+        // Push inline on the main task so the on-change-pusher background
+        // task cannot race the CLI exit and drop mid-send.
         if let Err(e) = session
             .backend()
             .coordinator()
