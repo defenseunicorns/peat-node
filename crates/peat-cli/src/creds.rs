@@ -4,7 +4,14 @@
 //! order:
 //!   1. `--creds <PATH>` argument
 //!   2. `PEAT_CREDS` environment variable (path to the YAML file)
-//!   3. `$XDG_CONFIG_HOME/peat/credentials.yaml` (platform default)
+//!   3. `$XDG_CONFIG_HOME/peat/credentials.yaml` (if `$XDG_CONFIG_HOME` is set)
+//!   4. Platform-native config dir (macOS: `~/Library/Application Support`,
+//!      Linux: `~/.config` respecting `$XDG_CONFIG_HOME`)
+//!   5. `~/.config/peat/credentials.yaml` (XDG fallback; useful on macOS)
+//!
+//! Steps 3–5 are tried in order; the first path that exists on disk wins.
+//! If none exist, step 4 (platform-native) is used as the reported default
+//! so error messages point somewhere sensible.
 //!
 //! The on-disk schema is intentionally narrow today — it mirrors the fields of
 //! `peat-node`'s `SidecarConfig` that are relevant to mesh participation. The
@@ -95,15 +102,57 @@ pub fn resolve_path(explicit: Option<&Path>) -> Result<PathBuf, CliError> {
     // we re-check here so direct callers (tests, future internal use) follow
     // the same chain without depending on clap.
     let env = std::env::var("PEAT_CREDS").ok();
-    resolve_path_with(explicit, env.as_deref(), dirs::config_dir())
+    resolve_path_with(explicit, env.as_deref(), &config_candidates())
+}
+
+/// Build the ordered list of candidate credential paths for the platform.
+///
+/// On macOS this includes both the native `~/Library/Application Support` path
+/// and the XDG `~/.config` fallback so that users coming from a Linux
+/// background can place the file at the familiar location.
+fn config_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Explicit XDG override — honoured on all platforms.
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        candidates.push(xdg.join("peat").join("credentials.yaml"));
+    }
+
+    // Platform-native default (macOS: ~/Library/Application Support;
+    // Linux: ~/.config, already respecting $XDG_CONFIG_HOME via dirs).
+    if let Some(dir) = dirs::config_dir() {
+        let p = dir.join("peat").join("credentials.yaml");
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+
+    // XDG ~/.config fallback — only meaningful on macOS where dirs::config_dir
+    // returns ~/Library/Application Support instead.
+    if let Some(home) = dirs::home_dir() {
+        let p = home.join(".config").join("peat").join("credentials.yaml");
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+
+    candidates
 }
 
 /// Pure resolution helper. Tests drive this directly so they never have to
 /// mutate process-global state.
+///
+/// Walks `candidates` and returns the first path that exists on disk.
+/// If none exist, returns the first candidate (the platform-preferred default)
+/// so that the caller's error message points somewhere sensible.
+/// Returns `Err` only when the candidates list is empty.
 fn resolve_path_with(
     explicit: Option<&Path>,
     env: Option<&str>,
-    config_dir: Option<PathBuf>,
+    candidates: &[PathBuf],
 ) -> Result<PathBuf, CliError> {
     if let Some(p) = explicit {
         return Ok(p.to_path_buf());
@@ -111,8 +160,13 @@ fn resolve_path_with(
     if let Some(env) = env.filter(|s| !s.is_empty()) {
         return Ok(PathBuf::from(env));
     }
-    if let Some(dir) = config_dir {
-        return Ok(dir.join("peat").join("credentials.yaml"));
+    if let Some(first) = candidates.first() {
+        for candidate in candidates {
+            if candidate.exists() {
+                return Ok(candidate.clone());
+            }
+        }
+        return Ok(first.clone());
     }
     Err(CliError::Auth(
         "no credentials path resolved — pass --creds, set PEAT_CREDS, or place a file at the platform config dir".into(),
@@ -178,8 +232,11 @@ not_a_field: oops
         assert!(parse("shared_key: only").is_err());
     }
 
-    fn fake_config_dir() -> Option<PathBuf> {
-        Some(PathBuf::from("/fake/config"))
+    fn fake_candidates() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/fake/config/peat/credentials.yaml"),
+            PathBuf::from("/fake/fallback/peat/credentials.yaml"),
+        ]
     }
 
     #[test]
@@ -188,7 +245,7 @@ not_a_field: oops
         let resolved = resolve_path_with(
             Some(&explicit),
             Some("/should/not/be/used"),
-            fake_config_dir(),
+            &fake_candidates(),
         )
         .unwrap();
         assert_eq!(resolved, explicit);
@@ -196,24 +253,38 @@ not_a_field: oops
 
     #[test]
     fn env_used_when_no_explicit() {
-        let resolved = resolve_path_with(None, Some("/env/path"), fake_config_dir()).unwrap();
+        let resolved = resolve_path_with(None, Some("/env/path"), &fake_candidates()).unwrap();
         assert_eq!(resolved, PathBuf::from("/env/path"));
     }
 
     #[test]
-    fn empty_env_falls_through_to_config_dir() {
-        let resolved = resolve_path_with(None, Some(""), fake_config_dir()).unwrap();
+    fn empty_env_falls_through_to_first_candidate() {
+        let resolved = resolve_path_with(None, Some(""), &fake_candidates()).unwrap();
+        // Neither fake path exists on disk, so the first candidate is returned.
         assert_eq!(
             resolved,
-            PathBuf::from("/fake/config")
-                .join("peat")
-                .join("credentials.yaml")
+            PathBuf::from("/fake/config/peat/credentials.yaml")
         );
     }
 
     #[test]
+    fn second_candidate_used_when_first_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("peat").join("credentials.yaml");
+        std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+        std::fs::write(&present, "app_id: x\nshared_key: y\n").unwrap();
+
+        let candidates = vec![
+            PathBuf::from("/does/not/exist/peat/credentials.yaml"),
+            present.clone(),
+        ];
+        let resolved = resolve_path_with(None, None, &candidates).unwrap();
+        assert_eq!(resolved, present);
+    }
+
+    #[test]
     fn no_sources_returns_auth_error() {
-        let err = resolve_path_with(None, None, None).unwrap_err();
+        let err = resolve_path_with(None, None, &[]).unwrap_err();
         assert_eq!(err.exit_code(), 2);
     }
 
