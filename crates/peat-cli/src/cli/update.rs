@@ -10,7 +10,7 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::AutomergeStore;
+use peat_mesh::storage::{AutomergeStore, SyncTransport};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -174,8 +174,24 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
     }
 
     if args.wait_for_sync {
-        // on_change_pusher handles the sync push. Calling sync_document_with_all_peers
-        // here races with it (both clear Automerge sync state). Just wait.
+        if let Err(e) = session
+            .backend()
+            .coordinator()
+            .sync_document_with_all_peers(&key)
+            .await
+        {
+            tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+        }
+        for peer_id in session.backend().transport().connected_peers() {
+            if let Err(e) = session
+                .backend()
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
+                tracing::warn!(peer = %peer_id, "post-update sync round-trip failed: {e}");
+            }
+        }
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
         println!("{key}");
         session.close().await;

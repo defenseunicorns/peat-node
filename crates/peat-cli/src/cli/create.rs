@@ -3,6 +3,7 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::json_to_automerge;
+use peat_mesh::storage::SyncTransport;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -135,16 +136,24 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
 
     if args.wait_for_sync {
-        // `on_change_pusher` (spawned during open()) already fired
-        // `sync_document_with_all_peers` when store.put() wrote the doc.
-        // Calling it again here races with that push — both call
-        // `clear_sync_state_for_document` which resets the Automerge
-        // sync state mid-exchange and breaks delivery.
-        //
-        // Instead, just wait for the on_change_pusher + full Automerge
-        // sync exchange (3 round-trips, < 30ms on loopback) to finish.
-        // close() adds an extra window after the sleep so any final
-        // writer-task drains complete before the tokio runtime exits.
+        if let Err(e) = session
+            .backend()
+            .coordinator()
+            .sync_document_with_all_peers(&key)
+            .await
+        {
+            tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+        }
+        for peer_id in session.backend().transport().connected_peers() {
+            if let Err(e) = session
+                .backend()
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
+                tracing::warn!(peer = %peer_id, "post-create sync round-trip failed: {e}");
+            }
+        }
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
         println!("{key}");
         session.close().await;
