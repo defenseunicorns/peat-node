@@ -938,6 +938,7 @@ async fn lifecycle_cell_state_registered_type() {
 
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
+#[ignore = "requires loopback multicast; fails in containerised CI — run with --ignored on bare metal"]
 async fn mdns_observe_sees_create_without_explicit_peers() {
     // Two standalone peat processes — no TestPeer, no `peers:` in creds.
     // Observe must receive the capability document that create writes.
