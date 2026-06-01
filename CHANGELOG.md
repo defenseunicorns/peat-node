@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-01
+
+Picks up **peat-mesh v0.9.0-rc.30** ([peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205)/[#206](https://github.com/defenseunicorns/peat-mesh/pull/206)) — the release that makes `peat-cli` actually work end-to-end against an established sidecar over an airgapped network. Also ships the two automated walkthrough gates (`Quickstart Path A (compose)` + a new `Cross-cluster sync` Test 6) that pin the QUICKSTART documentation to verifiable behavior.
+
 ### Added
 
+- **QUICKSTART walkthroughs.** Root [`QUICKSTART.md`](QUICKSTART.md) covers standing up `peat-node` itself via Docker Compose (Path A, ~3 min) or Helm + k3d (Path B, ~10 min); [`crates/peat-cli/QUICKSTART.md`](crates/peat-cli/QUICKSTART.md) walks operators through every `peat` subcommand against the compose example. Both gated by automated CI tests so doc claims stay honest.
+- **Two new CI gates.** [`test/quickstart-compose.sh`](test/quickstart-compose.sh) (`.github/workflows/quickstart.yml`) runs the full Path A walkthrough on every push — schema discovery, creds bootstrap, mesh-touching `query`, CRUD via `create`/`update`/`delete`, and `observe` streaming. [`test/cross-cluster-sync.sh`](test/cross-cluster-sync.sh) Test 6 exercises the in-pod CLI workflow from QUICKSTART Path B (`kubectl exec deploy/peat-peat-node -- peat …`) against a real Helm-deployed k3d cluster.
 - **`peat` operator CLI — Phase 2–6 build-out** ([peat-node ADR-001](docs/peat-node-adr-001-peat-cli.md), PR [#107](https://github.com/defenseunicorns/peat-node/pull/107)). 0.3.6 shipped the Phase 1 scaffolding (workspace conversion + skeleton via [peat-node#103](https://github.com/defenseunicorns/peat-node/pull/103)); this PR wires all subcommand handlers to the live mesh:
   - **Read commands:** `peat query <COLLECTION>[/<DOC_ID>]` (materialised current state then exit) and `peat observe <COLLECTION>[/<DOC_ID>]` (stream changes until SIGINT).
   - **Write commands:** `peat create`, `peat update --set` (upsert per ADR-021), and `peat delete` (tombstone per ADR-034). `peat update --from` is gated on [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) and returns `NotImplemented` until that lands.
@@ -19,16 +25,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Optional pre-commit hook** at `.githooks/pre-commit` runs `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` when Rust files are staged. Enable per-clone with `git config core.hooksPath .githooks`.
 - **Cross-platform CI matrix.** `.github/workflows/ci.yaml` adds a `cross-platform` job covering macOS aarch64 (workspace build + `peat-cli` tests) and Windows x86_64 (`peat-cli` build). Closes the "Windows in Constraints but not in CI gates" ADR-001 review finding.
 
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.30"`** (was `rc.27` in 0.3.6). Spans rc.28 / rc.29 / rc.30:
+  - rc.28 ([peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187)/[#192](https://github.com/defenseunicorns/peat-mesh/issues/192)/[#195](https://github.com/defenseunicorns/peat-mesh/pull/195)/[#196](https://github.com/defenseunicorns/peat-mesh/pull/196)) — `AutomergeStore::diff` / `apply_delta` + `AutomergeDelta` (unblocks `peat update --from`); `AutomergeBackend::{next_lamport, current_lamport, observe_lamport}` node-local Lamport clock + persistence + receive-side wire-up (replaces peat-cli's wall-clock workaround in `peat delete`).
+  - rc.29 ([peat-mesh#202](https://github.com/defenseunicorns/peat-mesh/issues/202)) — `AutomergeStore::delete` now fires `observer_tx`, satisfying the CDC contract documented on `subscribe_to_observer_changes` ("fires for ALL document changes"). `peat observe` now sees remote tombstone arrivals.
+  - rc.30 ([peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205)/[#206](https://github.com/defenseunicorns/peat-mesh/pull/206)) — two coordinated fixes that take peat-cli from "authenticates but pulls zero docs" to fully functional. Connect side: `connect_and_authenticate_with_addr(EndpointAddr)` skips the `AddressLookupServices` chain when the caller has a fully-populated address (airgapped consumers no longer time out on `DnsAddressLookup`). Accept side: `SyncProtocolHandler::accept` now spawns `sync_all_documents_with_peer` after registering inbound connections, so empty-store peers pull state on connect.
+- **`sync_on_change` fans out sync-received writes.** `src/node.rs` switched from `subscribe_to_changes()` (local-only) to `subscribe_to_changes_with_origin()` so peat-node-b relays a doc it received from peer A to peer C, with echo-suppression against the source. Needed for the A→B→C gossip chain the new `peat observe` walkthrough exercises ([peat-mesh#891](https://github.com/defenseunicorns/peat-mesh/issues/891)/[#907](https://github.com/defenseunicorns/peat-mesh/issues/907) contract).
+- **`GetDocument` tolerates two doc shapes.** `src/node.rs` accepts both `{"value": "<json-string>"}` (the `PutDocument` (gRPC) wire shape, with optional at-rest encryption) AND the structural Automerge shape peat-cli's `create --set` writes (`{"name": "alice"}`). Single API entry point regardless of which writer produced the record.
+- **`render_query` keys output for `--all-collections` and collection scopes.** Was dropping the `collection:id` key on single-doc results, which broke `jq '.["hello:world"]'` against `--all-collections` whenever the result happened to be one doc. Bare rendering reserved for explicit-doc-id queries (`query contacts/alice`).
+- **CI test job split.** `cargo test --workspace --exclude peat-cli` runs alongside the rest of the workspace in parallel; `cargo test -p peat-cli` runs in its own step to isolate the e2e binary's multi-process scenarios from cross-binary CPU contention on 2-core Linux runners. Mirrors the existing macOS isolation in the `Cross-platform` job.
+
 ### Upstream landed
 
 - **[peat#940](https://github.com/defenseunicorns/peat/issues/940)** — operator credential bundle file format formalised in ADR-006 (via [peat#944](https://github.com/defenseunicorns/peat/pull/944)). `peat-cli`'s `crates/peat-cli/src/creds.rs` shape (`app_id` + `shared_key` + optional `peers`) is now the canonical bundle; file-system custody normative requirements (mode 0600, refuse on world/group-readable).
 
+### Resolved upstream
+
+- **[peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187)** — Automerge delta API. Landed in rc.28; `peat update --from` now uses the delta path instead of returning `NotImplemented`.
+- **[peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192)** — Lamport-clock source. Landed in rc.28; `peat delete` uses `AutomergeBackend::next_lamport` instead of a wall-clock proxy.
+- **[peat-mesh#202](https://github.com/defenseunicorns/peat-mesh/issues/202)** — `AutomergeStore::delete` fires `observer_tx`. Landed in rc.29; `peat observe` now sees remote tombstones.
+- **[peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205)** + **[#206](https://github.com/defenseunicorns/peat-mesh/pull/206)** — connect-side `AddressLookupServices` chain bypass + accept-side push of existing docs. Landed in rc.30; peat-cli now fully works against an established sidecar.
+
 ### Open upstream tracking
 
 - [peat#941](https://github.com/defenseunicorns/peat/issues/941) — authorization model. **Deferred** pending ADR-006 Layer 1 device identity. `peat-cli`'s "exit 3 before content parse" path stays as scaffolding for the future design; today's access boundary is formation-key custody.
-- [peat-mesh#187](https://github.com/defenseunicorns/peat-mesh/issues/187) — Automerge delta API. Blocks `peat update --from`.
-- [peat-mesh#192](https://github.com/defenseunicorns/peat-mesh/issues/192) — Lamport-clock source. `peat delete` uses wall-clock proxy until this lands.
 - [peat#946](https://github.com/defenseunicorns/peat/issues/946) — peat-schema runtime type metadata registry. Blocks typed renderer dispatch + schema-validated writes (filed P0).
+- "Real ack" for peat-cli's `--wait-for-sync`. Current implementation is a fixed 750 ms post-write sleep (`POST_WRITE_SYNC_WAIT` in `crates/peat-cli/src/cli/writes.rs`); QA review flags this as a misleading doc claim. Tracked for a follow-up once peat-mesh surfaces a per-write "acknowledged by N peers" signal.
 
 ## [0.3.6] - 2026-05-28
 
