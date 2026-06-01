@@ -134,6 +134,16 @@ const SCENARIO_TIMEOUT: Duration = Duration::from_secs(30);
 /// subprocess wall time, not test polling).
 const POLL_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Settle window after spawning an observer subprocess and before the
+/// second subprocess fires its write. The observer needs to: complete
+/// its join handshake, register its subscription on the peer's
+/// `subscribe_to_observer_changes` broadcast, AND drain its initial
+/// state from the peer. Only after all three steps is the observer
+/// guaranteed to see the upcoming write — and the CLI's 1 s
+/// `POST_JOIN_SETTLE` (join.rs) is the floor for just the first two.
+/// 2 s was enough locally; CI runner contention pushes it past that.
+const OBSERVER_SUBSCRIBE_SETTLE: Duration = Duration::from_secs(5);
+
 #[tokio::test]
 #[serial_test::serial(peat_cli_two_party)]
 async fn query_returns_doc_written_on_peer() {
@@ -500,7 +510,7 @@ async fn observe_subprocess_streams_create_from_second_subprocess() {
     // moment to complete before the writer subprocess starts. Without
     // this, the writer races the subscribe and the observer can miss
     // the event.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(OBSERVER_SUBSCRIBE_SETTLE).await;
 
     run_peat(
         &creds,
@@ -516,7 +526,7 @@ async fn observe_subprocess_streams_create_from_second_subprocess() {
     )
     .await;
 
-    topology::await_stdout_contains(&mut observer, "c-bridge", Duration::from_secs(15)).await;
+    topology::await_stdout_contains(&mut observer, "c-bridge", POLL_DEADLINE).await;
     // observer is killed on Drop (kill_on_drop=true).
 }
 
@@ -608,13 +618,12 @@ async fn observe_subprocess_streams_delete_from_second_subprocess() {
 
     // Let the observer's join handshake + subscription settle before
     // the delete fires, otherwise the delete races the subscribe.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(OBSERVER_SUBSCRIBE_SETTLE).await;
 
     run_peat(&creds, &["delete", "contacts/c-tomb", "--wait-for-sync"]).await;
 
     let seen =
-        topology::await_stdout_contains(&mut observer, "\"deleted\":true", Duration::from_secs(15))
-            .await;
+        topology::await_stdout_contains(&mut observer, "\"deleted\":true", POLL_DEADLINE).await;
     assert!(
         seen.contains("contacts:c-tomb"),
         "expected tombstone for c-tomb in observer stdout; saw:\n{seen}"
@@ -850,7 +859,7 @@ async fn observe_all_collections_streams_events_from_every_collection() {
 
     // Allow the observer's join handshake + subscription to settle
     // before the writers fire.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(OBSERVER_SUBSCRIBE_SETTLE).await;
 
     run_peat(
         &creds,
@@ -882,8 +891,7 @@ async fn observe_all_collections_streams_events_from_every_collection() {
     // Observer must see BOTH collections in its stdout — the
     // `--all-collections` flag turns off the prefix filter so every
     // event reaches the renderer.
-    let seen =
-        topology::await_stdout_contains(&mut observer, "things:t-2", Duration::from_secs(20)).await;
+    let seen = topology::await_stdout_contains(&mut observer, "things:t-2", POLL_DEADLINE).await;
     assert!(
         seen.contains("contacts:c-2"),
         "expected contacts event in observer stdout; saw:\n{seen}"
