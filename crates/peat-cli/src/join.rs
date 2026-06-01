@@ -228,18 +228,23 @@ impl MeshSession {
 
     /// Gracefully shut down the QUIC connection before the session drops.
     ///
-    /// `shutdown_and_release` sends iroh's CONNECTION_CLOSE to all peers and
-    /// waits for their acknowledgement, guaranteeing that all data written to
-    /// the QUIC send buffer during this session has been delivered before the
-    /// process exits. Without this, the tokio runtime exit sends a QUIC RST
-    /// instead of a graceful close, potentially discarding in-flight writes.
+    /// Calls `blob_store().shutdown()` which invokes iroh's
+    /// `Router::shutdown()` directly — sending CONNECTION_CLOSE to all peers
+    /// and waiting for the router's tasks to join. This ensures all data
+    /// written to the QUIC send buffer has been delivered before the process
+    /// exits.
+    ///
+    /// Deliberately avoids `shutdown_and_release()` because that first calls
+    /// `stop_sync()` which aborts the internal sync task. That task drives the
+    /// QUIC send side, so aborting it before the router closes can discard
+    /// in-flight writes (exactly the failure we're trying to prevent).
     ///
     /// Call this inside a `--wait-for-sync` block after all sync operations
     /// are complete. Commands that don't use `--wait-for-sync` can drop the
     /// session normally (fire-and-forget contract).
     pub async fn close(self) {
-        if let Err(e) = self.backend.shutdown_and_release().await {
-            tracing::warn!("session close: graceful shutdown failed: {e}");
+        if let Err(e) = self.backend.blob_store().shutdown().await {
+            tracing::warn!("session close: graceful QUIC shutdown failed: {e}");
         }
     }
 }
