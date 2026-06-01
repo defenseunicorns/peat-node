@@ -28,6 +28,11 @@
 //! ```yaml
 //! app_id: my-app
 //! shared_key: <base64-formation-key>
+//! # Optional: persist the local Automerge store across invocations.
+//! # Without this the CLI uses a TempDir that is deleted on exit, so
+//! # documents only survive if they sync to a connected peer.
+//! # ~/  prefix is expanded to the user's home directory.
+//! data_dir: ~/.local/share/peat/my-app
 //! # Optional initial peers in `endpoint_id@host:port` form.
 //! peers:
 //!   - <endpoint_id>@10.0.0.5:4242
@@ -55,6 +60,10 @@ pub struct PeatCredentials {
     pub shared_key: String,
     #[serde(default)]
     pub peers: Vec<String>,
+    /// Optional persistent store directory. `~/` prefix is expanded to the
+    /// user's home directory. If absent the CLI uses a TempDir per invocation.
+    #[serde(default)]
+    pub data_dir: Option<String>,
     #[serde(default)]
     pub encryption_key: Option<String>,
 }
@@ -175,6 +184,22 @@ fn resolve_path_with(
 
 fn parse(raw: &str) -> Result<PeatCredentials, serde_yaml::Error> {
     serde_yaml::from_str(raw)
+}
+
+/// Expand a `data_dir` string from the credential bundle into a `PathBuf`.
+///
+/// A leading `~/` is replaced with the user's home directory. All other paths
+/// are returned as-is (relative paths are accepted; callers resolve them
+/// against the process working directory).
+pub fn expand_data_dir(raw: &str) -> Result<PathBuf, CliError> {
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        let home = dirs::home_dir().ok_or_else(|| {
+            CliError::Auth("cannot expand `~/` in data_dir: home directory unknown".into())
+        })?;
+        Ok(home.join(suffix))
+    } else {
+        Ok(PathBuf::from(raw))
+    }
 }
 
 #[cfg(test)]
@@ -317,5 +342,48 @@ not_a_field: oops
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("encryption_key"));
         assert!(err.to_string().contains("peat#940"));
+    }
+
+    // --- expand_data_dir tests ---
+
+    #[test]
+    fn expand_data_dir_absolute_passthrough() {
+        let p = expand_data_dir("/tmp/peat/myapp").unwrap();
+        assert_eq!(p, PathBuf::from("/tmp/peat/myapp"));
+    }
+
+    #[test]
+    fn expand_data_dir_relative_passthrough() {
+        let p = expand_data_dir("relative/path").unwrap();
+        assert_eq!(p, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn expand_data_dir_tilde_slash_expands() {
+        // Only test that `~/` is expanded; exact home dir is env-dependent.
+        let p = expand_data_dir("~/peat/myapp").unwrap();
+        let home = dirs::home_dir().expect("home dir required for this test");
+        assert_eq!(p, home.join("peat/myapp"));
+        assert!(p.is_absolute(), "expanded path must be absolute");
+    }
+
+    #[test]
+    fn expand_data_dir_tilde_alone_is_absolute() {
+        // "~" with no trailing slash is treated as a literal path segment, not
+        // home expansion — only `~/` prefix is special.
+        let p = expand_data_dir("~").unwrap();
+        assert_eq!(p, PathBuf::from("~"));
+    }
+
+    #[test]
+    fn parses_data_dir_field() {
+        let creds = parse("app_id: x\nshared_key: y\ndata_dir: /tmp/peat\n").unwrap();
+        assert_eq!(creds.data_dir.as_deref(), Some("/tmp/peat"));
+    }
+
+    #[test]
+    fn data_dir_defaults_to_none() {
+        let creds = parse("app_id: x\nshared_key: y\n").unwrap();
+        assert!(creds.data_dir.is_none());
     }
 }

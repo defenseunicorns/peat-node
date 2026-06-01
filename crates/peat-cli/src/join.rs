@@ -6,12 +6,14 @@
 //! `Arc<AutomergeBackend>` so subcommands can pass the session around
 //! cheaply.
 //!
-//! Lifecycle: `MeshSession` owns an ephemeral `TempDir` that backs the
-//! Automerge store on disk. Dropping the session drops the tempdir, which
-//! cleans up after the CLI invocation. The CLI is a short-lived
-//! "observer" node (ADR-001 §"Node posture per command"); no persistent
-//! state survives.
+//! Lifecycle: `MeshSession` owns the data directory its Automerge store lives
+//! in. When a persistent `data_dir` is provided (via `--data-dir` flag or the
+//! credentials bundle), the directory is left on disk after the CLI exits so
+//! the next invocation can resume from the same state. Without a `data_dir`
+//! the session falls back to a `TempDir` that is cleaned up on drop — documents
+//! only survive if they sync to a connected peer before exit.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +22,7 @@ use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use tempfile::TempDir;
 
 use crate::cli::CliError;
-use crate::creds::PeatCredentials;
+use crate::creds::{expand_data_dir, PeatCredentials};
 
 /// Options derived from the parsed `CommonArgs` that affect how the join
 /// prelude runs.
@@ -31,6 +33,9 @@ pub struct SessionOptions {
     pub timeout: Duration,
     /// Caller-supplied identity. `None` → ephemeral UUID.
     pub as_id: Option<String>,
+    /// Persist the Automerge store here. `None` → ephemeral TempDir.
+    /// Overrides `data_dir` in the credentials bundle when both are set.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for SessionOptions {
@@ -38,6 +43,23 @@ impl Default for SessionOptions {
         Self {
             timeout: Duration::from_secs(10),
             as_id: None,
+            data_dir: None,
+        }
+    }
+}
+
+/// Backing store for a `MeshSession` — either a self-cleaning `TempDir` or a
+/// caller-supplied persistent path.
+enum DataDir {
+    Ephemeral(TempDir),
+    Persistent(PathBuf),
+}
+
+impl DataDir {
+    fn path(&self) -> &Path {
+        match self {
+            DataDir::Ephemeral(d) => d.path(),
+            DataDir::Persistent(p) => p.as_path(),
         }
     }
 }
@@ -48,13 +70,13 @@ impl Default for SessionOptions {
 /// need more (and individual read commands poll on top — see query.rs).
 const POST_JOIN_SETTLE: Duration = Duration::from_millis(1000);
 
-/// A live mesh participant. Holds the backend plus the tempdir its store
-/// lives in so cleanup is RAII.
+/// A live mesh participant. Holds the backend and the directory its store
+/// lives in. Dropping a persistent session leaves the directory intact;
+/// dropping an ephemeral session removes it.
 pub struct MeshSession {
     backend: Arc<AutomergeBackend>,
     node_id: String,
-    // RAII: dropping this removes the on-disk store.
-    _data_dir: TempDir,
+    _data_dir: DataDir,
 }
 
 impl MeshSession {
@@ -64,17 +86,47 @@ impl MeshSession {
     /// (or if no peers were configured — useful for read-from-self in tests).
     /// Returns `Err` if peers were configured but none could be reached.
     pub async fn open(creds: PeatCredentials, opts: SessionOptions) -> Result<Self, CliError> {
-        let node_id = opts
-            .as_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Resolve data dir: CLI flag > creds bundle > ephemeral TempDir.
+        let data_dir: DataDir = if let Some(p) = opts.data_dir.clone() {
+            create_private_dir(&p)?;
+            DataDir::Persistent(p)
+        } else if let Some(raw) = &creds.data_dir {
+            let p = expand_data_dir(raw)?;
+            create_private_dir(&p)?;
+            DataDir::Persistent(p)
+        } else {
+            DataDir::Ephemeral(tempfile::tempdir().map_err(|e| {
+                CliError::Generic(format!("could not create ephemeral data dir: {e}"))
+            })?)
+        };
 
-        let data_dir = tempfile::tempdir()
-            .map_err(|e| CliError::Generic(format!("could not create ephemeral data dir: {e}")))?;
+        // Stable actor identity for persistent stores: derive from
+        // `data_dir/identity` so the same actor ID is reused across
+        // invocations. With an ephemeral store a fresh UUID is fine because
+        // the store is thrown away on exit anyway.
+        // Automerge actors accumulate per-actor change history; reusing the
+        // same actor across invocations keeps the Automerge document lean.
+        let node_id = opts.as_id.clone().unwrap_or_else(|| {
+            if let DataDir::Persistent(p) = &data_dir {
+                let id_file = p.join("identity");
+                if let Ok(id) = std::fs::read_to_string(&id_file) {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() {
+                        return id;
+                    }
+                }
+                let fresh = uuid::Uuid::new_v4().to_string();
+                let _ = std::fs::write(&id_file, &fresh);
+                fresh
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            }
+        });
 
         tracing::debug!(
             node_id = %node_id,
             data_dir = %data_dir.path().display(),
+            persistent = matches!(data_dir, DataDir::Persistent(_)),
             "bootstrapping peat-cli backend"
         );
 
@@ -173,6 +225,36 @@ impl MeshSession {
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
+}
+
+/// Create `path` (and any parents) with restricted permissions.
+///
+/// On Unix the leaf directory is created with mode `0700` so the local
+/// Automerge store is not world-readable on shared hosts. On other platforms
+/// `create_dir_all` is used without further restriction.
+fn create_private_dir(path: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Create parents with default permissions, then the leaf with 0700.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+            })?;
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+            })?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(path).map_err(|e| {
+        CliError::Generic(format!("could not create data_dir {}: {e}", path.display()))
+    })?;
+    Ok(())
 }
 
 /// Split an `endpoint_id@host:port` spec into its two parts and parse the
