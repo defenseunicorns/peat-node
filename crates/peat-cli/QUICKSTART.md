@@ -10,7 +10,7 @@ A 5-minute walkthrough from zero to reading/writing documents on a Peat mesh. St
 |---|---|---|
 | 1 | The `peat` binary | The CLI itself |
 | 2 | A credential bundle YAML | Identifies you to the mesh |
-| 3 | A reachable peer | Something for the CLI to sync with — can be a local `peat-node`, a compose example, or a remote cluster |
+| 3 | A reachable peer | Something for the CLI to sync with — can be a local `peat-node`, a compose example, another `peat` process on the same host (via mDNS), or a remote cluster |
 
 For (1), grab the pre-built binary for your platform from the [GitHub Releases page](https://github.com/defenseunicorns/peat-node/releases). Each release attaches archives for:
 
@@ -30,7 +30,7 @@ cargo install --path crates/peat-cli
 # installs to ~/.cargo/bin/peat
 ```
 
-For (3), if you don't already have a `peat-node` to talk to, the fastest path is the compose example at [`examples/compose/`](../../examples/compose/) — `docker compose up -d && ./bootstrap.sh` boots two sidecars on a single host in about 30 seconds. The rest of this guide assumes that's running.
+For (3), if you don't already have a `peat-node` to talk to, the fastest path is the compose example at [`examples/compose/`](../../examples/compose/) — `docker compose up -d && ./bootstrap.sh` boots two sidecars on a single host in about 30 seconds. Alternatively, two `peat` processes on the same host discover each other automatically via mDNS — see [Step 4](#step-4--watch-changes-live) for the two-terminal workflow. The rest of this guide assumes the compose example is running when an explicit peer is needed.
 
 ---
 
@@ -100,6 +100,10 @@ data_dir: ~/.local/share/peat/<your-formation-id>
 # are discoverable via mDNS — the CLI will find them automatically.
 peers:
   - <endpoint-id>@<host>:<udp-port>
+
+# Optional. Disable mDNS peer discovery (needed in containers where
+# multicast is unavailable).
+# disable_mdns: true
 ```
 
 > **Default location:** `peat` looks for credentials in this order:
@@ -150,10 +154,14 @@ If you have your own `peat-node` running on a network the CLI can reach (UDP and
 The simplest mesh-touching command — confirms the handshake works and the local store sees existing documents.
 
 ```sh
-peat --creds ./creds.yaml query --all-collections --output json
+peat --creds ./creds.yaml query --all-collections
 ```
 
-`--all-collections` scans every collection reachable with this bundle. The first run on a fresh peer may return `{}` if the mesh is empty; that's a successful empty result, not an error.
+`--all-collections` scans every collection reachable with this bundle. The first run on a fresh peer may return `{}` if the mesh is empty; that's a successful empty result, not an error. Output defaults to JSON — pipe to `jq` directly:
+
+```sh
+peat --creds ./creds.yaml query --all-collections | jq 'keys'
+```
 
 Same shape on a specific collection:
 
@@ -171,28 +179,33 @@ peat --creds ./creds.yaml query contacts/c-1234 --output text
 
 ## Step 3 — Write a document
 
-> **Prerequisite:** by default the CLI uses an ephemeral store per invocation — documents only persist if they sync to a connected peer before the process exits. To persist the local store across invocations, pass `--data-dir <PATH>` or add `data_dir: <path>` to your credentials bundle (`~/` is expanded). Steps 2–4 still require a reachable `peat-node` peer to see documents written by other nodes.
+> **Prerequisite:** by default the CLI uses an ephemeral store per invocation — documents only persist if they sync to a connected peer before the process exits. To persist the local store across invocations, pass `--data-dir <PATH>` or add `data_dir: <path>` to your credentials bundle (`~/` is expanded). Steps 2–4 still require a reachable peer to see documents written by other nodes.
 
-`create` adds a new document. `--set path=value` builds the document from key/value pairs (works on both arbitrary JSON and peat-schema-registered types).
+`create` adds a new document. The target is `<COLLECTION>/<DOC_ID>` — the same slash syntax used by `update`, `query`, and `delete`. `--set path=value` builds the document from key/value pairs (works on both arbitrary JSON and peat-schema-registered types).
 
 Arbitrary JSON (any collection name you make up):
 
 ```sh
-peat --creds ./creds.yaml create contacts \
-  --id alice \
+peat --creds ./creds.yaml create contacts/alice \
   --set name=alice \
   --set rank=1 \
   --wait-for-sync
 ```
 
-Schema-registered type (peat-schema validates the result):
+Schema-registered type (peat-schema validates the result). The `id` field is auto-injected from the doc_id — no need to set it separately:
 
 ```sh
-peat --creds ./creds.yaml create capabilities \
-  --id cap-thermal \
-  --set id=cap-thermal \
+peat --creds ./creds.yaml create capabilities/cap-thermal \
   --set name=thermal-sensor \
   --set confidence=0.92 \
+  --wait-for-sync
+```
+
+Omit the doc_id to have a UUID generated automatically:
+
+```sh
+peat --creds ./creds.yaml create contacts \
+  --set name=bob \
   --wait-for-sync
 ```
 
@@ -222,22 +235,45 @@ peat --creds ./creds.yaml delete capabilities/cap-thermal --wait-for-sync
 
 ## Step 4 — Watch changes live
 
-`observe` opens a subscription and streams events to stdout until you `Ctrl-C`. Default output is line-buffered ndjson — pipe it to `jq` for filtering.
+`observe` opens a subscription and streams events to stdout until you `Ctrl-C`. Output defaults to JSON — pipe to `jq` for filtering.
 
 ```sh
-peat --creds ./creds.yaml observe capabilities --output ndjson | jq .
+peat --creds ./creds.yaml observe capabilities | jq .
 ```
 
 Or across every collection at once:
 
 ```sh
-peat --creds ./creds.yaml observe --all-collections --output ndjson \
+peat --creds ./creds.yaml observe --all-collections \
   | jq 'select(.key | startswith("capabilities:"))'
 ```
 
-In a second terminal, run a `create` from step 3 — you should see the new record appear in the observer's stdout within ~1 second. Same with `delete`: the observer emits `{"key":"…","deleted":true}`.
+In a second terminal, run a `create` from step 3 — you should see the new record appear in the observer's stdout within ~1 second. Same with `delete`: the observer emits `{"key":"…","deleted":true}`. `observe` deduplicates: it only emits when the document content actually changes, so you won't see duplicate events from Automerge's internal multi-hop sync exchanges.
 
 `peat observe contacts | head -n 5` exits cleanly with status 0 after the consumer closes its end. No `broken pipe` line on stderr.
+
+### Two-terminal workflow (no explicit peer needed)
+
+With mDNS zero-config discovery, two `peat` processes on the same host with the same `app_id` and `shared_key` find each other automatically — no `peers:` list required.
+
+**Terminal A** — persistent observer:
+
+```sh
+peat --creds ./creds.yaml observe capabilities --data-dir /tmp/myapp | jq .
+```
+
+**Terminal B** — ephemeral writer (no `--data-dir` avoids the redb lock conflict):
+
+```sh
+peat --creds ./creds.yaml create capabilities/cap-thermal \
+  --set name=thermal --set confidence=0.98 --wait-for-sync
+peat --creds ./creds.yaml update capabilities/cap-thermal \
+  --set confidence=0.95 --wait-for-sync
+```
+
+Terminal A emits each change as it arrives. The two processes discover each other via mDNS (`_peat._udp.local.`) and the formation HMAC ensures only same-formation peers connect.
+
+> **Data-dir note:** `observe` holds an exclusive lock on its redb store. The writer must either use a different `--data-dir` or omit `--data-dir` entirely (ephemeral). mDNS bridges them regardless.
 
 ---
 
@@ -246,7 +282,7 @@ In a second terminal, run a `create` from step 3 — you should see the new reco
 **Round-trip-edit** — fetch a doc, edit it in `jq`, write it back as a minimal delta:
 
 ```sh
-peat --creds ./creds.yaml query capabilities/cap-thermal --output json \
+peat --creds ./creds.yaml query capabilities/cap-thermal \
   | jq '.confidence = 0.99' \
   | peat --creds ./creds.yaml update capabilities/cap-thermal --from - --wait-for-sync
 ```
@@ -256,7 +292,7 @@ The Automerge delta path preserves the doc's operation history — this is *not*
 **Dry-run a write** — validate locally without joining the mesh:
 
 ```sh
-peat create capabilities --id cap-x --set name=foo --set id=cap-x --dry-run
+peat create capabilities/cap-x --set name=foo --dry-run
 ```
 
 Prints the canonical operation JSON to stdout. Exit 0 = the write would be valid; exit 4 = schema validation failed (e.g. missing required field).
@@ -265,7 +301,7 @@ Prints the canonical operation JSON to stdout. Exit 0 = the write would be valid
 
 ```sh
 kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml query --all-collections --output json
+  peat --creds /tmp/creds.yaml query --all-collections
 ```
 
 ---
@@ -284,7 +320,7 @@ kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
 | 1 | timeout / no peers / generic failure | unreachable peer in `creds.yaml` |
 | 2 | authentication failure | missing/unreadable `creds.yaml`, unknown field in the bundle |
 | 3 | permission denied | reserved for future per-collection scopes |
-| 4 | malformed request | bad target syntax, schema validation failure, duplicate `--id` on `create` |
+| 4 | malformed request | bad target syntax, schema validation failure, doc already exists on `create` |
 | 130 | SIGINT | Ctrl-C while streaming |
 
 Data goes to **stdout**; logs, errors, and status to **stderr**. `peat … > file.json` produces a clean file with no log noise.

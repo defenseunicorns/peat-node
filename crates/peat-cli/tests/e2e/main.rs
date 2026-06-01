@@ -49,7 +49,7 @@ fn schema_list_runs_offline_without_creds() {
     // mesh handshake. Confirms an operator can discover registered
     // types before they have a credential bundle in hand.
     peat()
-        .args(["schema", "list"])
+        .args(["--output", "text", "schema", "list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("COLLECTION"))
@@ -63,7 +63,7 @@ fn schema_describe_renders_field_shape() {
     // Field-level table for one type. Asserts on the format strings
     // exercised by Capability so the renderer's contract is pinned.
     peat()
-        .args(["schema", "describe", "capabilities"])
+        .args(["--output", "text", "schema", "describe", "capabilities"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Capability (v1)"))
@@ -77,7 +77,13 @@ fn schema_describe_renders_field_shape() {
 #[serial_test::parallel(peat_cli_two_party)]
 fn schema_describe_resolves_by_canonical_id() {
     peat()
-        .args(["schema", "describe", "peat.capability.v1.Capability"])
+        .args([
+            "--output",
+            "text",
+            "schema",
+            "describe",
+            "peat.capability.v1.Capability",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("Capability"));
@@ -206,9 +212,7 @@ fn create_dry_run_renders_op_without_join() {
     peat()
         .args([
             "create",
-            "contacts",
-            "--id",
-            "c-1",
+            "contacts/c-1",
             "--set",
             "name=alice",
             "--set",
@@ -229,15 +233,7 @@ fn create_for_unknown_collection_skips_validation() {
     // "contacts" is not a peat-schema-registered collection, so the
     // schema gate accepts the document structurally and dry-run prints.
     peat()
-        .args([
-            "create",
-            "contacts",
-            "--id",
-            "c-1",
-            "--set",
-            "name=alice",
-            "--dry-run",
-        ])
+        .args(["create", "contacts/c-1", "--set", "name=alice", "--dry-run"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"op\": \"create\""));
@@ -246,16 +242,16 @@ fn create_for_unknown_collection_skips_validation() {
 #[test]
 #[serial_test::parallel(peat_cli_two_party)]
 fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
-    // "capabilities" IS a registered collection (peat-schema). Building
-    // only `name` leaves `id` and other proto3 fields at their defaults.
-    // validate_capability rejects an empty id with MissingField, which
-    // surfaces as CliError::Malformed → exit 4.
+    // "capabilities" IS a registered collection (peat-schema). The target
+    // doc_id is auto-injected as the `id` field, but `name` has no default
+    // and must be supplied. Omitting --set name=… leaves name="" which the
+    // validator rejects with MissingField → CliError::Malformed → exit 4.
     peat()
         .args([
             "create",
-            "capabilities",
+            "capabilities/cap-1",
             "--set",
-            "name=thermal",
+            "confidence=0.98",
             "--dry-run",
         ])
         .assert()

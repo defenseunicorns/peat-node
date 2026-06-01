@@ -84,12 +84,20 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
+            iroh_bind_port: None,
         },
     )
     .await?;
 
     let store = session.backend().store().clone();
     let mut rx = store.subscribe_to_observer_changes();
+
+    // Dedup: peat-mesh fires observer_tx for every sync message processed,
+    // including no-op rounds of the Automerge exchange that carry no new
+    // changes. Track the last-emitted Automerge save bytes per key and
+    // suppress events that don't advance the document state.
+    let mut last_seen: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
 
     // tokio::signal::ctrl_c is a Future that resolves on first SIGINT.
     // We multiplex it with the broadcast receiver via select.
@@ -109,7 +117,6 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                     }
                     Err(RecvError::Closed) => break,
                 };
-
                 if let Some(target) = &target_key {
                     if &key != target { continue; }
                 } else if !key.starts_with(&prefix) {
@@ -117,14 +124,24 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                 }
 
                 let render = match store.get(&key) {
-                    // Live doc: render it.
-                    Ok(Some(d)) => render_observe_event(&key, &d, common.output),
+                    // Live doc: deduplicate, then render.
+                    Ok(Some(d)) => {
+                        let bytes = d.save();
+                        if last_seen.get(&key).map(|prev| prev == &bytes).unwrap_or(false) {
+                            continue; // no actual change — skip
+                        }
+                        last_seen.insert(key.clone(), bytes);
+                        render_observe_event(&key, &d, common.output)
+                    }
                     // Document is gone between event emission and our read
                     // (tombstoned). Emit a structurally distinct "deleted"
                     // record so CDC consumers see deletes, not just upserts.
                     // ADR-034 metadata refinement is a follow-up; for v1
                     // we emit a minimal `deleted: true` envelope.
-                    Ok(None) => render_observe_deleted(&key, common.output),
+                    Ok(None) => {
+                        last_seen.remove(&key);
+                        render_observe_deleted(&key, common.output)
+                    }
                     Err(e) => {
                         tracing::warn!(key = %key, error = %e, "store read failed");
                         continue;

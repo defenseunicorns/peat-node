@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use peat_mesh::discovery::{DiscoveryEvent, DiscoveryStrategy, MdnsDiscovery, PeerInfo};
 use peat_mesh::storage::SyncTransport;
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use tempfile::TempDir;
@@ -36,6 +37,10 @@ pub struct SessionOptions {
     /// Persist the Automerge store here. `None` → ephemeral TempDir.
     /// Overrides `data_dir` in the credentials bundle when both are set.
     pub data_dir: Option<PathBuf>,
+    /// Bind iroh's UDP endpoint to this port. `None` → OS-assigned ephemeral
+    /// port. `peat serve` passes a fixed port so peer-spec lines stay stable
+    /// across restarts; transient subcommands leave this as `None`.
+    pub iroh_bind_port: Option<u16>,
 }
 
 impl Default for SessionOptions {
@@ -44,6 +49,7 @@ impl Default for SessionOptions {
             timeout: Duration::from_secs(10),
             as_id: None,
             data_dir: None,
+            iroh_bind_port: None,
         }
     }
 }
@@ -77,6 +83,9 @@ pub struct MeshSession {
     backend: Arc<AutomergeBackend>,
     node_id: String,
     _data_dir: DataDir,
+    // Kept alive so mDNS advertisement and browsing continue for the
+    // session lifetime. None when mDNS is disabled or failed to init.
+    _mdns: Option<MdnsDiscovery>,
 }
 
 impl MeshSession {
@@ -134,8 +143,10 @@ impl MeshSession {
             data_dir: data_dir.path().to_path_buf(),
             formation_id: creds.app_id.clone(),
             base64_shared_key: creds.shared_key.clone(),
-            // CLI is a transient client; let Iroh pick an ephemeral UDP port.
-            iroh_bind_addr: None,
+            // Fixed port for `peat serve`; ephemeral for transient commands.
+            iroh_bind_addr: opts
+                .iroh_bind_port
+                .map(|p| format!("0.0.0.0:{p}").parse().expect("valid bind addr")),
             // At-rest cipher is handled at the peat-node layer for now
             // (matches the rc.26 comment in peat-node/src/node.rs). The CLI's
             // tempdir-backed store is short-lived enough that omitting it is
@@ -143,7 +154,80 @@ impl MeshSession {
             cipher: None,
         })
         .await
-        .map_err(|e| CliError::Generic(format!("backend bootstrap: {e}")))?;
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            // redb holds an exclusive file lock on the store while open.
+            // "Cannot acquire lock" means another peat process is running
+            // against the same data_dir.
+            if msg.contains("Cannot acquire lock") || msg.contains("Database already open") {
+                CliError::Generic(format!(
+                    "backend bootstrap: {msg}\n\
+                     hint: the local store at {} is locked — another `peat` \
+                     process is likely running. Stop it and retry.",
+                    data_dir.path().display()
+                ))
+            } else {
+                CliError::Generic(format!("backend bootstrap: {msg}"))
+            }
+        })?;
+
+        // ── mDNS peer discovery ────────────────────────────────────────────
+        // Start mDNS before explicit peer connects so the daemon begins
+        // collecting peer announcements while we dial. `disable_mdns` in
+        // the creds bundle opts out — useful in containers where multicast
+        // is unavailable.
+        let (mut mdns, mdns_rx) = if creds.disable_mdns {
+            (None, None)
+        } else {
+            match MdnsDiscovery::new() {
+                Err(e) => {
+                    tracing::warn!("mDNS init failed (no local discovery): {e}");
+                    (None, None)
+                }
+                Ok(mut m) => {
+                    if let Err(e) = m.start().await {
+                        tracing::warn!("mDNS start failed: {e}");
+                    } else {
+                        let ep = backend.transport().endpoint();
+                        let eid = ep.id().to_string();
+                        let port = ep
+                            .bound_sockets()
+                            .into_iter()
+                            .find(|s| s.is_ipv4())
+                            .map(|s| s.port())
+                            .unwrap_or(0);
+                        if port > 0 {
+                            // Advertise with a concrete loopback address so
+                            // same-host peers can connect directly. Also embed
+                            // the port in the TXT metadata as a fallback for
+                            // the case where cross-process mDNS resolution
+                            // returns an empty address list (query responses
+                            // don't always attach the A record; the port from
+                            // the SRV record is always present).
+                            let loopback = std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                port,
+                            );
+                            let mut meta = std::collections::HashMap::new();
+                            meta.insert("port".to_string(), port.to_string());
+                            // Embed formation_id so peers can filter before
+                            // attempting a connection. Avoids connecting to
+                            // peers from a different formation (e.g. test
+                            // processes running alongside the user's session).
+                            meta.insert("formation_id".to_string(), creds.app_id.clone());
+                            match m.advertise_with_addr(&eid, loopback, Some(meta)) {
+                                Ok(()) => tracing::debug!("mDNS: advertising on 127.0.0.1:{port}"),
+                                Err(e) => tracing::warn!("mDNS advertise (loopback) failed: {e}"),
+                            }
+                        }
+                    }
+                    let rx = m.event_stream().ok();
+                    (Some(m), rx)
+                }
+            }
+        };
+        // Keep mdns alive in the session; mut only needed for event_stream above.
+        let mdns: Option<MdnsDiscovery> = mdns.take();
 
         let mut connected: usize = 0;
         for spec in &creds.peers {
@@ -191,19 +275,187 @@ impl MeshSession {
         // dropped on session drop).
         Self::spawn_on_change_pusher(&backend);
 
-        // Brief settle window for the peer's reciprocal sync to drain into
-        // our local store. peat-mesh doesn't surface a "sync caught up"
-        // signal; this fixed window is the v1 heuristic — long enough for
-        // loopback / LAN, short enough that interactive CLI feels snappy.
-        // Subcommands that need stronger guarantees layer additional
-        // polling on top (see query.rs).
+        // Brief settle window: let the peer's reciprocal sync drain in AND
+        // give mDNS time to collect announcements from other peat processes
+        // on the same host (loopback round-trip ≪ 10ms; full window = 1s).
         tokio::time::sleep(POST_JOIN_SETTLE).await;
+
+        // ── Connect to mDNS-discovered peers ─────────────────────────────
+        // By now mDNS has had the full settle window to receive peer
+        // announcements. Connect to any we found that aren't already wired.
+        if let Some(ref m) = mdns {
+            let our_id = backend.transport().endpoint().id().to_string();
+            let already: std::collections::HashSet<String> = backend
+                .transport()
+                .connected_peers()
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+
+            let discovered = m.discovered_peers().await;
+            tracing::debug!("mDNS: {} peer(s) discovered after settle", discovered.len());
+            for peer in discovered {
+                if peer.node_id == our_id || already.contains(&peer.node_id) {
+                    continue;
+                }
+                // Skip peers from a different formation. Old peat versions
+                // that don't embed formation_id are still attempted.
+                if let Some(fid) = peer.metadata.get("formation_id") {
+                    if fid != &creds.app_id {
+                        continue;
+                    }
+                }
+                'addr: for addr in Self::peer_addresses(&peer) {
+                    let spec = format!("{}@{}", peer.node_id, addr);
+                    match connect_peer(&backend, &spec, opts.timeout).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                peer = %peer.node_id, %addr,
+                                "mDNS: connected to peer"
+                            );
+                            // Immediate sync so this peer's existing docs
+                            // are available to the current command.
+                            let pid = backend
+                                .transport()
+                                .connected_peers()
+                                .into_iter()
+                                .find(|id| id.to_string() == peer.node_id);
+                            if let Some(pid) = pid {
+                                let _ = backend
+                                    .coordinator()
+                                    .sync_all_documents_with_peer(pid)
+                                    .await;
+                            }
+                            break 'addr;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer.node_id, %addr,
+                                "mDNS: connect failed: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Background mDNS watcher ───────────────────────────────────────
+        // Connects to peers that announce AFTER the initial settle window —
+        // e.g., a `peat create` that starts after `peat observe` is already
+        // running. The task terminates when the receiver closes (mdns dropped).
+        if let Some(rx) = mdns_rx {
+            let backend_arc = Arc::clone(&backend);
+            let timeout = opts.timeout;
+            let formation_id = creds.app_id.clone();
+            tokio::spawn(async move {
+                Self::mdns_watcher(backend_arc, rx, timeout, formation_id).await;
+            });
+        }
 
         Ok(Self {
             backend,
             node_id,
             _data_dir: data_dir,
+            _mdns: mdns,
         })
+    }
+
+    /// Return the effective address list for an mDNS peer.
+    ///
+    /// Cross-process mDNS queries sometimes produce a `ServiceResolved` with
+    /// empty `addresses` because the A record arrives in a separate packet
+    /// after the SRV record. When that happens, fall back to constructing
+    /// `127.0.0.1:{port}` from the `port` TXT metadata we embed at
+    /// advertisement time — reliable for same-host peers.
+    fn peer_addresses(peer: &PeerInfo) -> Vec<std::net::SocketAddr> {
+        if !peer.addresses.is_empty() {
+            return peer.addresses.clone();
+        }
+        // A record wasn't in the initial response. Use the embedded port.
+        if let Some(port_str) = peer.metadata.get("port") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                tracing::warn!(
+                    peer = %peer.node_id,
+                    "mDNS: addresses empty, using metadata port fallback 127.0.0.1:{port}"
+                );
+                return vec![std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                )];
+            }
+        }
+        tracing::debug!(peer = %peer.node_id, "mDNS: no usable address for peer");
+        vec![]
+    }
+
+    /// Background task: connect to mDNS peers as they announce themselves
+    /// after the initial settle window.
+    async fn mdns_watcher(
+        backend: Arc<AutomergeBackend>,
+        mut rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+        timeout: Duration,
+        formation_id: String,
+    ) {
+        let our_id = backend.transport().endpoint().id().to_string();
+        // Peers that failed with a permanent error (wrong formation key).
+        // Formation ID mismatch is not transient — skip indefinitely.
+        let mut auth_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(event) = rx.recv().await {
+            let peer = match event {
+                DiscoveryEvent::PeerFound(p) | DiscoveryEvent::PeerUpdated(p) => p,
+                DiscoveryEvent::PeerLost(_) => continue,
+            };
+            if peer.node_id == our_id || auth_failed.contains(&peer.node_id) {
+                continue;
+            }
+            // Skip peers advertising a different formation_id without
+            // attempting a connection. Each test run creates a new endpoint
+            // ID, so auth_failed alone can't suppress the deluge.
+            if let Some(fid) = peer.metadata.get("formation_id") {
+                if fid != &formation_id {
+                    continue;
+                }
+            }
+            let already_connected = backend
+                .transport()
+                .connected_peers()
+                .iter()
+                .any(|id| id.to_string() == peer.node_id);
+            if already_connected {
+                continue;
+            }
+            for addr in Self::peer_addresses(&peer) {
+                let spec = format!("{}@{}", peer.node_id, addr);
+                match connect_peer(&backend, &spec, timeout).await {
+                    Ok(()) => {
+                        tracing::debug!(peer = %peer.node_id, %addr, "mDNS watcher: connected to peer");
+                        let pid = backend
+                            .transport()
+                            .connected_peers()
+                            .into_iter()
+                            .find(|id| id.to_string() == peer.node_id);
+                        if let Some(pid) = pid {
+                            let _ = backend
+                                .coordinator()
+                                .sync_all_documents_with_peer(pid)
+                                .await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("formation")
+                            || msg.contains("mismatch")
+                            || msg.contains("auth")
+                        {
+                            // Permanent: different formation key — never retry.
+                            auth_failed.insert(peer.node_id.clone());
+                        }
+                        tracing::debug!(peer = %peer.node_id, %addr, "mDNS watcher connect failed: {e}");
+                    }
+                }
+            }
+        }
     }
 
     fn spawn_on_change_pusher(backend: &Arc<AutomergeBackend>) {
@@ -212,7 +464,7 @@ impl MeshSession {
         tokio::spawn(async move {
             while let Ok(key) = rx.recv().await {
                 if let Err(e) = coord.sync_document_with_all_peers(&key).await {
-                    tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+                    tracing::warn!(key = %key, "on_change_pusher: sync failed: {e}");
                 }
             }
         });
@@ -224,6 +476,21 @@ impl MeshSession {
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// Let the Automerge sync exchange complete before dropping the session.
+    ///
+    /// The Automerge sync protocol requires 3 QUIC stream round-trips:
+    ///   bloom-filter → peer response → actual changes
+    /// Each round-trip takes < 5ms on loopback. This sleep gives the
+    /// SyncChannelManager writer tasks time to drain their mpsc queues
+    /// and transmit all three messages before the iroh endpoint drops.
+    ///
+    /// `blob_store().shutdown()` was tried here but sends CONNECTION_CLOSE
+    /// BEFORE the exchange completes, preventing the peer from opening the
+    /// streams needed for steps 2-3. A plain sleep avoids that race.
+    pub async fn close(self) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 

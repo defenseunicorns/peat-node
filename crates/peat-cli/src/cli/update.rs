@@ -10,7 +10,7 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, SyncTransport};
+use peat_mesh::storage::AutomergeStore;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -78,6 +78,7 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
+            iroh_bind_port: None,
         },
     )
     .await?;
@@ -89,14 +90,24 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Generic(format!("read `{key}`: {e}")))?;
 
     // Build the proposed JSON shape. `--from` replaces wholesale; `--set`
-    // overlays onto the current doc (or an empty object if missing).
+    // overlays onto the current doc (or a seeded object if missing).
     let updated = match from_doc {
         Some(doc) => doc,
         None => {
-            let base = existing
+            let mut base = existing
                 .as_ref()
                 .map(automerge_to_json)
                 .unwrap_or_else(|| Value::Object(Default::default()));
+            // Upsert-on-missing: seed `id` from the target doc_id so
+            // registered types (Capability, NodeConfig, …) that require
+            // the `id` field pass validation without forcing the operator
+            // to duplicate it in `--set id=…`.
+            if existing.is_none() {
+                if let Value::Object(ref mut map) = base {
+                    map.entry("id")
+                        .or_insert_with(|| Value::String(doc_id.to_string()));
+                }
+            }
             apply_sets(base, &args.set)?
         }
     };
@@ -163,30 +174,12 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
     }
 
     if args.wait_for_sync {
-        if let Err(e) = session
-            .backend()
-            .coordinator()
-            .sync_document_with_all_peers(&key)
-            .await
-        {
-            tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
-        }
-        // Round-trip confirmation: sync_document_with_all_peers writes to
-        // the QUIC send buffer but does not wait for peer ACK. A subsequent
-        // sync_all_documents_with_peer request/response cycle only completes
-        // after the peer has processed the connection's prior data, confirming
-        // the update was received before the CLI exits.
-        for peer_id in session.backend().transport().connected_peers() {
-            if let Err(e) = session
-                .backend()
-                .coordinator()
-                .sync_all_documents_with_peer(peer_id)
-                .await
-            {
-                tracing::warn!(peer = %peer_id, "post-update sync round-trip failed: {e}");
-            }
-        }
+        // on_change_pusher handles the sync push. Calling sync_document_with_all_peers
+        // here races with it (both clear Automerge sync state). Just wait.
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
+        println!("{key}");
+        session.close().await;
+        return Ok(());
     }
 
     println!("{key}");

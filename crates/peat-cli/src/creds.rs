@@ -64,6 +64,12 @@ pub struct PeatCredentials {
     /// user's home directory. If absent the CLI uses a TempDir per invocation.
     #[serde(default)]
     pub data_dir: Option<String>,
+    /// Disable mDNS peer discovery. mDNS is on by default so that CLI
+    /// invocations on the same host or LAN find each other without explicit
+    /// `peers:` configuration. Set to `true` in container deployments where
+    /// mDNS multicast is unavailable or undesired.
+    #[serde(default)]
+    pub disable_mdns: bool,
     #[serde(default)]
     pub encryption_key: Option<String>,
 }
@@ -219,6 +225,16 @@ shared_key: abc123
         assert_eq!(creds.shared_key, "abc123");
         assert!(creds.peers.is_empty());
         assert!(creds.encryption_key.is_none());
+        // mDNS on by default — disable_mdns absent → false.
+        assert!(!creds.disable_mdns);
+    }
+
+    #[test]
+    fn disable_mdns_parses_and_defaults_false() {
+        let with_flag = parse("app_id: x\nshared_key: y\ndisable_mdns: true\n").unwrap();
+        assert!(with_flag.disable_mdns);
+        let without_flag = parse("app_id: x\nshared_key: y\n").unwrap();
+        assert!(!without_flag.disable_mdns);
     }
 
     #[test]

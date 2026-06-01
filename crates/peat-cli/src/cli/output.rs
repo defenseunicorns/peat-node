@@ -287,8 +287,11 @@ pub fn render_query(
             println!("{out}");
         }
         OutputFormat::Ndjson => {
-            for (_, doc) in docs {
-                let line = serde_json::to_string(&automerge_to_json(doc))
+            for (key, doc) in docs {
+                let mut obj = serde_json::Map::with_capacity(2);
+                obj.insert("key".into(), Value::String(key.clone()));
+                obj.insert("doc".into(), automerge_to_json(doc));
+                let line = serde_json::to_string(&Value::Object(obj))
                     .map_err(|e| CliError::Generic(format!("serialize JSON: {e}")))?;
                 println!("{line}");
             }
@@ -317,6 +320,26 @@ mod tests {
         let docs = [("contacts:c-1".to_string(), fixture_doc("alice"))];
         let v = automerge_to_json(&docs[0].1);
         assert_eq!(v["name"], serde_json::json!("alice"));
+    }
+
+    #[test]
+    fn ndjson_includes_key_field() {
+        // render_query ndjson must emit {"key": "...", "doc": {...}} — the
+        // same shape as render_observe_event, so `jq .key` works on both
+        // query and observe output.
+        let docs = [
+            ("contacts:c-1".to_string(), fixture_doc("alice")),
+            ("contacts:c-2".to_string(), fixture_doc("bob")),
+        ];
+        for (key, doc) in &docs {
+            let mut obj = serde_json::Map::with_capacity(2);
+            obj.insert("key".into(), Value::String(key.clone()));
+            obj.insert("doc".into(), automerge_to_json(doc));
+            let line = serde_json::to_string(&Value::Object(obj)).unwrap();
+            let parsed: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(parsed["key"], serde_json::json!(key), "key field missing");
+            assert!(parsed["doc"].is_object(), "doc field missing or not object");
+        }
     }
 
     #[test]

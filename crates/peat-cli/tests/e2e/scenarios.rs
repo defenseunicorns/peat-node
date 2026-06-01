@@ -194,9 +194,7 @@ async fn create_propagates_to_peer() {
         &creds,
         &[
             "create",
-            "contacts",
-            "--id",
-            "c-new",
+            "contacts/c-new",
             "--set",
             "name=dave",
             "--wait-for-sync",
@@ -322,9 +320,10 @@ async fn update_rejects_known_collection_with_invalid_post_merge_shape() {
     // as `CliError::Malformed` (exit 4) only here. Drives the
     // `validate_against_schema` rejection arm in `cli/update.rs`.
     //
-    // "capabilities" is a registered collection (peat-schema); building
-    // only `name` against a missing doc upserts into `{name: "thermal"}`,
-    // which fails `validate_capability` with `MissingField(id)`.
+    // "capabilities" is a registered collection (peat-schema). The target
+    // doc_id ("cap-fresh") is now auto-injected as `id`, so the remaining
+    // required field is `name`. Omitting `--set name=…` leaves name=""
+    // which validate_capability rejects → MissingField → exit 4.
     let peer = TestPeer::start().await;
     let dir = tempfile::tempdir().unwrap();
     let creds = peer.creds_tempfile(&dir);
@@ -341,7 +340,7 @@ async fn update_rejects_known_collection_with_invalid_post_merge_shape() {
                 "update",
                 "capabilities/cap-fresh",
                 "--set",
-                "name=thermal",
+                "confidence=0.98",
             ])
             .timeout(SCENARIO_TIMEOUT)
             .output()
@@ -444,9 +443,7 @@ async fn create_rejects_duplicate_id() {
                 "--timeout",
                 "15s",
                 "create",
-                "contacts",
-                "--id",
-                "c-existing",
+                "contacts/c-existing",
                 "--set",
                 "name=ignored",
             ])
@@ -527,9 +524,7 @@ async fn observe_subprocess_streams_create_from_second_subprocess() {
         &creds,
         &[
             "create",
-            "contacts",
-            "--id",
-            "c-bridge",
+            "contacts/c-bridge",
             "--set",
             "name=alice",
             "--wait-for-sync",
@@ -559,9 +554,7 @@ async fn update_from_round_trip_across_two_subprocesses() {
         &creds,
         &[
             "create",
-            "contacts",
-            "--id",
-            "c-round",
+            "contacts/c-round",
             "--set",
             "name=alice",
             "--set",
@@ -690,7 +683,8 @@ async fn run_typed_lifecycle(
     let target = format!("{collection}/{doc_id}");
 
     // 1. create — only the validator-required fields, defaults fill the rest.
-    let mut create_args: Vec<&str> = vec!["create", collection, "--id", doc_id];
+    let target_create = format!("{collection}/{doc_id}");
+    let mut create_args: Vec<&str> = vec!["create", &target_create];
     for s in create_sets {
         create_args.push("--set");
         create_args.push(s);
@@ -881,9 +875,7 @@ async fn observe_all_collections_streams_events_from_every_collection() {
         &creds,
         &[
             "create",
-            "contacts",
-            "--id",
-            "c-2",
+            "contacts/c-2",
             "--set",
             "name=carol",
             "--wait-for-sync",
@@ -894,9 +886,7 @@ async fn observe_all_collections_streams_events_from_every_collection() {
         &creds,
         &[
             "create",
-            "things",
-            "--id",
-            "t-2",
+            "things/t-2",
             "--set",
             "label=gadget",
             "--wait-for-sync",
@@ -935,4 +925,220 @@ async fn lifecycle_cell_state_registered_type() {
         },
     )
     .await;
+}
+
+// ----------------------------------------------------------------------------
+// mDNS direct CLI-to-CLI sync (no TestPeer).
+//
+// These tests exercise the zero-config peer discovery path: two standalone
+// `peat` subprocesses that have no `peers:` configured but find each other
+// via mDNS on the loopback interface. Each process uses a separate data dir
+// so there is no redb lock conflict.
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn mdns_observe_sees_create_without_explicit_peers() {
+    // Two standalone peat processes — no TestPeer, no `peers:` in creds.
+    // Observe must receive the capability document that create writes.
+    let dir = tempfile::tempdir().unwrap();
+    let obs_data = dir.path().join("obs");
+    let create_data = dir.path().join("create");
+    std::fs::create_dir_all(&obs_data).unwrap();
+    std::fs::create_dir_all(&create_data).unwrap();
+
+    use base64::Engine as _;
+    let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+
+    // Shared creds with NO peers — mDNS must bridge the two processes.
+    let creds_path = dir.path().join("creds.yaml");
+    std::fs::write(
+        &creds_path,
+        format!("app_id: peat-cli-e2e\nshared_key: {key}\n"),
+    )
+    .unwrap();
+
+    // Launch observer with its own data dir (avoids redb lock with create).
+    let mut observer = topology::spawn_peat_streaming(
+        &creds_path,
+        &[
+            "--data-dir",
+            obs_data.to_str().unwrap(),
+            "observe",
+            "capabilities",
+            "--output",
+            "ndjson",
+        ],
+    );
+
+    // Give mDNS time to advertise and start browsing before create runs.
+    tokio::time::sleep(OBSERVER_SUBSCRIBE_SETTLE).await;
+
+    // Create a capability document. create uses its own data dir so it
+    // doesn't collide with observe's redb lock.
+    let (create_stdout, create_stderr) = run_peat_with_data_dir(
+        &creds_path,
+        create_data.to_str().unwrap(),
+        &[
+            "create",
+            "capabilities/cap-mdns",
+            "--set",
+            "name=mdns-sensor",
+            "--wait-for-sync",
+        ],
+    )
+    .await;
+
+    // Check whether observe emitted the document within the deadline.
+    // await_stdout_contains reads live from the pipe; if nothing arrives
+    // in POLL_DEADLINE seconds it panics with the accumulated output.
+    //
+    // If the observer is silent we fall through to a post-mortem query
+    // to distinguish "sync never happened" from "sync happened but
+    // observer_tx didn't fire."
+    let observe_result = tokio::time::timeout(
+        POLL_DEADLINE,
+        topology::await_stdout_contains_no_panic(&mut observer, "capabilities:cap-mdns"),
+    )
+    .await;
+
+    if let Ok(seen) = observe_result {
+        // Happy path: observer emitted the document.
+        assert!(seen.contains("cap-mdns"), "unexpected stdout: {seen}");
+        return;
+    }
+
+    // Observer was silent. Kill it so we can open the store for diagnosis.
+    observer.kill().await.ok();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let (query_out, query_err) = run_peat_with_data_dir(
+        &creds_path,
+        obs_data.to_str().unwrap(),
+        &["--output", "json", "query", "capabilities"],
+    )
+    .await;
+
+    panic!(
+        "observer stream was silent for {POLL_DEADLINE:?}.\n\
+         Doc in observe store: {}\n\
+         create stdout: {create_stdout}\n\
+         create stderr: {create_stderr}\n\
+         query stdout: {query_out}\n\
+         query stderr: {query_err}",
+        if query_out.contains("cap-mdns") {
+            "YES — sync arrived but observer_tx did not fire"
+        } else {
+            "NO — sync never reached observe's store"
+        }
+    );
+}
+
+/// Like `run_peat` but also passes `--data-dir` for the caller-supplied path.
+async fn run_peat_with_data_dir(creds: &Path, data_dir: &str, args: &[&str]) -> (String, String) {
+    let mut owned: Vec<String> = vec![
+        "--creds".into(),
+        creds.to_string_lossy().into_owned(),
+        "--timeout".into(),
+        "15s".into(),
+        "--data-dir".into(),
+        data_dir.to_string(),
+    ];
+    owned.extend(args.iter().map(|s| (*s).to_string()));
+    let args_for_display = owned.clone();
+
+    let output = tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("peat")
+            .unwrap()
+            // Use warn for all crates so peat_mesh sync failures are visible.
+            .env("RUST_LOG", "warn")
+            .args(owned.iter().map(|s| s.as_str()))
+            .timeout(SCENARIO_TIMEOUT)
+            .output()
+            .expect("spawn peat")
+    })
+    .await
+    .expect("join blocking");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "peat {args_for_display:?} failed (exit {:?})\nstdout={stdout}\nstderr={stderr}",
+        output.status.code(),
+    );
+    (stdout, stderr)
+}
+
+// ----------------------------------------------------------------------------
+// Diagnostic / error-quality tests. These do NOT require a live TestPeer —
+// they exercise the CLI binary's error reporting against bad local state.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn bad_data_dir_surfaces_root_cause_not_just_context() {
+    // Regression: `with_iroh` returns `anyhow::Result`. We were formatting the
+    // error with `{e}` (Display), which shows only the outermost `.context()`
+    // string "open AutomergeStore at data_dir" and silently drops the root
+    // cause (the actual redb/IO error). Switching to `{e:#}` walks the full
+    // anyhow chain.
+    //
+    // Setup: give peat a `data_dir` that has a DIRECTORY at the root
+    // (so `create_private_dir` succeeds), but a garbage FILE at
+    // `data_dir/automerge` where peat-mesh expects to open the redb store.
+    // peat-mesh will fail inside `AutomergeStore::open_with_cipher` and
+    // return the context-wrapped error.
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    // `peat-mesh` calls `create_dir_all(data_dir/automerge)` before opening
+    // the store, so the automerge subdir must exist as a directory (not a
+    // file) to get past that check. We put a garbage file at the redb path
+    // that peat-mesh then tries to open as a database.
+    let automerge_dir = data_dir.join("automerge");
+    std::fs::create_dir_all(&automerge_dir).unwrap();
+    let bogus_store = automerge_dir.join("automerge.redb");
+    std::fs::write(&bogus_store, b"not a redb database").unwrap();
+
+    let creds_path = dir.path().join("creds.yaml");
+    // Any 32-byte base64 key works; no peer is configured so HMAC
+    // setup doesn't fire during this test.
+    use base64::Engine as _;
+    let dummy_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+    std::fs::write(
+        &creds_path,
+        format!(
+            "app_id: test-bad-dir\nshared_key: {dummy_key}\ndata_dir: {path}\n",
+            path = data_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("peat")
+        .unwrap()
+        .args(["--creds", creds_path.to_str().unwrap(), "query", "contacts"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit for bad data_dir"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The outer anyhow context must be present.
+    assert!(
+        stderr.contains("backend bootstrap"),
+        "expected backend bootstrap in stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("open AutomergeStore at data_dir"),
+        "expected store-open context in stderr; got: {stderr}"
+    );
+    // The root-cause chain from redb must ALSO be present. Before the fix
+    // the message stopped at "open AutomergeStore at data_dir" and the
+    // operator had no actionable diagnostic.
+    let bare_msg = "peat: backend bootstrap: open AutomergeStore at data_dir";
+    assert!(
+        stderr.trim_end() != bare_msg,
+        "root cause is missing — error stops at the bare anyhow context: {stderr}"
+    );
 }

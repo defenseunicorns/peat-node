@@ -58,7 +58,7 @@ pub struct CommonArgs {
     pub timeout: String,
 
     /// Output format.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Json)]
     pub output: OutputFormat,
 
     /// Increase log verbosity. Repeat for more detail.
