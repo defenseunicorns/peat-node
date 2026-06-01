@@ -89,7 +89,13 @@ pub fn apply_proto3_defaults(collection: &str, mut value: Value) -> Value {
 /// signal — this gives the local sync coordinator a budget to push the
 /// new op to connected peers before the CLI exits. Real ack tracking
 /// lands when upstream exposes it.
-pub const POST_WRITE_SYNC_WAIT: Duration = Duration::from_millis(750);
+///
+/// 2 s keeps the QUIC connection alive long enough for the OS to put
+/// the outbound packets on the wire AND for the peer to ACK them, even
+/// on a loaded self-hosted CI runner where the tokio scheduler may be
+/// slow to process the outbound queue. 750 ms proved insufficient in
+/// practice (see peat-node#120).
+pub const POST_WRITE_SYNC_WAIT: Duration = Duration::from_millis(2000);
 
 /// Read the `--from` argument: a path, or `-` for stdin.
 pub fn read_from(path: &Path) -> Result<Value, CliError> {
