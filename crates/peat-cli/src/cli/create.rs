@@ -3,6 +3,7 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::json_to_automerge;
+use peat_mesh::storage::SyncTransport;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -136,6 +137,21 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
             .await
         {
             tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
+        }
+        // Round-trip confirmation: sync_document_with_all_peers writes to
+        // the QUIC send buffer but does not wait for peer ACK. A subsequent
+        // sync_all_documents_with_peer request/response cycle only completes
+        // after the peer has processed the connection's prior data, confirming
+        // the create was received before the CLI exits.
+        for peer_id in session.backend().transport().connected_peers() {
+            if let Err(e) = session
+                .backend()
+                .coordinator()
+                .sync_all_documents_with_peer(peer_id)
+                .await
+            {
+                tracing::warn!(peer = %peer_id, "post-create sync round-trip failed: {e}");
+            }
         }
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
