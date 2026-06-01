@@ -184,8 +184,7 @@ pass "query --all-collections sees the demo doc"
 
 log "Step 3: 'peat create capabilities/cap-thermal' from inside peat-node-a"
 docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
-    create capabilities --id cap-thermal \
-    --set id=cap-thermal \
+    create capabilities/cap-thermal \
     --set name=thermal-sensor \
     --set confidence=0.92 \
     --wait-for-sync >/dev/null
@@ -243,8 +242,8 @@ docker exec peat-node-a sh -c '
 sleep 3
 
 docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
-    create capabilities --id cap-radio \
-    --set id=cap-radio --set name=radio --set confidence=0.5 \
+    create capabilities/cap-radio \
+    --set name=radio --set confidence=0.5 \
     --wait-for-sync >/dev/null
 
 # Poll the observer's output for the new key.

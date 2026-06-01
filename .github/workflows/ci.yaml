@@ -105,7 +105,7 @@ jobs:
           test ! -s stdout.txt
           grep -q "authentication failure" stderr.txt
           # create --dry-run skips the join prelude — confirm it renders.
-          "$PEAT" create contacts --id c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
+          "$PEAT" create contacts/c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
           grep -q '"op": "create"' stdout.txt
           grep -q '"key": "contacts:c-1"' stdout.txt
           # update --from reads the proposed JSON before the join prelude

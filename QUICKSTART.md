@@ -170,7 +170,7 @@ Write on alpha, read on bravo:
 ```sh
 # Write on alpha
 kubectl --context k3d-peat-sync-alpha exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml create contacts --id alice --set name=alice --wait-for-sync
+  peat --creds /tmp/creds.yaml create contacts/alice --set name=alice --wait-for-sync
 
 # Bootstrap the bravo-side creds the same way (different endpoint id) and read
 kubectl --context k3d-peat-sync-bravo exec -n peat deploy/peat-peat-node -c peat-node -- sh -c '
@@ -234,7 +234,7 @@ Plus typed convenience RPCs over peat-schema collections (`PutPlatform`, `GetCel
 
 ```sh
 # From any peer with the right creds
-peat --creds creds.yaml create contacts --id smoke --set ts=$(date +%s) --wait-for-sync
+peat --creds creds.yaml create contacts/smoke --set ts=$(date +%s) --wait-for-sync
 peat --creds creds.yaml query contacts/smoke --output json
 ```
 

@@ -317,7 +317,7 @@ EOF
     log "Step (Test 6): create with debug logs"
     CREATE_OUT=$(kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
         sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=debug,iroh=debug peat --creds /tmp/creds.yaml --timeout 60s \
-            create contacts --id cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
+            create contacts/cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
     echo "${CREATE_OUT}" | sed 's/^/    /'
     if echo "${CREATE_OUT}" | grep -q "contacts:cli-smoke"; then
         pass "peat create via kubectl exec succeeded"
