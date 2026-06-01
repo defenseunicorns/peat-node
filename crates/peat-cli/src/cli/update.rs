@@ -10,13 +10,14 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, SyncTransport};
+use peat_mesh::storage::AutomergeStore;
 use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::cli::query::parse_target;
 use crate::cli::writes::{
-    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+    apply_proto3_defaults, apply_sets, confirm_peer_delivery, read_from, validate_against_schema,
+    POST_WRITE_SYNC_WAIT,
 };
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -171,21 +172,7 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
         {
             tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
         }
-        // Round-trip confirmation: sync_document_with_all_peers writes to
-        // the QUIC send buffer but does not wait for peer ACK. A subsequent
-        // sync_all_documents_with_peer request/response cycle only completes
-        // after the peer has processed the connection's prior data, confirming
-        // the update was received before the CLI exits.
-        for peer_id in session.backend().transport().connected_peers() {
-            if let Err(e) = session
-                .backend()
-                .coordinator()
-                .sync_all_documents_with_peer(peer_id)
-                .await
-            {
-                tracing::warn!(peer = %peer_id, "post-update sync round-trip failed: {e}");
-            }
-        }
+        confirm_peer_delivery(&session, "update").await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
 

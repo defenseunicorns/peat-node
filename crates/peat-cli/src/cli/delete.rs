@@ -5,7 +5,7 @@ use peat_mesh::qos::Tombstone;
 use peat_mesh::storage::SyncTransport;
 
 use crate::cli::query::parse_target;
-use crate::cli::writes::POST_WRITE_SYNC_WAIT;
+use crate::cli::writes::{confirm_peer_delivery, POST_WRITE_SYNC_WAIT};
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
 use crate::join::{MeshSession, SessionOptions};
@@ -72,25 +72,11 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
             continue;
         }
 
-        if args.wait_for_sync {
-            // `send_tombstones_to_peer` writes to the QUIC send buffer but
-            // returns before the peer ACKs. A subsequent document-sync
-            // round-trip creates a request/response cycle that only
-            // completes after the peer has processed the connection's
-            // prior data, giving us a delivery confirmation without
-            // needing an explicit tombstone-ack API in peat-mesh.
-            if let Err(e) = session
-                .backend()
-                .coordinator()
-                .sync_all_documents_with_peer(peer_id)
-                .await
-            {
-                tracing::warn!(peer = %peer_id, "post-delete sync round-trip failed: {e}");
-            }
-        }
+        // Delivery confirmation deferred to confirm_peer_delivery below.
     }
 
     if args.wait_for_sync {
+        confirm_peer_delivery(&session, "delete").await;
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
     }
 
