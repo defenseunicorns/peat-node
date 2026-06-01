@@ -6,12 +6,14 @@
 //! `Arc<AutomergeBackend>` so subcommands can pass the session around
 //! cheaply.
 //!
-//! Lifecycle: `MeshSession` owns an ephemeral `TempDir` that backs the
-//! Automerge store on disk. Dropping the session drops the tempdir, which
-//! cleans up after the CLI invocation. The CLI is a short-lived
-//! "observer" node (ADR-001 §"Node posture per command"); no persistent
-//! state survives.
+//! Lifecycle: `MeshSession` owns the data directory its Automerge store lives
+//! in. When a persistent `data_dir` is provided (via `--data-dir` flag or the
+//! credentials bundle), the directory is left on disk after the CLI exits so
+//! the next invocation can resume from the same state. Without a `data_dir`
+//! the session falls back to a `TempDir` that is cleaned up on drop — documents
+//! only survive if they sync to a connected peer before exit.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +22,7 @@ use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use tempfile::TempDir;
 
 use crate::cli::CliError;
-use crate::creds::PeatCredentials;
+use crate::creds::{expand_data_dir, PeatCredentials};
 
 /// Options derived from the parsed `CommonArgs` that affect how the join
 /// prelude runs.
@@ -31,6 +33,9 @@ pub struct SessionOptions {
     pub timeout: Duration,
     /// Caller-supplied identity. `None` → ephemeral UUID.
     pub as_id: Option<String>,
+    /// Persist the Automerge store here. `None` → ephemeral TempDir.
+    /// Overrides `data_dir` in the credentials bundle when both are set.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for SessionOptions {
@@ -38,6 +43,23 @@ impl Default for SessionOptions {
         Self {
             timeout: Duration::from_secs(10),
             as_id: None,
+            data_dir: None,
+        }
+    }
+}
+
+/// Backing store for a `MeshSession` — either a self-cleaning `TempDir` or a
+/// caller-supplied persistent path.
+enum DataDir {
+    Ephemeral(TempDir),
+    Persistent(PathBuf),
+}
+
+impl DataDir {
+    fn path(&self) -> &Path {
+        match self {
+            DataDir::Ephemeral(d) => d.path(),
+            DataDir::Persistent(p) => p.as_path(),
         }
     }
 }
@@ -48,13 +70,13 @@ impl Default for SessionOptions {
 /// need more (and individual read commands poll on top — see query.rs).
 const POST_JOIN_SETTLE: Duration = Duration::from_millis(1000);
 
-/// A live mesh participant. Holds the backend plus the tempdir its store
-/// lives in so cleanup is RAII.
+/// A live mesh participant. Holds the backend and the directory its store
+/// lives in. Dropping a persistent session leaves the directory intact;
+/// dropping an ephemeral session removes it.
 pub struct MeshSession {
     backend: Arc<AutomergeBackend>,
     node_id: String,
-    // RAII: dropping this removes the on-disk store.
-    _data_dir: TempDir,
+    _data_dir: DataDir,
 }
 
 impl MeshSession {
@@ -69,12 +91,28 @@ impl MeshSession {
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let data_dir = tempfile::tempdir()
-            .map_err(|e| CliError::Generic(format!("could not create ephemeral data dir: {e}")))?;
+        // Resolve data dir: CLI flag > creds bundle > ephemeral TempDir.
+        let data_dir: DataDir = if let Some(p) = opts.data_dir.clone() {
+            std::fs::create_dir_all(&p).map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", p.display()))
+            })?;
+            DataDir::Persistent(p)
+        } else if let Some(raw) = &creds.data_dir {
+            let p = expand_data_dir(raw)?;
+            std::fs::create_dir_all(&p).map_err(|e| {
+                CliError::Generic(format!("could not create data_dir {}: {e}", p.display()))
+            })?;
+            DataDir::Persistent(p)
+        } else {
+            DataDir::Ephemeral(tempfile::tempdir().map_err(|e| {
+                CliError::Generic(format!("could not create ephemeral data dir: {e}"))
+            })?)
+        };
 
         tracing::debug!(
             node_id = %node_id,
             data_dir = %data_dir.path().display(),
+            persistent = matches!(data_dir, DataDir::Persistent(_)),
             "bootstrapping peat-cli backend"
         );
 

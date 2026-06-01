@@ -36,6 +36,7 @@ pub async fn run(args: DeleteArgs, common: CommonArgs) -> Result<(), CliError> {
         SessionOptions {
             timeout,
             as_id: common.as_id.clone(),
+            data_dir: common.data_dir.clone(),
         },
     )
     .await?;

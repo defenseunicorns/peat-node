@@ -91,6 +91,10 @@ app_id: <your-formation-id>
 # Generate a real one with `openssl rand -base64 32`.
 shared_key: <base64-32-bytes>
 
+# Optional. Persist the local Automerge store across invocations.
+# ~/  is expanded to your home directory. Overridden by --data-dir flag.
+data_dir: ~/.local/share/peat/<your-formation-id>
+
 # Optional. Explicit peers to dial in `<endpoint-id>@<host>:<port>` form,
 # where host:port is the peer's Iroh UDP socket. Omit entirely if peers
 # are discoverable via mDNS — the CLI will find them automatically.
@@ -166,6 +170,8 @@ peat --creds ./creds.yaml query contacts/c-1234 --output text
 ---
 
 ## Step 3 — Write a document
+
+> **Prerequisite:** by default the CLI uses an ephemeral store per invocation — documents only persist if they sync to a connected peer before the process exits. To persist the local store across invocations, pass `--data-dir <PATH>` or add `data_dir: <path>` to your credentials bundle (`~/` is expanded). Steps 2–4 still require a reachable `peat-node` peer to see documents written by other nodes.
 
 `create` adds a new document. `--set path=value` builds the document from key/value pairs (works on both arbitrary JSON and peat-schema-registered types).
 

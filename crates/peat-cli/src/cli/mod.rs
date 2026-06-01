@@ -34,6 +34,13 @@ pub struct CommonArgs {
     #[arg(long, global = true, env = "PEAT_CREDS")]
     pub creds: Option<PathBuf>,
 
+    /// Persist the local store at this directory across invocations.
+    /// Overrides `data_dir` in the credentials bundle.
+    /// Without this (and without `data_dir` in the bundle) the store is
+    /// ephemeral — documents only survive if they sync to a connected peer.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub data_dir: Option<PathBuf>,
+
     /// Identity this CLI joins as. Default: ephemeral identity derived from credentials.
     #[arg(long = "as", global = true, value_name = "ID")]
     pub as_id: Option<String>,
