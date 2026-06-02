@@ -10,7 +10,7 @@
 
 use clap::Args;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, SyncTransport};
+use peat_mesh::storage::{AutomergeStore, ChangeOrigin, SyncTransport};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -152,11 +152,26 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             let proposed = json_to_automerge(&updated, Some(&current))
                 .map_err(|e| CliError::Generic(format!("build automerge doc: {e}")))?;
             let delta = AutomergeStore::diff(&current, &proposed);
-            session
-                .backend()
-                .store()
-                .apply_delta(&key, &delta)
-                .map_err(|e| CliError::Generic(format!("apply_delta `{key}`: {e}")))?;
+            // When --wait-for-sync is set, suppress change_tx so on_change_pusher
+            // doesn't race the explicit sync block below. Both callers call
+            // clear_sync_state_for_document which resets the Automerge exchange
+            // mid-flight and can trip the circuit-breaker under CI load.
+            // observer_tx still fires so peat observe continues to work.
+            if args.wait_for_sync {
+                // ChangeOrigin::Remote suppresses change_tx (notify=false)
+                // so on_change_pusher doesn't race the explicit sync below.
+                session
+                    .backend()
+                    .store()
+                    .apply_delta_with_origin(&key, &delta, ChangeOrigin::Remote(String::new()))
+                    .map_err(|e| CliError::Generic(format!("apply_delta `{key}`: {e}")))?;
+            } else {
+                session
+                    .backend()
+                    .store()
+                    .apply_delta(&key, &delta)
+                    .map_err(|e| CliError::Generic(format!("apply_delta `{key}`: {e}")))?;
+            }
         }
         None => {
             // Upsert semantics (ADR-001): missing doc → initial creation,
@@ -165,11 +180,19 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             // names this as the lone exception.
             let doc = json_to_automerge(&updated, None)
                 .map_err(|e| CliError::Generic(format!("build automerge doc: {e}")))?;
-            session
-                .backend()
-                .store()
-                .put(&key, &doc)
-                .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+            if args.wait_for_sync {
+                session
+                    .backend()
+                    .store()
+                    .put_without_notify(&key, &doc)
+                    .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+            } else {
+                session
+                    .backend()
+                    .store()
+                    .put(&key, &doc)
+                    .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+            }
         }
     }
 

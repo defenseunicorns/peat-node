@@ -129,11 +129,24 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
 
     let doc = json_to_automerge(&json_value, None)
         .map_err(|e| CliError::Generic(format!("build automerge doc: {e}")))?;
-    session
-        .backend()
-        .store()
-        .put(&key, &doc)
-        .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+    if args.wait_for_sync {
+        // Suppress change_tx so on_change_pusher does not race the explicit
+        // sync below. Both callers call clear_sync_state_for_document, which
+        // resets the Automerge exchange mid-flight and can trip the
+        // circuit-breaker under CI load. observer_tx still fires (peat observe
+        // still works); only the pusher-triggered re-sync is suppressed.
+        session
+            .backend()
+            .store()
+            .put_without_notify(&key, &doc)
+            .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+    } else {
+        session
+            .backend()
+            .store()
+            .put(&key, &doc)
+            .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
+    }
 
     if args.wait_for_sync {
         if let Err(e) = session
