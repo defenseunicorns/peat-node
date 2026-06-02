@@ -70,7 +70,6 @@ pub async fn run(args: QueryArgs, common: CommonArgs) -> Result<(), CliError> {
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
-            iroh_bind_port: None,
         },
     )
     .await?;

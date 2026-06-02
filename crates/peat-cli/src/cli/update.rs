@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use crate::cli::query::parse_target;
 use crate::cli::writes::{
-    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+    apply_proto3_defaults, apply_sets, is_registered_collection, read_from,
+    validate_against_schema, POST_WRITE_SYNC_WAIT,
 };
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -78,7 +79,6 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
-            iroh_bind_port: None,
         },
     )
     .await?;
@@ -90,27 +90,39 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
         .map_err(|e| CliError::Generic(format!("read `{key}`: {e}")))?;
 
     // Build the proposed JSON shape. `--from` replaces wholesale; `--set`
-    // overlays onto the current doc (or a seeded object if missing).
-    let updated = match from_doc {
+    // overlays onto the current doc (or an empty object if missing).
+    let mut updated = match from_doc {
         Some(doc) => doc,
         None => {
-            let mut base = existing
+            let base = existing
                 .as_ref()
                 .map(automerge_to_json)
                 .unwrap_or_else(|| Value::Object(Default::default()));
-            // Upsert-on-missing: seed `id` from the target doc_id so
-            // registered types (Capability, NodeConfig, …) that require
-            // the `id` field pass validation without forcing the operator
-            // to duplicate it in `--set id=…`.
-            if existing.is_none() {
-                if let Value::Object(ref mut map) = base {
-                    map.entry("id")
-                        .or_insert_with(|| Value::String(doc_id.to_string()));
-                }
-            }
             apply_sets(base, &args.set)?
         }
     };
+
+    // Reconcile the `id` field with the target doc id for registered types
+    // (same convention as `create`): fill it when absent so upsert-on-missing
+    // of a typed doc validates without `--set id=…`, and reject a document
+    // whose `id` disagrees with the target — the stored key and the doc would
+    // otherwise say different things. Untyped collections are left untouched.
+    if is_registered_collection(collection) {
+        if let Value::Object(ref mut map) = updated {
+            match map.get("id") {
+                Some(Value::String(existing_id)) if existing_id != doc_id => {
+                    return Err(CliError::Malformed(format!(
+                        "document `id` ({existing_id}) does not match target doc id ({doc_id}); \
+                         omit `id` or make it match `{collection}/{doc_id}`"
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    map.insert("id".to_string(), Value::String(doc_id.to_string()));
+                }
+            }
+        }
+    }
 
     // For registered peat-schema types, underlay proto3 zero-defaults
     // (peat-node#112). When `existing` is `Some`, `base` already carries

@@ -37,10 +37,6 @@ pub struct SessionOptions {
     /// Persist the Automerge store here. `None` → ephemeral TempDir.
     /// Overrides `data_dir` in the credentials bundle when both are set.
     pub data_dir: Option<PathBuf>,
-    /// Bind iroh's UDP endpoint to this port. `None` → OS-assigned ephemeral
-    /// port. `peat serve` passes a fixed port so peer-spec lines stay stable
-    /// across restarts; transient subcommands leave this as `None`.
-    pub iroh_bind_port: Option<u16>,
 }
 
 impl Default for SessionOptions {
@@ -49,7 +45,6 @@ impl Default for SessionOptions {
             timeout: Duration::from_secs(10),
             as_id: None,
             data_dir: None,
-            iroh_bind_port: None,
         }
     }
 }
@@ -143,10 +138,8 @@ impl MeshSession {
             data_dir: data_dir.path().to_path_buf(),
             formation_id: creds.app_id.clone(),
             base64_shared_key: creds.shared_key.clone(),
-            // Fixed port for `peat serve`; ephemeral for transient commands.
-            iroh_bind_addr: opts
-                .iroh_bind_port
-                .map(|p| format!("0.0.0.0:{p}").parse().expect("valid bind addr")),
+            // CLI is a transient client; let iroh pick an ephemeral UDP port.
+            iroh_bind_addr: None,
             // At-rest cipher is handled at the peat-node layer for now
             // (matches the rc.26 comment in peat-node/src/node.rs). The CLI's
             // tempdir-backed store is short-lived enough that omitting it is

@@ -46,6 +46,16 @@ pub fn validate_against_schema(collection: &str, value: &Value) -> Result<(), Cl
     })
 }
 
+/// Whether `collection` maps to a peat-schema-registered type. Used to gate
+/// behaviour that only makes sense for typed collections (e.g. auto-filling
+/// the required `id` field) so arbitrary/application-defined collections are
+/// left structurally untouched.
+pub fn is_registered_collection(collection: &str) -> bool {
+    BuiltinRegistry::with_peat_schema_types()
+        .for_collection(collection)
+        .is_some()
+}
+
 /// Apply proto3 zero-defaults for every field of a registered peat-schema
 /// type, then merge the caller's value on top (caller wins per top-level
 /// field). For unknown collections the value is returned unchanged.
@@ -259,6 +269,16 @@ mod tests {
         let user = json!({"name": "alice"});
         let merged = apply_proto3_defaults("contacts", user.clone());
         assert_eq!(merged, user, "unknown collections pass through unchanged");
+    }
+
+    #[test]
+    fn registered_collection_detection() {
+        // Gates create/update id-injection: registered types get an `id`
+        // filled from the target doc id; arbitrary collections do not.
+        assert!(is_registered_collection("capabilities"));
+        assert!(is_registered_collection("node-configs"));
+        assert!(!is_registered_collection("contacts"));
+        assert!(!is_registered_collection("made-up-collection"));
     }
 
     #[test]

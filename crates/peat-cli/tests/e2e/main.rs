@@ -241,6 +241,57 @@ fn create_for_unknown_collection_skips_validation() {
 
 #[test]
 #[serial_test::parallel(peat_cli_two_party)]
+fn create_unregistered_collection_does_not_inject_id() {
+    // id auto-injection is gated to registered types. An arbitrary
+    // collection must NOT gain a spurious `id` field it didn't ask for.
+    peat()
+        .args(["create", "contacts/c-1", "--set", "name=alice", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"alice\""))
+        .stdout(predicate::str::contains("\"id\"").not());
+}
+
+#[test]
+#[serial_test::parallel(peat_cli_two_party)]
+fn create_registered_collection_injects_id_from_target() {
+    // Registered type with no explicit `id` → filled from the target doc id
+    // so the operator doesn't repeat it in --set.
+    peat()
+        .args([
+            "create",
+            "capabilities/cap-1",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"id\": \"cap-1\""));
+}
+
+#[test]
+#[serial_test::parallel(peat_cli_two_party)]
+fn create_rejects_id_that_mismatches_target() {
+    // An explicit `id` disagreeing with the target doc id is a contradiction
+    // (stored key vs doc.id) → exit 4, before any mesh join.
+    peat()
+        .args([
+            "create",
+            "capabilities/cap-1",
+            "--set",
+            "id=cap-2",
+            "--set",
+            "name=thermal",
+            "--dry-run",
+        ])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("does not match target doc id"));
+}
+
+#[test]
+#[serial_test::parallel(peat_cli_two_party)]
 fn create_for_known_collection_validates_and_rejects_missing_required_fields() {
     // "capabilities" IS a registered collection (peat-schema). The target
     // doc_id is auto-injected as the `id` field, but `name` has no default

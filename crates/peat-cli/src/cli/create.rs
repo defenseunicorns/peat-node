@@ -8,7 +8,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::cli::writes::{
-    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+    apply_proto3_defaults, apply_sets, is_registered_collection, read_from,
+    validate_against_schema, POST_WRITE_SYNC_WAIT,
 };
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -61,12 +62,29 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         _ => unreachable!("clap ArgGroup requires --from or --set"),
     };
 
-    // If the doc_id came from --id and the document doesn't already have an
-    // `id` field (e.g. via --set id=…), inject it so registered types that
-    // require `id` (Capability, NodeConfig, …) don't fail validation.
-    if let Value::Object(ref mut map) = json_value {
-        map.entry("id")
-            .or_insert_with(|| Value::String(doc_id.clone()));
+    // For registered peat-schema types the `id` field equals the store key's
+    // doc id by convention, and the type validator requires it. Fill it from
+    // the target doc id so the operator doesn't have to repeat it in `--set`.
+    // Only for registered collections — arbitrary collections don't get a
+    // spurious `id`. If the document already carries an `id` that disagrees
+    // with the target doc id (via `--set id=…` or a `--from` file), that's a
+    // contradiction: the stored key would say one thing and the doc another.
+    // Reject it rather than silently storing a mismatch.
+    if is_registered_collection(collection) {
+        if let Value::Object(ref mut map) = json_value {
+            match map.get("id") {
+                Some(Value::String(existing)) if existing != &doc_id => {
+                    return Err(CliError::Malformed(format!(
+                        "document `id` ({existing}) does not match target doc id ({doc_id}); \
+                         omit `id` or make it match `{collection}/{doc_id}`"
+                    )));
+                }
+                Some(_) => {} // present and matching (or non-string — validation will catch)
+                None => {
+                    map.insert("id".to_string(), Value::String(doc_id.clone()));
+                }
+            }
+        }
     }
 
     // For registered peat-schema types, underlay proto3 zero-defaults for
@@ -108,7 +126,6 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
-            iroh_bind_port: None,
         },
     )
     .await?;

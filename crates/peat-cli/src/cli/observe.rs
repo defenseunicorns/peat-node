@@ -84,7 +84,6 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
             timeout,
             as_id: common.as_id.clone(),
             data_dir: common.data_dir.clone(),
-            iroh_bind_port: None,
         },
     )
     .await?;
@@ -94,10 +93,15 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
 
     // Dedup: peat-mesh fires observer_tx for every sync message processed,
     // including no-op rounds of the Automerge exchange that carry no new
-    // changes. Track the last-emitted Automerge save bytes per key and
-    // suppress events that don't advance the document state.
-    let mut last_seen: std::collections::HashMap<String, Vec<u8>> =
-        std::collections::HashMap::new();
+    // changes. Track a hash of the last-emitted document state per key and
+    // suppress events that don't advance it. Storing a u64 hash (not the
+    // full save bytes) keeps each entry tiny; `MAX_DEDUP_KEYS` bounds the
+    // map so a long-lived `observe --all-collections` can't grow unbounded.
+    // Dedup is best-effort (suppresses no-op sync rounds, not a guarantee),
+    // so clearing on overflow — costing at most one duplicate emission per
+    // still-live key afterward — is an acceptable trade for the memory bound.
+    const MAX_DEDUP_KEYS: usize = 10_000;
+    let mut last_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     // tokio::signal::ctrl_c is a Future that resolves on first SIGINT.
     // We multiplex it with the broadcast receiver via select.
@@ -124,13 +128,21 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                 }
 
                 let render = match store.get(&key) {
-                    // Live doc: deduplicate, then render.
+                    // Live doc: deduplicate on a hash of its state, then render.
                     Ok(Some(d)) => {
-                        let bytes = d.save();
-                        if last_seen.get(&key).map(|prev| prev == &bytes).unwrap_or(false) {
+                        let digest = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            d.save().hash(&mut h);
+                            h.finish()
+                        };
+                        if last_seen.get(&key) == Some(&digest) {
                             continue; // no actual change — skip
                         }
-                        last_seen.insert(key.clone(), bytes);
+                        if last_seen.len() >= MAX_DEDUP_KEYS {
+                            last_seen.clear();
+                        }
+                        last_seen.insert(key.clone(), digest);
                         render_observe_event(&key, &d, common.output)
                     }
                     // Document is gone between event emission and our read
