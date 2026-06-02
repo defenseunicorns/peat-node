@@ -127,7 +127,7 @@ peat create <COLLECTION>[/<DOC_ID>] (--from PATH|- | --set PATH=VALUE...) \
 
 # Upsert: applies path=value updates; creates the doc if missing.
 peat update <COLLECTION>/<DOC_ID> (--from PATH|- | --set PATH=VALUE...) \
-            [--dry-run] [--wait-for-sync]
+            [--dry-run] [--wait-for-sync] [--no-validate]
 
 # Tombstone the doc per ADR-034.
 peat delete <COLLECTION>/<DOC_ID> [--wait-for-sync]

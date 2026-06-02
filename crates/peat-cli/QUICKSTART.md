@@ -1,6 +1,6 @@
 # peat CLI — Quickstart
 
-A 5-minute walkthrough from zero to reading/writing documents on a Peat mesh. Stops along the way exercise everything you'll actually use in day-to-day operations.
+A ~5–10 minute walkthrough from zero to reading/writing documents on a Peat mesh — closer to 5 on the recommended mDNS path, longer if you stand up the compose or `peat-node` alternatives. Stops along the way exercise everything you'll actually use in day-to-day operations.
 
 > **What is `peat`?** A CRUD-shaped operator CLI that joins a Peat mesh as a real node, runs one command, and exits. Same protocol stack as `peat-node` — no admin-side API. See [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md) for the design.
 
@@ -30,7 +30,7 @@ cargo install --path crates/peat-cli
 # installs to ~/.cargo/bin/peat
 ```
 
-For (3), if you don't already have a `peat-node` to talk to, the fastest path is the compose example at [`examples/compose/`](../../examples/compose/) — `docker compose up -d && ./bootstrap.sh` boots two sidecars on a single host in about 30 seconds. Alternatively, two `peat` processes on the same host discover each other automatically via mDNS — see [Step 4](#step-4--watch-changes-live) for the two-terminal workflow. The rest of this guide assumes the compose example is running when an explicit peer is needed.
+For (3), the simplest peer is **another `peat` process on the same host**: two `peat` invocations sharing an `app_id` and `shared_key` discover each other automatically over mDNS — no peer list, no container, no `peat-node` required. That's the path [Step 4](#step-4--watch-changes-live) uses, and it's the fastest way to see sync work end-to-end. If you instead want to drive an existing `peat-node` deployment, the compose example at [`examples/compose/`](../../examples/compose/) (`docker compose up -d && ./bootstrap.sh`, ~30s) gives you two sidecars to talk to — its per-deployment credential setup is the first alternative in [Step 1](#step-1--write-a-credential-bundle).
 
 ---
 
@@ -118,7 +118,23 @@ peers:
 
 > **File-permission discipline (ADR-006):** `peat` refuses to read a bundle that is world- or group-readable. `chmod 600` is the path forward.
 
-### Concrete: drive the compose example from inside the container
+### Simplest: two `peat` processes on one host (recommended)
+
+For the fastest start you need neither a peer list nor a `peat-node`. A bundle with just `app_id` and `shared_key` is enough — two `peat` processes on the same host (or LAN) with matching values find each other over mDNS:
+
+```yaml
+# creds.yaml — minimal; peers discovered via mDNS
+app_id: my-formation
+shared_key: <output of `openssl rand -base64 32`>
+```
+
+```sh
+chmod 600 creds.yaml
+```
+
+Write documents in [Step 3](#step-3--create-update-and-delete-a-document), then jump to [Step 4's two-terminal workflow](#two-terminal-workflow-no-explicit-peer-needed) — that's the whole loop with no extra infrastructure. The two subsections below cover the heavier cases: a containerized compose demo, or a `peat-node` you operate.
+
+### Alternative: drive the compose example from inside the container
 
 The [`examples/compose/`](../../examples/compose/) demo only maps the gRPC TCP ports to the host — Iroh UDP stays on the compose bridge network. The cleanest way to drive it with `peat` is to run the CLI *inside* one of the sidecar containers (the `peat-node` image ships `/usr/local/bin/peat`):
 
@@ -143,7 +159,7 @@ chmod 600 /tmp/creds.yaml'
 
 From here, every `peat …` invocation in the remaining steps runs as `docker exec peat-node-a peat --creds /tmp/creds.yaml …`. To keep the examples below readable I'll write them as plain `peat …`; mentally prepend the `docker exec` prefix.
 
-### Concrete: drive a peat-node you control
+### Alternative: drive a `peat-node` you control
 
 If you have your own `peat-node` running on a network the CLI can reach (UDP and TCP both open), write the bundle on the host and supply `--creds ./creds.yaml` directly. The Helm + k3d path in the [container quickstart](../../QUICKSTART.md#path-b--helm--k3d-10-minutes) shows the `kubectl exec` variant of the same pattern.
 
@@ -169,6 +185,12 @@ Same shape on a specific collection:
 peat --creds ./creds.yaml query contacts
 ```
 
+Cap the result count on a large collection with `--limit`:
+
+```sh
+peat --creds ./creds.yaml query contacts --limit 20
+```
+
 Or a specific doc:
 
 ```sh
@@ -177,7 +199,7 @@ peat --creds ./creds.yaml query contacts/c-1234 --output text
 
 ---
 
-## Step 3 — Write a document
+## Step 3 — Create, update, and delete a document
 
 > **Prerequisite:** by default the CLI uses an ephemeral store per invocation — documents only persist if they sync to a connected peer before the process exits. To persist the local store across invocations, pass `--data-dir <PATH>` or add `data_dir: <path>` to your credentials bundle (`~/` is expanded). Steps 2–4 still require a reachable peer to see documents written by other nodes.
 
@@ -209,7 +231,7 @@ peat --creds ./creds.yaml create contacts \
   --wait-for-sync
 ```
 
-`--wait-for-sync` blocks until at least one peer has acknowledged the write. Drop it for fire-and-forget.
+`--wait-for-sync` approximates per-write peer acknowledgement with a brief fixed wait before returning — it is **not** a durability guarantee that a peer has persisted the write. (Real per-write ack tracking lands when `peat-mesh` exposes it.) Drop it for fire-and-forget.
 
 Read it back:
 
@@ -251,6 +273,8 @@ peat --creds ./creds.yaml observe --all-collections \
 In a second terminal, run a `create` from step 3 — you should see the new record appear in the observer's stdout within ~1 second. Same with `delete`: the observer emits `{"key":"…","deleted":true}`. `observe` deduplicates: it only emits when the document content actually changes, so you won't see duplicate events from Automerge's internal multi-hop sync exchanges.
 
 `peat observe contacts | head -n 5` exits cleanly with status 0 after the consumer closes its end. No `broken pipe` line on stderr.
+
+`observe` also takes `--mode` (`latest-only` (default), `windowed`, `full-history`), mapping to ADR-019 sync modes. Today only `latest-only` is effective — `peat-mesh` doesn't yet expose mode-bound subscriptions, so passing another mode prints a stderr warning and falls back to `latest-only`. The flag is wired now so scripts won't have to change when the upstream binding lands.
 
 ### Two-terminal workflow (no explicit peer needed)
 
@@ -305,6 +329,22 @@ kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
 ```
 
 ---
+
+## Beyond CRUD — extending the schema
+
+Everything above operates on two kinds of collection, and the difference matters once you go past a demo:
+
+- **Arbitrary-JSON collections** (`contacts/alice` above) — any collection name works, and `peat` stores whatever JSON you hand it. No validation: nothing checks field names or types. Good for ad-hoc state.
+- **Schema-registered (typed) collections** (`capabilities`, `node-configs`, … — the ones `peat schema list` shows) — validated against a registered type on every write. A missing required field or wrong type fails with exit 4 *before* it touches the mesh.
+
+`peat schema describe` only *reads* this registry; the CLI cannot define new types. Typed collections are defined upstream in the **`peat` repo's `peat-schema` crate** (`peat/peat-schema/`), schema-first as Protobuf message definitions — adding a `peat schema list` row is a change there, not here. That work is governed by the ecosystem invariants (FIPS-approved crypto primitives, no consumer-specific names, the `peat`-anchored dependency flow) and lands as its own PR in `peat` behind a tracking issue. It is not a casual edit.
+
+A note on **which protocol you're extending**, because this repo has two and they're easy to confuse:
+
+- `peat-cli` joins the mesh as a **node**. Its contract is the mesh protocol — `peat-protocol` / `peat-mesh` / `peat-schema` in the `peat` repo. That's the surface you extend to add types or change the sync/CRDT behavior the CLI sees.
+- `proto/sidecar.proto` in *this* repo is a **different consumer path**: the gRPC/Connect API `peat-node` exposes to a co-located application. Editing it changes nothing `peat-cli` does — the CLI does not speak to the sidecar API.
+
+See [`peat-node` ADR-001](../../docs/peat-node-adr-001-peat-cli.md) for why the CLI is a node rather than a control client, and the `peat-schema` crate's `README.md` + `SCHEMAS.md` for the current type catalog.
 
 ## Where to next
 
