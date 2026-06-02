@@ -79,7 +79,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-      # Toolchain (rustup/cargo) and protoc are pre-provisioned on this runner.
+      # Toolchain (rustup/cargo) + protoc are pre-provisioned, but rustup
+      # installs cargo to ~/.cargo/bin which GitHub's non-login step shell
+      # doesn't put on PATH. Add it so `cargo` resolves.
+      - name: Put cargo on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run peat-cli e2e tests (incl. mDNS via --include-ignored)
         run: cargo test -p peat-cli --test e2e -- --include-ignored
 
