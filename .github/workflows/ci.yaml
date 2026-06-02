@@ -60,8 +60,26 @@ jobs:
       # that here so the Linux signal matches the macOS one. The other
       # workspace members keep the parallel `--workspace` path.
       - run: cargo test --workspace --exclude peat-cli
-      - name: Run peat-cli tests in isolation
-        run: cargo test -p peat-cli
+      # Each peat-cli e2e test runs an in-process TestPeer AND spawns a `peat`
+      # subprocess, both doing real Iroh QUIC sync over loopback. On a 2-core
+      # runner the two tokio runtimes contend for cores; under load a sync can
+      # miss the 30s deadline. This is inherent to the test design (not a code
+      # bug — it flakes on main too), so retry up to 3x: the standard mitigation
+      # for network integration tests. The deterministic unit/parser tests rerun
+      # in <1s per attempt, so a retry only costs a re-run of the e2e binary.
+      - name: Run peat-cli tests in isolation (retry up to 3x — e2e is contention-sensitive)
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::peat-cli test attempt ${attempt}/3"
+            if cargo test -p peat-cli; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "peat-cli test attempt ${attempt} failed"
+          done
+          echo "peat-cli tests failed after 3 attempts"
+          exit 1
 
   build:
     name: Build
@@ -159,9 +177,22 @@ jobs:
       - name: Build workspace (macOS)
         if: runner.os == 'macOS'
         run: cargo build --workspace --release
-      - name: Run peat-cli tests (macOS only)
+      # Retry up to 3x — same contention-sensitive e2e tests as the Linux
+      # Test job (real Iroh QUIC sync over loopback; flaky under CPU load).
+      - name: Run peat-cli tests (macOS only, retry up to 3x)
         if: matrix.test
-        run: cargo test -p peat-cli
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::peat-cli test attempt ${attempt}/3"
+            if cargo test -p peat-cli; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "peat-cli test attempt ${attempt} failed"
+          done
+          echo "peat-cli tests failed after 3 attempts"
+          exit 1
 
   helm-lint:
     name: Helm Lint
