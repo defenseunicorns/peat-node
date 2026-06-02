@@ -129,26 +129,15 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
 
     let doc = json_to_automerge(&json_value, None)
         .map_err(|e| CliError::Generic(format!("build automerge doc: {e}")))?;
-    if args.wait_for_sync {
-        // Suppress change_tx so on_change_pusher does not race the explicit
-        // sync below. Both callers call clear_sync_state_for_document, which
-        // resets the Automerge exchange mid-flight and can trip the
-        // circuit-breaker under CI load. observer_tx still fires (peat observe
-        // still works); only the pusher-triggered re-sync is suppressed.
-        session
-            .backend()
-            .store()
-            .put_without_notify(&key, &doc)
-            .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
-    } else {
-        session
-            .backend()
-            .store()
-            .put(&key, &doc)
-            .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
-    }
+    session
+        .backend()
+        .store()
+        .put(&key, &doc)
+        .map_err(|e| CliError::Generic(format!("put `{key}`: {e}")))?;
 
     if args.wait_for_sync {
+        // Push inline on the main task so the on-change-pusher background
+        // task cannot race the CLI exit and drop mid-send.
         if let Err(e) = session
             .backend()
             .coordinator()
@@ -157,6 +146,11 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         {
             tracing::warn!(key = %key, "sync_document_with_all_peers failed: {e}");
         }
+        // Round-trip confirmation: sync_document_with_all_peers writes to
+        // the QUIC send buffer but does not wait for peer ACK. A subsequent
+        // sync_all_documents_with_peer request/response cycle only completes
+        // after the peer has processed the connection's prior data, confirming
+        // the create was received before the CLI exits.
         for peer_id in session.backend().transport().connected_peers() {
             if let Err(e) = session
                 .backend()
@@ -168,9 +162,6 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
             }
         }
         tokio::time::sleep(POST_WRITE_SYNC_WAIT).await;
-        println!("{key}");
-        session.close().await;
-        return Ok(());
     }
 
     println!("{key}");

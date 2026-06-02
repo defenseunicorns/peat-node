@@ -477,21 +477,6 @@ impl MeshSession {
     pub fn node_id(&self) -> &str {
         &self.node_id
     }
-
-    /// Let the Automerge sync exchange complete before dropping the session.
-    ///
-    /// The Automerge sync protocol requires 3 QUIC stream round-trips:
-    ///   bloom-filter → peer response → actual changes
-    /// Each round-trip takes < 5ms on loopback. This sleep gives the
-    /// SyncChannelManager writer tasks time to drain their mpsc queues
-    /// and transmit all three messages before the iroh endpoint drops.
-    ///
-    /// `blob_store().shutdown()` was tried here but sends CONNECTION_CLOSE
-    /// BEFORE the exchange completes, preventing the peer from opening the
-    /// streams needed for steps 2-3. A plain sleep avoids that race.
-    pub async fn close(self) {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 }
 
 /// Create `path` (and any parents) with restricted permissions.
