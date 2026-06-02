@@ -951,11 +951,17 @@ async fn mdns_observe_sees_create_without_explicit_peers() {
     use base64::Engine as _;
     let key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
 
+    // Unique formation id per run: the self-hosted CI runner is shared, so a
+    // hardcoded app_id would let two concurrent runs' mDNS advertisements
+    // discover each other on the host's loopback. A per-run id (plus the
+    // formation_id filter in join.rs) keeps each run's discovery isolated.
+    let app_id = format!("peat-cli-e2e-mdns-{}", uuid::Uuid::new_v4());
+
     // Shared creds with NO peers — mDNS must bridge the two processes.
     let creds_path = dir.path().join("creds.yaml");
     std::fs::write(
         &creds_path,
-        format!("app_id: peat-cli-e2e\nshared_key: {key}\n"),
+        format!("app_id: {app_id}\nshared_key: {key}\n"),
     )
     .unwrap();
 

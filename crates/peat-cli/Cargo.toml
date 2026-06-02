@@ -61,3 +61,6 @@ base64 = "0.22"
 # crypto provider and triggers handshake races. Mirrors peat-node's own
 # tests/sync_test.rs pattern (`#[serial(iroh_two_node)]`).
 serial_test = "3"
+# Unique per-run formation id in the mDNS e2e test so concurrent runs on
+# the shared self-hosted runner can't discover each other over loopback.
+uuid = { version = "1", features = ["v4"] }
