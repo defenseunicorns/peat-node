@@ -54,7 +54,8 @@ jobs:
       - name: Review PR with Claude Code
         if: steps.prior.outputs.skip != 'true'
         env:
-          GH_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:               ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           HAS_PRIOR: ${{ steps.prior.outputs.has_prior }}
           PREV_SHA:  ${{ steps.prior.outputs.prev_sha }}
           SHORT_SHA: ${{ steps.prior.outputs.short_sha }}

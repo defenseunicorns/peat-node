@@ -34,7 +34,8 @@ pub struct CreateArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Block until at least one peer has acknowledged.
+    /// Wait briefly for the write to sync to peers before returning.
+    /// Approximate (fixed wait), not a delivery/durability guarantee.
     #[arg(long)]
     pub wait_for_sync: bool,
 
