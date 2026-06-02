@@ -91,6 +91,18 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
     let store = session.backend().store().clone();
     let mut rx = store.subscribe_to_observer_changes();
 
+    // Dedup: peat-mesh fires observer_tx for every sync message processed,
+    // including no-op rounds of the Automerge exchange that carry no new
+    // changes. Track a hash of the last-emitted document state per key and
+    // suppress events that don't advance it. Storing a u64 hash (not the
+    // full save bytes) keeps each entry tiny; `MAX_DEDUP_KEYS` bounds the
+    // map so a long-lived `observe --all-collections` can't grow unbounded.
+    // Dedup is best-effort (suppresses no-op sync rounds, not a guarantee),
+    // so clearing on overflow — costing at most one duplicate emission per
+    // still-live key afterward — is an acceptable trade for the memory bound.
+    const MAX_DEDUP_KEYS: usize = 10_000;
+    let mut last_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
     // tokio::signal::ctrl_c is a Future that resolves on first SIGINT.
     // We multiplex it with the broadcast receiver via select.
     let mut sigint = Box::pin(tokio::signal::ctrl_c());
@@ -109,7 +121,6 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                     }
                     Err(RecvError::Closed) => break,
                 };
-
                 if let Some(target) = &target_key {
                     if &key != target { continue; }
                 } else if !key.starts_with(&prefix) {
@@ -117,14 +128,32 @@ pub async fn run(args: ObserveArgs, common: CommonArgs) -> Result<(), CliError> 
                 }
 
                 let render = match store.get(&key) {
-                    // Live doc: render it.
-                    Ok(Some(d)) => render_observe_event(&key, &d, common.output),
+                    // Live doc: deduplicate on a hash of its state, then render.
+                    Ok(Some(d)) => {
+                        let digest = {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            d.save().hash(&mut h);
+                            h.finish()
+                        };
+                        if last_seen.get(&key) == Some(&digest) {
+                            continue; // no actual change — skip
+                        }
+                        if last_seen.len() >= MAX_DEDUP_KEYS {
+                            last_seen.clear();
+                        }
+                        last_seen.insert(key.clone(), digest);
+                        render_observe_event(&key, &d, common.output)
+                    }
                     // Document is gone between event emission and our read
                     // (tombstoned). Emit a structurally distinct "deleted"
                     // record so CDC consumers see deletes, not just upserts.
                     // ADR-034 metadata refinement is a follow-up; for v1
                     // we emit a minimal `deleted: true` envelope.
-                    Ok(None) => render_observe_deleted(&key, common.output),
+                    Ok(None) => {
+                        last_seen.remove(&key);
+                        render_observe_deleted(&key, common.output)
+                    }
                     Err(e) => {
                         tracing::warn!(key = %key, error = %e, "store read failed");
                         continue;

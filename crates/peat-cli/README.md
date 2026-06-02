@@ -37,11 +37,11 @@ EOF
 
 # One-shot read.
 kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml query contacts/c-1234 --output json
+  peat --creds /tmp/creds.yaml query contacts/c-1234
 
 # Streaming observe (Ctrl-C to exit; binary handles SIGINT cleanly).
 kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
-  peat --creds /tmp/creds.yaml observe contacts --output ndjson
+  peat --creds /tmp/creds.yaml observe contacts
 ```
 
 `peat` joins as an ephemeral observer node — no persistent state survives the `exec` invocation, presence records carry a short TTL, and the mesh does not plan around the CLI as a durable participant.
@@ -69,13 +69,30 @@ openssl rand -base64 32
 ```yaml
 app_id: my-app
 shared_key: <base64-formation-key>
+
+# Optional: explicit peers in <endpoint_id>@<host>:<port> form.
+# Not needed when peers are on the same host/LAN — mDNS discovers them.
 peers:
   - <endpoint_id>@10.0.0.5:4242
+
+# Optional: persist the local store across CLI restarts.
+data_dir: ~/.local/share/peat/my-app
+
+# Optional: disable mDNS peer discovery (for containers where multicast
+# is unavailable). Default: mDNS is enabled.
+# disable_mdns: true
+
 # encryption_key: <base64-32-byte-key>   # accepted by schema but rejected at
 # load time; at-rest cipher layering vs. peat-node's app-level encryption is
 # being resolved in peat#940. Setting this field today exits 2 with a clear
 # error rather than silently bypassing encryption.
 ```
+
+### mDNS zero-config peer discovery
+
+`peat` processes with the same `app_id` and `shared_key` on the same host or LAN discover each other automatically via mDNS (`_peat._udp.local.`). The formation key HMAC validates that only same-formation peers connect. The `peers:` list is therefore optional — omit it entirely for local workflows.
+
+Set `disable_mdns: true` in the bundle to opt out. This is necessary in containers where multicast routing is typically unavailable.
 
 ## Commands
 
@@ -83,11 +100,11 @@ peers:
 
 ```sh
 # Materialised current state for one collection or doc.
-peat query <COLLECTION>[/<DOC_ID>] [--limit N] [--output text|json|ndjson]
+peat query <COLLECTION>[/<DOC_ID>] [--limit N] [--output json|text|ndjson]
 
 # Scan every collection reachable with the credential bundle.
-peat query --all-collections [--limit N] [--output text|json|ndjson]
-peat query --all              [--limit N] [--output text|json|ndjson]   # short alias
+peat query --all-collections [--limit N] [--output json|text|ndjson]
+peat query --all              [--limit N] [--output json|text|ndjson]   # short alias
 
 # Live stream of updates until SIGINT.
 peat observe <COLLECTION>[/<DOC_ID>] [--mode latest-only|windowed|full-history]
@@ -103,16 +120,20 @@ Exactly one of `<TARGET>` or `--all-collections` is required; combining them is 
 
 ```sh
 # Strict-create: errors if the doc already exists.
-peat create <COLLECTION> [--id DOC_ID] (--from PATH|- | --set PATH=VALUE...) \
+# <DOC_ID> is optional — omit for an auto-generated UUID.
+# For schema-registered types, the `id` field is auto-injected from <DOC_ID>.
+peat create <COLLECTION>[/<DOC_ID>] (--from PATH|- | --set PATH=VALUE...) \
             [--dry-run] [--wait-for-sync] [--no-validate]
 
 # Upsert: applies path=value updates; creates the doc if missing.
-peat update <COLLECTION>/<DOC_ID> --set PATH=VALUE... \
+peat update <COLLECTION>/<DOC_ID> (--from PATH|- | --set PATH=VALUE...) \
             [--dry-run] [--wait-for-sync]
 
 # Tombstone the doc per ADR-034.
 peat delete <COLLECTION>/<DOC_ID> [--wait-for-sync]
 ```
+
+`--wait-for-sync` works with both explicit peers and mDNS-discovered peers.
 
 ### Schema discovery
 
@@ -126,13 +147,15 @@ peat schema describe <COLLECTION | TYPE_ID>
 
 Both run offline — no credential bundle required. Useful to audit which types are registered before staging a write, or to discover field names + formats for a `--set` payload. Address by collection (`capabilities`) or canonical id (`peat.capability.v1.Capability`); a typo returns exit 4 with `no registered type matches`.
 
+Schema commands produce human-readable text output by default regardless of the global `--output` setting — they are offline inspectors, not data pipelines. Pass `--output json` explicitly if you need machine-readable schema output.
+
 ### Output formats
 
 | Format | Use |
 |---|---|
-| `text` (default) | Human-readable. Pretty-printed JSON in v1; richer typed renderers land as `peat-schema` exposes a type registry. |
-| `json` | Single canonical JSON value. Stable schema for scripts. |
-| `ndjson` | One JSON record per line. Natural for `observe \| jq` and log shipping. |
+| `json` **(default)** | Single canonical JSON value. Stable schema for scripts. Pipe directly to `jq`. |
+| `text` | Human-readable labeled output. Pass `--output text` for terminal-friendly display. |
+| `ndjson` | One JSON record per line, with a `key` field: `{"key": "capabilities:cap-1", "doc": {...}}`. Natural for `observe \| jq` and log shipping; the `key` field is useful for CDC or multi-collection streams. |
 
 ### Exit codes
 
@@ -144,7 +167,7 @@ Per ADR-001 "Shell integration discipline":
 | 1 | timeout / no peers / generic failure |
 | 2 | authentication failure |
 | 3 | permission denied |
-| 4 | malformed request (bad target, conflicting flags, duplicate `--id`, …) |
+| 4 | malformed request (bad target, conflicting flags, doc already exists on `create`, …) |
 | 130 | SIGINT (Ctrl-C while streaming) |
 
 Data goes to **stdout**; logs, errors, and status to **stderr**. `peat … > file.json` produces a clean file with no log noise.
@@ -152,20 +175,29 @@ Data goes to **stdout**; logs, errors, and status to **stderr**. `peat … > fil
 ## Examples
 
 ```sh
-# Show the current state of a doc.
-peat query contacts/c-1234 --output json
+# Show the current state of a doc (JSON by default).
+peat query contacts/c-1234
+
+# Pipe directly to jq — no --output flag needed.
+peat query contacts/c-1234 | jq '.name'
 
 # Sweep every collection reachable with the bundle.
-peat query --all --output json | jq 'keys'
+peat query --all | jq 'keys'
 
-# Stream every update to the contacts collection as ndjson.
-peat observe contacts --output ndjson | jq 'select(.doc.rank > 3)'
+# Stream every update to the contacts collection.
+peat observe contacts | jq 'select(.doc.rank > 3)'
 
 # Cross-collection observer — route on the key field.
-peat observe --all --output ndjson | jq 'select(.key | startswith("contacts:"))'
+peat observe --all | jq 'select(.key | startswith("contacts:"))'
 
-# Create a doc from a JSON file.
-peat create contacts --id c-1234 --from contact.json --wait-for-sync
+# Create a doc with a specific id (slash syntax).
+peat create contacts/c-1234 --from contact.json --wait-for-sync
+
+# Create a doc with an auto-generated UUID.
+peat create contacts --set name=alice --wait-for-sync
+
+# Create a schema-registered doc — id is auto-injected from the doc_id.
+peat create capabilities/cap-thermal --set name=thermal-sensor --set confidence=0.92 --wait-for-sync
 
 # Tweak a single field, leaving everything else alone.
 peat update contacts/c-1234 --set rank=2 --wait-for-sync
@@ -177,7 +209,7 @@ peat delete contacts/c-1234
 ### Round-trip edit
 
 ```sh
-peat query contacts/c-1234 --output json \
+peat query contacts/c-1234 \
   | jq '.position.lat = 40.7128' \
   | peat update contacts/c-1234 --from -
 ```
@@ -187,8 +219,9 @@ peat query contacts/c-1234 --output json \
 ## Operational notes
 
 - **Posture.** `peat` joins as a short-TTL observer; it advertises no application capabilities, and other peers can filter it out of routing decisions. Writes are author-stamped with the credential identity (`--as <id>` overrides).
-- **Tempdir.** Each invocation gets an ephemeral data dir that is removed on exit. No persistent state survives a CLI run.
-- **`--wait-for-sync`.** Approximates per-write peer-acknowledgement with a brief fixed wait. Real ack tracking lands when [peat-mesh](https://github.com/defenseunicorns/peat-mesh) exposes it.
+- **Tempdir.** Each invocation without `--data-dir` gets an ephemeral data dir that is removed on exit. No persistent state survives a CLI run unless `data_dir` is configured.
+- **`--wait-for-sync`.** Approximates per-write peer-acknowledgement with a brief fixed wait. Works with both explicit peers and mDNS-discovered peers. Real ack tracking lands when [peat-mesh](https://github.com/defenseunicorns/peat-mesh) exposes it.
+- **`observe` deduplication.** `peat observe` emits only when document content actually changes. The Automerge multi-hop sync protocol internally exchanges 2-3 messages; only distinct document states produce output events.
 
 ## Troubleshooting
 
@@ -212,6 +245,16 @@ The bundle sets `encryption_key`, but the at-rest cipher path is still being res
 - Peer endpoint id matches what `peat-node` advertises (`GET /status` on the sidecar's gRPC surface, field `endpointAddr`).
 - The `host:port` resolves and the host is reachable on UDP (Iroh transport).
 - `--timeout` is long enough — default `10s` is brief on cold links; pass `--timeout 60s` for slow networks.
+
+If you're relying on mDNS rather than explicit peers, confirm that `disable_mdns` is not set and that multicast is available on the interface (mDNS does not work in most container networking configurations).
+
+**Local store is locked**
+
+```
+the local store at /path/to/data is locked — another `peat` process is likely running. Stop it and retry.
+```
+
+Only one `peat` process can hold a redb store at a time. When using `observe` with `--data-dir`, writer processes must use a different `--data-dir` or omit it entirely (ephemeral). Stop the conflicting process and retry.
 
 **Query returns empty / observe never fires**
 

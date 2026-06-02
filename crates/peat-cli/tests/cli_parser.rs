@@ -170,7 +170,7 @@ fn create_with_from() {
     let cli = parse(&["create", "contacts", "--from", "doc.json", "--dry-run"]);
     match cli.command {
         Command::Create(c) => {
-            assert_eq!(c.collection, "contacts");
+            assert_eq!(c.target, "contacts");
             assert_eq!(c.from.as_deref().unwrap().to_str().unwrap(), "doc.json");
             assert!(c.dry_run);
             assert!(!c.wait_for_sync);
@@ -279,7 +279,7 @@ fn schema_requires_sub() {
 fn common_args_defaults() {
     let cli = parse(&["query", "contacts"]);
     assert_eq!(cli.common.timeout, "10s");
-    assert_eq!(cli.common.output, OutputFormat::Text);
+    assert_eq!(cli.common.output, OutputFormat::Json);
     assert_eq!(cli.common.verbose, 0);
     assert!(cli.common.creds.is_none());
 }

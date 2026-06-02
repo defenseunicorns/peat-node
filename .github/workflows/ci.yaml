@@ -47,21 +47,45 @@ jobs:
           cache-on-failure: true
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      # peat-cli's e2e binary spawns the real `peat` binary as a
-      # subprocess for every test and exercises a live mesh sync
-      # against an in-process TestPeer over loopback Iroh. Running it
-      # alongside `peat-node`'s heavier integration tests on a 2-core
-      # GitHub Linux runner produces enough contention to starve the
-      # subprocesses' tokio runtimes — initial sync drains miss the
-      # CLI's POST_JOIN_SETTLE window and tests that pre-seed via
-      # `peer.store.put` race the CLI's join handshake. The
-      # `Cross-platform (macos-14)` job (further down this workflow)
-      # already isolates peat-cli with `cargo test -p peat-cli`; mirror
-      # that here so the Linux signal matches the macOS one. The other
-      # workspace members keep the parallel `--workspace` path.
+      # peat-cli is excluded here: its deterministic tests run in the next
+      # step, and its e2e binary runs on the self-hosted `peat-cli-e2e` job.
       - run: cargo test --workspace --exclude peat-cli
-      - name: Run peat-cli tests in isolation
-        run: cargo test -p peat-cli
+      # peat-cli's deterministic tests (lib unit + parser) run here. The e2e
+      # binary (real Iroh QUIC sync over loopback) needs real CPU + a real
+      # network stack and runs on the self-hosted `peat-cli-e2e` job instead —
+      # on this 2-core container it was ~40-50% flaky (contention starves the
+      # subprocess tokio runtimes) and mDNS multicast doesn't work at all.
+      - name: Run peat-cli unit + parser tests
+        run: |
+          cargo test -p peat-cli --lib
+          cargo test -p peat-cli --test cli_parser
+
+  peat-cli-e2e:
+    name: peat-cli e2e (self-hosted)
+    # Same self-hosted runner as the QA review job: real cores (no tokio-runtime
+    # starvation under the loopback-QUIC contention that flakes hosted runners)
+    # and a real network stack (loopback multicast works, so the mDNS discovery
+    # test runs for real via `--include-ignored`).
+    runs-on: peat-arm64-linux-gb10-node
+    # Fork-PR guard: never run untrusted PR code on self-hosted hardware.
+    # Same-repo PRs and push events run; fork PRs are skipped.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # Serialize e2e on the shared self-hosted runner: at most one run at a
+    # time repo-wide, newest wins. Prevents pileup and stops two concurrent
+    # runs' mDNS advertisements from cross-talking on the host's loopback.
+    concurrency:
+      group: peat-cli-e2e-self-hosted
+      cancel-in-progress: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      # Toolchain (rustup/cargo) + protoc are pre-provisioned, but rustup
+      # installs cargo to ~/.cargo/bin which GitHub's non-login step shell
+      # doesn't put on PATH. Add it so `cargo` resolves.
+      - name: Put cargo on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run peat-cli e2e tests (incl. mDNS via --include-ignored)
+        run: cargo test -p peat-cli --test e2e -- --include-ignored
 
   build:
     name: Build
@@ -105,7 +129,7 @@ jobs:
           test ! -s stdout.txt
           grep -q "authentication failure" stderr.txt
           # create --dry-run skips the join prelude — confirm it renders.
-          "$PEAT" create contacts --id c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
+          "$PEAT" create contacts/c-1 --set name=alice --dry-run > stdout.txt 2> /dev/null
           grep -q '"op": "create"' stdout.txt
           grep -q '"key": "contacts:c-1"' stdout.txt
           # update --from reads the proposed JSON before the join prelude
@@ -159,9 +183,14 @@ jobs:
       - name: Build workspace (macOS)
         if: runner.os == 'macOS'
         run: cargo build --workspace --release
-      - name: Run peat-cli tests (macOS only)
+      # Deterministic peat-cli tests only (lib unit + parser). The e2e binary
+      # runs on the self-hosted `peat-cli-e2e` job — it's contention-flaky on
+      # hosted runners. This job still validates the macOS/aarch64 build above.
+      - name: Run peat-cli unit + parser tests (macOS only)
         if: matrix.test
-        run: cargo test -p peat-cli
+        run: |
+          cargo test -p peat-cli --lib
+          cargo test -p peat-cli --test cli_parser
 
   helm-lint:
     name: Helm Lint

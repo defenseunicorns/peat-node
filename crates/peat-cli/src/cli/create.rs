@@ -8,7 +8,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::cli::writes::{
-    apply_proto3_defaults, apply_sets, read_from, validate_against_schema, POST_WRITE_SYNC_WAIT,
+    apply_proto3_defaults, apply_sets, is_registered_collection, read_from,
+    validate_against_schema, POST_WRITE_SYNC_WAIT,
 };
 use crate::cli::{parse_timeout, CliError, CommonArgs};
 use crate::creds;
@@ -17,12 +18,9 @@ use crate::join::{MeshSession, SessionOptions};
 #[derive(Debug, Args)]
 #[command(group = clap::ArgGroup::new("input").required(true).args(["from", "set"]))]
 pub struct CreateArgs {
-    /// Target collection.
-    pub collection: String,
-
-    /// Explicit document id. Default: generated.
-    #[arg(long, value_name = "DOC_ID")]
-    pub id: Option<String>,
+    /// Target as `<COLLECTION>` or `<COLLECTION>/<DOC_ID>`.
+    /// If `<DOC_ID>` is omitted a UUID is generated.
+    pub target: String,
 
     /// Read document content from file. Use `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "set")]
@@ -50,32 +48,59 @@ pub async fn run(args: CreateArgs, common: CommonArgs) -> Result<(), CliError> {
         tracing::warn!("--no-validate set; skipping schema validation");
     }
 
-    let json_value: Value = match (args.from.as_deref(), args.set.as_slice()) {
+    let (collection, doc_id_opt) = crate::cli::query::parse_target(&args.target)?;
+    // doc_id from the target path, or a generated UUID if only a collection
+    // was given (e.g. `peat create capabilities --set name=foo`).
+    let doc_id = doc_id_opt
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let key = format!("{collection}:{doc_id}");
+
+    let mut json_value: Value = match (args.from.as_deref(), args.set.as_slice()) {
         (Some(path), _) => read_from(path)?,
         (None, sets) if !sets.is_empty() => apply_sets(Value::Object(Default::default()), sets)?,
         _ => unreachable!("clap ArgGroup requires --from or --set"),
     };
+
+    // For registered peat-schema types the `id` field equals the store key's
+    // doc id by convention, and the type validator requires it. Fill it from
+    // the target doc id so the operator doesn't have to repeat it in `--set`.
+    // Only for registered collections — arbitrary collections don't get a
+    // spurious `id`. If the document already carries an `id` that disagrees
+    // with the target doc id (via `--set id=…` or a `--from` file), that's a
+    // contradiction: the stored key would say one thing and the doc another.
+    // Reject it rather than silently storing a mismatch.
+    if is_registered_collection(collection) {
+        if let Value::Object(ref mut map) = json_value {
+            match map.get("id") {
+                Some(Value::String(existing)) if existing != &doc_id => {
+                    return Err(CliError::Malformed(format!(
+                        "document `id` ({existing}) does not match target doc id ({doc_id}); \
+                         omit `id` or make it match `{collection}/{doc_id}`"
+                    )));
+                }
+                Some(_) => {} // present and matching (or non-string — validation will catch)
+                None => {
+                    map.insert("id".to_string(), Value::String(doc_id.clone()));
+                }
+            }
+        }
+    }
 
     // For registered peat-schema types, underlay proto3 zero-defaults for
     // every field the user did not specify (peat-node#112). Without this,
     // `peat create capabilities --set id=cap-1 --set name=thermal` fails
     // prost's strict deserialize on sibling-field absence. User-supplied
     // fields always win.
-    let json_value = apply_proto3_defaults(&args.collection, json_value);
+    let json_value = apply_proto3_defaults(collection, json_value);
 
     // Schema gate (ADR-001 §"Write semantics" → "Validation"). Runs against
     // the peat-schema type registry: known collections enforce the
     // typed-message shape and field constraints; unknown collections accept
     // structurally. `--no-validate` skips the gate with the warning above.
     if !args.no_validate {
-        validate_against_schema(&args.collection, &json_value)?;
+        validate_against_schema(collection, &json_value)?;
     }
-
-    let doc_id = args
-        .id
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let key = format!("{}:{}", args.collection, doc_id);
 
     if args.dry_run {
         // Print the would-be operation in canonical JSON and exit 0 without

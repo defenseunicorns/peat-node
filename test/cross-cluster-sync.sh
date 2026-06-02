@@ -115,17 +115,36 @@ deploy_to() {
     fi
 }
 
+# Create one k3d cluster, retrying transient provisioning failures.
+# k3d occasionally fails to bring a cluster up on loaded CI runners
+# (docker/network races) and rolls itself back — infra flake, not a test
+# failure. Retry a few times, cleaning up partial state between attempts.
+create_one_cluster() {
+    local name="$1"
+    local attempt
+    for attempt in 1 2 3; do
+        log "Creating k3d cluster: ${name} on network ${NETWORK} (attempt ${attempt}/3)"
+        if k3d cluster create "${name}" --network "${NETWORK}" --wait 2>&1 | tail -1; then
+            return 0
+        fi
+        log "cluster ${name} creation failed (attempt ${attempt}/3); cleaning up and retrying"
+        k3d cluster delete "${name}" 2>/dev/null || true
+        sleep 5
+    done
+    # Downstream steps need the cluster; abort hard (matches the original
+    # set -e behavior) rather than continuing without one.
+    fail "k3d cluster ${name} failed to create after 3 attempts"
+    exit 1
+}
+
 create_clusters() {
     build_image
 
     # Both clusters share a Docker network so each cluster's node
     # container is reachable from the other's pods via Docker DNS at
     # `k3d-${CLUSTER}-server-0` on the `${NETWORK}` network.
-    log "Creating k3d cluster: ${ALPHA} on network ${NETWORK}"
-    k3d cluster create "${ALPHA}" --network "${NETWORK}" --wait 2>&1 | tail -1
-
-    log "Creating k3d cluster: ${BRAVO} on network ${NETWORK}"
-    k3d cluster create "${BRAVO}" --network "${NETWORK}" --wait 2>&1 | tail -1
+    create_one_cluster "${ALPHA}"
+    create_one_cluster "${BRAVO}"
 
     log "Loading image into clusters..."
     k3d image import "${IMAGE}" -c "${ALPHA}" 2>&1 | tail -1
@@ -302,7 +321,7 @@ EOF
 
     # Offline sanity: schema list must work without joining a mesh.
     if kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
-        peat schema list 2>&1 | grep -q "capabilities"; then
+        peat --output text schema list 2>&1 | grep -q "capabilities"; then
         pass "peat schema list runs offline inside the pod"
     else
         fail "peat schema list failed inside the pod"
@@ -317,7 +336,7 @@ EOF
     log "Step (Test 6): create with debug logs"
     CREATE_OUT=$(kubectl --context "${CTX_A}" exec -n peat deploy/peat-peat-node -c peat-node -- \
         sh -c 'RUST_LOG=peat_cli=debug,peat_mesh=debug,iroh=debug peat --creds /tmp/creds.yaml --timeout 60s \
-            create contacts --id cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
+            create contacts/cli-smoke --set name=via-cli --wait-for-sync 2>&1' || true)
     echo "${CREATE_OUT}" | sed 's/^/    /'
     if echo "${CREATE_OUT}" | grep -q "contacts:cli-smoke"; then
         pass "peat create via kubectl exec succeeded"

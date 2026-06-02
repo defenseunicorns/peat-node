@@ -25,7 +25,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::time::timeout;
 
-const TEST_APP_ID: &str = "peat-cli-e2e";
+pub const TEST_APP_ID_CONST: &str = "peat-cli-e2e";
+const TEST_APP_ID: &str = TEST_APP_ID_CONST;
 
 /// 32-byte zero key, base64-encoded. Real deployments rotate a securely
 /// generated key; e2e tests just need a valid-shape constant so every
@@ -231,7 +232,8 @@ impl TestPeer {
         let yaml = format!(
             "app_id: {app_id}\n\
              shared_key: {key}\n\
-             peers:\n  - {peer_id}@127.0.0.1:{port}\n",
+             peers:\n  - {peer_id}@127.0.0.1:{port}\n\
+             disable_mdns: true\n",
             app_id = self.app_id,
             key = self.formation_key_b64,
             peer_id = self.endpoint_id,
@@ -277,6 +279,30 @@ pub fn spawn_peat_streaming(creds: &Path, args: &[&str]) -> Child {
         .kill_on_drop(true)
         .spawn()
         .expect("spawn peat (streaming)")
+}
+
+/// Non-panicking variant: reads until `needle` is seen, returning `Ok(seen)`,
+/// or returns `Err(seen)` after the caller's timeout fires. Designed for use
+/// with `tokio::time::timeout` so the caller can do post-mortem diagnosis.
+pub async fn await_stdout_contains_no_panic(child: &mut Child, needle: &str) -> String {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout).lines();
+    let mut seen = String::new();
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                seen.push_str(&line);
+                seen.push('\n');
+                if line.contains(needle) {
+                    return seen;
+                }
+            }
+            Ok(None) | Err(_) => {
+                // EOF or error — won't see needle; caller's timeout handles it.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 /// Read lines from `child.stdout` until one contains `needle` or

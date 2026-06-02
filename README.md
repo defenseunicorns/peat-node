@@ -113,7 +113,7 @@ Every CLI flag has a `PEAT_NODE_*` environment variable equivalent — see [`doc
 ```bash
 peat query contacts/c-1234 --output json
 peat observe contacts --output ndjson | jq 'select(.doc.rank > 3)'
-peat create contacts --id c-1234 --from contact.json --wait-for-sync
+peat create contacts/c-1234 --from contact.json --wait-for-sync
 peat update contacts/c-1234 --set rank=2 --wait-for-sync
 peat delete contacts/c-1234
 ```

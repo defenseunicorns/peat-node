@@ -60,13 +60,13 @@ pass "demo writes on node-a, reads on node-b"
 # ---- Step 0: offline schema discovery (QUICKSTART step 0) -----------
 
 log "Step 0: 'peat schema list' inside peat-node-a (offline, no creds)"
-out=$(docker exec peat-node-a peat schema list)
+out=$(docker exec peat-node-a peat --output text schema list)
 echo "${out}" | grep -q "capabilities" || fail "schema list missing 'capabilities'"
 echo "${out}" | grep -q "node-configs" || fail "schema list missing 'node-configs'"
 pass "schema list enumerates all 5 builtin types"
 
 log "Step 0b: 'peat schema describe capabilities' renders field shape"
-out=$(docker exec peat-node-a peat schema describe capabilities)
+out=$(docker exec peat-node-a peat --output text schema describe capabilities)
 echo "${out}" | grep -q "Capability (v1)" || fail "describe missing type header"
 echo "${out}" | grep -q "confidence" || fail "describe missing confidence field"
 echo "${out}" | grep -q "percentage" || fail "describe missing percentage format"
@@ -184,8 +184,7 @@ pass "query --all-collections sees the demo doc"
 
 log "Step 3: 'peat create capabilities/cap-thermal' from inside peat-node-a"
 docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
-    create capabilities --id cap-thermal \
-    --set id=cap-thermal \
+    create capabilities/cap-thermal \
     --set name=thermal-sensor \
     --set confidence=0.92 \
     --wait-for-sync >/dev/null
@@ -243,8 +242,8 @@ docker exec peat-node-a sh -c '
 sleep 3
 
 docker exec peat-node-a peat --creds /tmp/creds.yaml --timeout 60s \
-    create capabilities --id cap-radio \
-    --set id=cap-radio --set name=radio --set confidence=0.5 \
+    create capabilities/cap-radio \
+    --set name=radio --set confidence=0.5 \
     --wait-for-sync >/dev/null
 
 # Poll the observer's output for the new key.
