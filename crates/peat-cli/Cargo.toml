@@ -31,19 +31,20 @@ tempfile = "3"
 # workspace can't end up with two peat-mesh / iroh versions in one process
 # (iroh has process-global crypto + ALPN registries that explode under
 # version skew, see peat#923/#924).
-peat-mesh = { version = "=0.9.0-rc.30", features = ["automerge-backend"] }
-peat-protocol = { version = ">=0.9.0-rc.17, <0.9.1", features = ["automerge-backend"] }
-# peat-schema runtime type registry. Floor is rc.21 — first cut to ship
-# `TypeDescriptor::proto3_zero()` (peat#953 / peat#954), which
-# `apply_proto3_defaults` in `cli/writes.rs` consumes as its
-# defaults source. Below rc.21 the symbol is absent and the build
-# fails at compile time; the floor pin makes that loud.
-peat-schema = { version = ">=0.9.0-rc.21, <0.9.1" }
-iroh = "=1.0.0-rc.0"
+peat-mesh = { version = "=0.9.0-rc.31", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.22, <0.9.1", features = ["automerge-backend"] }
+# peat-schema runtime type registry. Floor bumped to rc.22 — the ADR-066
+# hierarchy rename (peat#957) renames `platoon_id`→`cohort_id` on
+# `CellState` and the `CommandScope` enum variants; below rc.22 the typed
+# round-trip tests round-trip the old field name. The floor still pins
+# `TypeDescriptor::proto3_zero()` (rc.21, peat#953/#954), which
+# `apply_proto3_defaults` in `cli/writes.rs` consumes as its defaults source.
+peat-schema = { version = ">=0.9.0-rc.22, <0.9.1" }
+iroh = "=1.0.0-rc.1"
 # Pinned to match peat-mesh's `automerge` dep so the `Automerge` type peat-cli
 # names (from store.get / scan_prefix) is ABI-compatible with what the backend
-# hands us.
-automerge = "0.7.1"
+# hands us. peat-mesh rc.31 moved to automerge 0.9.
+automerge = "0.9.0"
 serde_json = "1"
 # SIGPIPE handling for `observe` (ADR-001 §"Shell integration discipline":
 # pipe-close should exit silently, not crash). Default disposition kills
