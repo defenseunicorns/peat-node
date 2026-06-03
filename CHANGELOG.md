@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Picks up **peat-mesh v0.9.0-rc.31** + **peat-schema / peat-protocol v0.9.0-rc.22** — the coordinated **ADR-066 hierarchy vocabulary rename** (Squad/Platoon/Company → Cell/Cohort/Federation, plus a new Coalition tier) together with peat-mesh's dependency refresh (`automerge` 0.7→0.9, `iroh` rc.0→rc.1). Adopted as a single release because the two upstreams must move in lockstep: peat-mesh rc.31's `automerge` 0.9 bump and peat-protocol rc.22's matching bump share the `Automerge` type across the re-export boundary, and `iroh` is pinned to one version process-wide.
+## [0.3.8] - 2026-06-02
+
+Picks up **peat-mesh v0.9.0-rc.32** + **peat-schema / peat-protocol v0.9.0-rc.22** — the coordinated **ADR-066 hierarchy vocabulary rename** (Squad/Platoon/Company → Cell/Cohort/Federation, plus a new Coalition tier) together with peat-mesh's dependency refresh (`automerge` 0.7→0.9, `iroh` rc.0→rc.1). Adopted as a single release because the two upstreams must move in lockstep: peat-mesh rc.31's `automerge` 0.9 bump and peat-protocol rc.22's matching bump share the `Automerge` type across the re-export boundary, and `iroh` is pinned to one version process-wide.
 
 ### Changed
 

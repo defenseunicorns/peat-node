@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
