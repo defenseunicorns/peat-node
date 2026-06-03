@@ -910,18 +910,19 @@ async fn observe_all_collections_streams_events_from_every_collection() {
 async fn lifecycle_cell_state_registered_type() {
     // CellState has no required scalar fields; defaults alone are valid.
     // `leader_id` would force a paired `members` mutation (the validator
-    // demands leader_id ∈ members), so anchor on `platoon_id` instead —
+    // demands leader_id ∈ members), so anchor on `cohort_id` instead —
     // it's an `optional string` with no cross-field constraint, suitable
-    // for round-tripping an arbitrary opaque identifier.
+    // for round-tripping an arbitrary opaque identifier. (Renamed from
+    // `platoon_id` in peat-schema rc.22 / ADR-066; same field number 5.)
     run_typed_lifecycle(
         "cell-states",
         "cs-1",
         "CellState",
-        &["platoon_id=g-1"],
+        &["cohort_id=g-1"],
         &["CellState"],
-        "platoon_id=g-2",
+        "cohort_id=g-2",
         |merged| {
-            assert_eq!(merged["platoon_id"], json!("g-2"));
+            assert_eq!(merged["cohort_id"], json!("g-2"));
         },
     )
     .await;

@@ -18,6 +18,18 @@ path = "src/main.rs"
 [dependencies]
 # Mesh networking (Automerge CRDT sync + Iroh blob transfer).
 #
+# rc.31 (peat-mesh#208/#209/#210, ADR-066 Phase 3): internal
+#   `HierarchyLevel` rename (Squad/Platoon/Company → Cell/Cohort/
+#   Federation) + new Coalition tier, QoS collection names aligned to
+#   the hyphenated peat-schema convention, and a coordinated dependency
+#   refresh: `automerge` 0.7→0.9 and the iroh rc-train rc.0→rc.1
+#   (iroh-blobs, iroh-mdns-address-lookup). The HierarchyLevel rename is
+#   internal to peat-mesh and not part of peat-node's consumed surface;
+#   the iroh/automerge bumps are why peat-node's own `iroh`/`automerge`
+#   pins move in lockstep below. Pairs with peat-schema/peat-protocol
+#   rc.22 (ADR-066 Phases 1+2: `platoon_id`→`cohort_id`, CommandScope
+#   CELL/COHORT/FEDERATION/COALITION), adopted together in one release.
+#
 # rc.30 (peat-mesh#205/#206): accept-side push of existing docs +
 #   `connect_and_authenticate_with_addr(EndpointAddr)` bypass for the
 #   `AddressLookupServices` chain. Two bugs in one release:
@@ -91,20 +103,20 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.30", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.31", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
 # peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
 # → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.17, <0.9.1", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.22, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's exact iroh pin
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh
 # version; mixed versions in the same process cause undefined behavior
 # in iroh's process-global crypto provider + ALPN registry.
-iroh = "=1.0.0-rc.0"
+iroh = "=1.0.0-rc.1"
 
 # Connect RPC (Connect + gRPC + gRPC-Web on single port)
 connectrpc = { version = "0.2", features = ["server"] }

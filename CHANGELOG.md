@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Picks up **peat-mesh v0.9.0-rc.31** + **peat-schema / peat-protocol v0.9.0-rc.22** — the coordinated **ADR-066 hierarchy vocabulary rename** (Squad/Platoon/Company → Cell/Cohort/Federation, plus a new Coalition tier) together with peat-mesh's dependency refresh (`automerge` 0.7→0.9, `iroh` rc.0→rc.1). Adopted as a single release because the two upstreams must move in lockstep: peat-mesh rc.31's `automerge` 0.9 bump and peat-protocol rc.22's matching bump share the `Automerge` type across the re-export boundary, and `iroh` is pinned to one version process-wide.
+
+### Changed
+
+- **`peat-mesh = "=0.9.0-rc.31"`** (was `rc.30`). rc.31 ([peat-mesh#208](https://github.com/defenseunicorns/peat-mesh/pull/208)/[#209](https://github.com/defenseunicorns/peat-mesh/pull/209)/[#210](https://github.com/defenseunicorns/peat-mesh/pull/210)) ships the ADR-066 Phase 3 internal `HierarchyLevel` rename + Coalition tier (internal to peat-mesh; not part of peat-node's consumed surface), aligns QoS collection names to the hyphenated peat-schema convention peat-node already uses, and refreshes deps: `automerge` 0.7→0.9, the iroh rc-train rc.0→rc.1 (`iroh-blobs` 0.101→0.102, `iroh-mdns-address-lookup` 0.2→0.3).
+- **`peat-protocol` / `peat-schema` floor `>=0.9.0-rc.22, <0.9.1`** (were `>=rc.17` / `>=rc.21`). rc.22 ([peat#957](https://github.com/defenseunicorns/peat/pull/957)) carries the ADR-066 schema/protocol rename and the matching `automerge` 0.9 bump.
+- **`iroh = "=1.0.0-rc.1"`** (was `rc.0`) in both the root and `peat-cli` manifests — kept in lockstep with peat-mesh because iroh's process-global crypto provider + ALPN registry break under version skew (peat#923/#924). Now requires a Rust 1.91+ toolchain.
+- **`automerge = "0.9.0"`** (was `0.7.1`) in `peat-cli`, matching peat-mesh's bump so the `Automerge` type peat-cli names from the store is ABI-compatible with the backend.
+
+### Migration
+
+- **`CellState.platoon_id` → `CellState.cohort_id`** (peat-schema, ADR-066; same proto field number 5). Consumers writing the `cell-states` typed collection via `peat create`/`peat update --set` must use `cohort_id`. The e2e typed-lifecycle scenario (`crates/peat-cli/tests/e2e/scenarios.rs`) was updated accordingly. The sidecar gRPC contract (`proto/sidecar.proto`) is unchanged; the rename is confined to the peat-schema typed-collection field names peat-node passes through as opaque JSON.
+
+### Resolved upstream
+
+- **[peat#904](https://github.com/defenseunicorns/peat/issues/904)** — ADR-066 hierarchy vocabulary rename. Phases 1+2 (schema/protocol) landed in peat rc.22; Phase 3 (peat-mesh internal) in peat-mesh rc.31.
+
 ## [0.3.7] - 2026-06-01
 
 Picks up **peat-mesh v0.9.0-rc.30** ([peat-mesh#205](https://github.com/defenseunicorns/peat-mesh/issues/205)/[#206](https://github.com/defenseunicorns/peat-mesh/pull/206)) — the release that makes `peat-cli` actually work end-to-end against an established sidecar over an airgapped network. Also ships the two automated walkthrough gates (`Quickstart Path A (compose)` + a new `Cross-cluster sync` Test 6) that pin the QUICKSTART documentation to verifiable behavior.
