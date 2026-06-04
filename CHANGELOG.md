@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-06-04
+
+Picks up **peat-mesh v0.9.0-rc.33** — the dual-C2 blob-fetch failover fix. No peat-node code change; the new behaviour is consumed transparently through `peat_mesh::storage` blob fetching.
+
 ### Changed
 
 - **`peat-mesh = "=0.9.0-rc.33"`** (was `rc.32`). rc.33 ([peat-mesh#220](https://github.com/defenseunicorns/peat-mesh/pull/220), closes [peat-mesh#137](https://github.com/defenseunicorns/peat-mesh/issues/137)) makes `fetch_blob` order peers by recent fetch health: a peer whose most recent attempt stalled/errored is deprioritized behind healthy and untried peers (deprioritize, not skip), so an unreachable preferred peer (e.g. a downed C2 in a dual-C2 deployment) no longer costs the full `download_stall_timeout` (~30s) on every attachment fetch — only on the first, after which it is demoted for `peer_health_cooldown` (new `IrohConfig` field, default 120s). peat-node consumes this transparently through `peat_mesh::storage` blob fetching; no peat-node code change is required and the cooldown default needs no tuning. `peat-protocol` / `peat-schema` stay at the `>=0.9.0-rc.22, <0.9.1` floor — their range already admits rc.33.
