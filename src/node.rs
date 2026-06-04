@@ -41,6 +41,11 @@ pub struct SidecarConfig {
     /// Pin this for deployments where peers need a stable address (e.g. Docker Compose
     /// or any case relying on direct peer-to-peer reachability instead of a relay).
     pub iroh_udp_port: Option<u16>,
+    /// Blob-download stall threshold. `None` uses peat-mesh's default (30s).
+    /// Lower it (e.g. 3-5s) for redundant-peer deployments where an
+    /// unreachable preferred peer otherwise costs the full stall on the
+    /// first fetch before the peer-health index demotes it (peat-mesh#137).
+    pub blob_stall_timeout: Option<Duration>,
     /// Attachment distribution (PRD-006). Empty roots → service handlers
     /// return `Unimplemented`. The `IrohFileDistribution` substrate is only
     /// constructed when at least one root is configured.
@@ -157,6 +162,7 @@ impl SidecarNode {
             formation_id: config.app_id.clone(),
             base64_shared_key: config.shared_key.clone(),
             iroh_bind_addr,
+            download_stall_timeout: config.blob_stall_timeout,
             // peat-mesh rc.12 introduced an optional at-rest cipher hook on
             // AutomergeBackendConfig. peat-node already encrypts at a higher
             // layer via `StoreCipher` (see `forward_store_changes` below),

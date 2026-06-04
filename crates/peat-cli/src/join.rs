@@ -145,6 +145,8 @@ impl MeshSession {
             // tempdir-backed store is short-lived enough that omitting it is
             // safe for Phase 2; revisit if persistent state is added.
             cipher: None,
+            // CLI uses peat-mesh's default stall threshold (peat-mesh#137).
+            download_stall_timeout: None,
         })
         .await
         .map_err(|e| {

@@ -72,6 +72,16 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_IROH_UDP_PORT")]
     iroh_udp_port: Option<u16>,
 
+    /// Blob-download stall threshold, in seconds. A blob fetch attempt that
+    /// makes no progress for this long is abandoned and the next known peer
+    /// is tried. Default: peat-mesh's 30s. Lower it (e.g. 3-5) for
+    /// redundant-peer deployments (dual-C2) where an unreachable preferred
+    /// peer otherwise costs the full 30s on the first fetch before the
+    /// peer-health index demotes it (peat-mesh#137). A live transfer never
+    /// trips this — the watchdog resets on progress.
+    #[arg(long, env = "PEAT_NODE_BLOB_STALL_TIMEOUT_SECS")]
+    blob_stall_timeout_secs: Option<u64>,
+
     // --- Agent Watcher ---
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
     /// Example: http://localhost:8080
@@ -291,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
+        blob_stall_timeout: args.blob_stall_timeout_secs.map(Duration::from_secs),
         attachment_config,
     };
 
