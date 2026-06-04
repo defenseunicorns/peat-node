@@ -31,7 +31,7 @@ tempfile = "3"
 # workspace can't end up with two peat-mesh / iroh versions in one process
 # (iroh has process-global crypto + ALPN registries that explode under
 # version skew, see peat#923/#924).
-peat-mesh = { version = "=0.9.0-rc.32", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.33", features = ["automerge-backend"] }
 peat-protocol = { version = ">=0.9.0-rc.22, <0.9.1", features = ["automerge-backend"] }
 # peat-schema runtime type registry. Floor bumped to rc.22 — the ADR-066
 # hierarchy rename (peat#957) renames `platoon_id`→`cohort_id` on
