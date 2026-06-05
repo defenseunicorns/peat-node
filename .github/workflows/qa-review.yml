@@ -199,8 +199,8 @@ jobs:
                    [ARCH]     — architectural concern requiring human design review; do NOT propose a fix, escalate
                  If there are no findings under any tag, write a single line: "No findings."
              (b) Use the Write tool to write the verdict to $RUNNER_TEMP/peat-qa-verdict:
-                 Write exactly `changes-requested` if any [BLOCKER], [WARNING], or [ARCH] finding is present.
-                 Write exactly `approve` if the review is clean or has only [IDIOM] findings.
+                 Write exactly: changes-requested if any [BLOCKER], [WARNING], or [ARCH] finding is present.
+                 Write exactly: approve if the review is clean or has only [IDIOM] findings.
                  No other content in that file.
              (c) Do NOT call gh pr review — the workflow posts the official review after you finish.
           PROMPT
@@ -295,8 +295,8 @@ jobs:
                    [ARCH]     — architectural concern requiring human design review; do NOT propose a fix, escalate
                  If there are no findings under any tag, write a single line: "No findings."
              (b) Use the Write tool to write the verdict to $RUNNER_TEMP/peat-qa-verdict:
-                 Write exactly `changes-requested` if any [BLOCKER], [WARNING], or [ARCH] finding is present.
-                 Write exactly `approve` if the review is clean or has only [IDIOM] findings.
+                 Write exactly: changes-requested if any [BLOCKER], [WARNING], or [ARCH] finding is present.
+                 Write exactly: approve if the review is clean or has only [IDIOM] findings.
                  No other content in that file.
              (c) Do NOT call gh pr review — the workflow posts the official review after you finish.
           PROMPT
