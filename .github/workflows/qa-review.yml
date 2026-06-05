@@ -66,7 +66,7 @@ jobs:
           set +e   # GH Actions defaults to bash -e; -e would abort before rc=$? captures the claude exit code
 
           submit_review() {
-            local verdict verb
+            local verdict verb peat_bot_token
             verdict=$(tr -d '[:space:]' < "$RUNNER_TEMP/peat-qa-verdict" 2>/dev/null || true)
             case "$verdict" in
               changes-requested) verb="--request-changes" ;;
@@ -76,7 +76,12 @@ jobs:
                 verb="--request-changes"
                 ;;
             esac
-            if ! env -u GH_TOKEN -u GITHUB_TOKEN gh pr review "$PR_NUMBER" $verb --body-file "$RUNNER_TEMP/peat-qa-review.md"; then
+            peat_bot_token=$(gh auth token --user peat-bot 2>/dev/null)
+            if [ -z "$peat_bot_token" ]; then
+              echo "::error::could not retrieve peat-bot token from host gh credential store"
+              exit 1
+            fi
+            if ! GH_TOKEN="$peat_bot_token" gh pr review "$PR_NUMBER" $verb --body-file "$RUNNER_TEMP/peat-qa-review.md"; then
               echo "::error::gh pr review ${verb} failed — verdict not posted"
               exit 1
             fi
