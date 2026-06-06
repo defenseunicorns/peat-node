@@ -54,7 +54,7 @@ Query either sidecar to see fleet-wide agent state from both clusters.
 
 | Data | CRDT Collection | Source API |
 |------|----------------|------------|
-| Agent health, K8s version, architecture | `platforms/{agent-id}` | `GET /status` |
+| Agent health, K8s version, architecture | `nodes/{agent-id}` | `GET /status` |
 | Deployed packages (name, version, status) | `deployments/{agent-id}:{pkg}` | `ListPackages` |
 | Pulled/cached packages | `packages/{agent-id}:{ref}` | `ListPulledPackages` |
 
@@ -136,7 +136,7 @@ The sidecar exposes `peat.sidecar.v1.PeatSidecar` with 25 RPCs:
 | **Lifecycle** | `GetStatus` |
 | **Peers** | `ConnectPeer`, `DisconnectPeer`, `ListPeers` |
 | **Documents** | `PutDocument`, `GetDocument`, `DeleteDocument`, `ListDocuments` |
-| **Typed Collections** | `PutPlatform`, `GetPlatforms`, `PutCell`, `GetCells`, `PutTrack`, `GetTracks`, `PutCommand`, `GetCommands` |
+| **Typed Collections** | `PutNode`, `GetNodes`, `PutCell`, `GetCells`, `PutTrack`, `GetTracks`, `PutCommand`, `GetCommands` |
 | **Subscriptions** | `Subscribe` (server-streaming) |
 | **Sync Control** | `StartSync`, `StopSync`, `GetSyncStats` |
 | **Attachments** (PRD-006) | `SendAttachments`, `GetAttachmentDistribution`, `SubscribeAttachmentBundle` (server-streaming), `CancelAttachmentDistribution` |

@@ -103,14 +103,14 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.34", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.35", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
 # peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
 # → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.22, <0.9.1", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.23, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's exact iroh pin
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh

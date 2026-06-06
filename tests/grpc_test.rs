@@ -137,17 +137,17 @@ async fn connect_protocol_full_crud_plaintext() {
     let stats = call(&client, &base, "GetSyncStats", serde_json::json!({})).await;
     assert_eq!(stats.get("connectedPeers"), None); // 0 is omitted by proto3 JSON
 
-    // PutPlatform (typed collection)
+    // PutNode (typed collection)
     call(
         &client,
         &base,
-        "PutPlatform",
+        "PutNode",
         serde_json::json!({
-            "platform": {
+            "node": {
                 "id": "plat-1",
-                "platformType": "uds-remote-agent",
+                "nodeType": "uds-remote-agent",
                 "name": "test-agent",
-                "status": "PLATFORM_STATUS_READY",
+                "status": "NODE_STATUS_READY",
                 "latitude": 38.89,
                 "longitude": -77.03,
                 "capabilities": ["deploy", "monitor"]
@@ -156,9 +156,9 @@ async fn connect_protocol_full_crud_plaintext() {
     )
     .await;
 
-    // GetPlatforms
-    let platforms = call(&client, &base, "GetPlatforms", serde_json::json!({})).await;
-    let plats = platforms["platforms"].as_array().unwrap();
+    // GetNodes
+    let nodes = call(&client, &base, "GetNodes", serde_json::json!({})).await;
+    let plats = nodes["nodes"].as_array().unwrap();
     assert_eq!(plats.len(), 1);
     assert_eq!(plats[0]["id"], "plat-1");
     assert_eq!(plats[0]["name"], "test-agent");

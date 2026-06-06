@@ -292,7 +292,7 @@ mod tests {
     fn defaults_plus_min_required_validates_for_node_config() {
         let user = json!({
             "id": "node-1",
-            "platform_type": "rover",
+            "node_type": "rover",
             "comm_range_m": 1500.0,
             "max_speed_mps": 12.0,
         });

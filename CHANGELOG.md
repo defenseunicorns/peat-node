@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (sidecar gRPC API): `Platform` → `Node` ([ADR-068](https://github.com/defenseunicorns/peat/blob/main/docs/adr/068-node-base-unit-vocabulary.md) Phase 4, epic [peat#968](https://github.com/defenseunicorns/peat/issues/968)).** Converges the sidecar surface on **Node** as the base-unit term. In `sidecar.proto` (field numbers preserved — binary stays tag-compatible; message/enum/RPC/field *names* break): `message Platform` → `Node`, `PutPlatform`/`GetPlatforms` → `PutNode`/`GetNodes`, `enum PlatformStatus` → `NodeStatus` (`PLATFORM_STATUS_*` → `NODE_STATUS_*`), `Platform.platform_type` → `Node.node_type`, `Cell.platform_count` → `node_count`, `Track.source_platform` → `source_node`. The document-collection name for node docs changes `"platforms"` → `"nodes"`. gRPC clients must regenerate. Pre-1.0 clean break, consistent with the ADR-066 rename in 0.3.8.
+- **`peat-mesh = "=0.9.0-rc.35"`** (was `rc.33`) and **`peat-protocol` / `peat-schema` floor `>=0.9.0-rc.23`** (was `>=rc.22`). rc.35 carries the peat-mesh `HierarchyLevel::Platform` → `Node` rename ([ADR-068 Phase 3](https://github.com/defenseunicorns/peat-mesh/pull/237)); rc.23 carries the peat-schema/peat-protocol rename ([ADR-068 Phase 1](https://github.com/defenseunicorns/peat/pull/969)) — `peat-cli`'s schema validation requires the `node_type` schema, so rc.22 (`platform_type`) is excluded. The `test/cross-cluster-sync.sh` e2e harness and the API docs were migrated to the new RPC/collection names in lockstep.
+
 ## [0.3.9] - 2026-06-04
 
 Picks up **peat-mesh v0.9.0-rc.33** — the dual-C2 blob-fetch failover fix. No peat-node code change; the new behaviour is consumed transparently through `peat_mesh::storage` blob fetching.

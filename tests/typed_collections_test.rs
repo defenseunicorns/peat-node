@@ -1,5 +1,5 @@
 //! Full-field round-trips for typed collections (Cell, Track, Command).
-//! The existing grpc_test.rs covers Platform minimally; this covers
+//! The existing grpc_test.rs covers Node minimally; this covers
 //! the remaining typed surfaces with all optional fields populated,
 //! mirroring the deleted Go `functest` Phase 1.
 
@@ -73,7 +73,7 @@ async fn cell_round_trip_with_all_fields() {
                 "id": "cell-001",
                 "name": "Alpha Cell",
                 "status": "CELL_STATUS_ACTIVE",
-                "platformCount": 5,
+                "nodeCount": 5,
                 "centerLatitude": 34.0522,
                 "centerLongitude": -118.2437,
                 "capabilities": ["recon", "relay"],
@@ -90,7 +90,7 @@ async fn cell_round_trip_with_all_fields() {
     assert_eq!(c["id"], "cell-001");
     assert_eq!(c["name"], "Alpha Cell");
     assert_eq!(c["status"], "CELL_STATUS_ACTIVE");
-    assert_eq!(c["platformCount"], 5);
+    assert_eq!(c["nodeCount"], 5);
     assert!((c["centerLatitude"].as_f64().unwrap() - 34.0522).abs() < 0.0001);
     assert!((c["centerLongitude"].as_f64().unwrap() + 118.2437).abs() < 0.0001);
     let caps: Vec<&str> = c["capabilities"]
@@ -114,7 +114,7 @@ async fn track_round_trip_with_all_optional_fields() {
         serde_json::json!({
             "track": {
                 "id": "trk-001",
-                "sourcePlatform": "plat-001",
+                "sourceNode": "plat-001",
                 "cellId": "cell-001",
                 "formationId": "form-001",
                 "latitude": 35.0,
@@ -135,7 +135,7 @@ async fn track_round_trip_with_all_optional_fields() {
     assert_eq!(tracks.len(), 1);
     let t = &tracks[0];
     assert_eq!(t["id"], "trk-001");
-    assert_eq!(t["sourcePlatform"], "plat-001");
+    assert_eq!(t["sourceNode"], "plat-001");
     assert_eq!(t["cellId"], "cell-001");
     assert_eq!(t["formationId"], "form-001");
     assert!((t["latitude"].as_f64().unwrap() - 35.0).abs() < 0.0001);

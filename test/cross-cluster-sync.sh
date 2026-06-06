@@ -227,27 +227,27 @@ run_test() {
     # ── Test 3: Alpha → Bravo sync ───────────────────────────────
     log "Test 3: Alpha → Bravo CRDT sync"
 
-    rpc_on "${CTX_A}" PutPlatform '{"platform":{"id":"alpha-agent","platformType":"uds-remote-agent","name":"Alpha Edge","status":"PLATFORM_STATUS_READY","latitude":38.89,"longitude":-77.03,"capabilities":["deploy","monitor"]}}' >/dev/null
-    pass "Wrote platform on Alpha"
+    rpc_on "${CTX_A}" PutNode '{"node":{"id":"alpha-agent","nodeType":"uds-remote-agent","name":"Alpha Edge","status":"NODE_STATUS_READY","latitude":38.89,"longitude":-77.03,"capabilities":["deploy","monitor"]}}' >/dev/null
+    pass "Wrote node on Alpha"
 
     rpc_on "${CTX_A}" PutDocument '{"collection":"deployments","docId":"alpha-agent:nginx","jsonData":"{\"package\":\"nginx\",\"version\":\"1.25\",\"status\":\"deployed\"}"}' >/dev/null
     pass "Wrote deployment doc on Alpha"
 
     SYNCED=false
     for i in $(seq 1 30); do
-        COUNT=$(rpc_on "${CTX_B}" GetPlatforms | jq_py "print(len(json.load(sys.stdin).get('platforms',[])))" || echo 0)
+        COUNT=$(rpc_on "${CTX_B}" GetNodes | jq_py "print(len(json.load(sys.stdin).get('nodes',[])))" || echo 0)
         if [ "${COUNT}" = "1" ]; then
-            pass "Platform synced to Bravo in ${i}s"
+            pass "Node synced to Bravo in ${i}s"
             SYNCED=true
             break
         fi
         sleep 1
     done
-    ${SYNCED} || fail "Platform did not sync to Bravo within 30s"
+    ${SYNCED} || fail "Node did not sync to Bravo within 30s"
 
-    # Verify platform data fidelity
-    PLAT_NAME=$(rpc_on "${CTX_B}" GetPlatforms | jq_py "print(json.load(sys.stdin)['platforms'][0]['name'])")
-    [ "${PLAT_NAME}" = "Alpha Edge" ] && pass "Platform name correct: ${PLAT_NAME}" || fail "wrong name: ${PLAT_NAME}"
+    # Verify node data fidelity
+    PLAT_NAME=$(rpc_on "${CTX_B}" GetNodes | jq_py "print(json.load(sys.stdin)['nodes'][0]['name'])")
+    [ "${PLAT_NAME}" = "Alpha Edge" ] && pass "Node name correct: ${PLAT_NAME}" || fail "wrong name: ${PLAT_NAME}"
 
     # Verify deployment doc
     DOC_PKG=$(rpc_on "${CTX_B}" GetDocument '{"collection":"deployments","docId":"alpha-agent:nginx"}' \
@@ -257,26 +257,26 @@ run_test() {
     # ── Test 4: Bravo → Alpha sync (bidirectional) ───────────────
     log "Test 4: Bravo → Alpha bidirectional sync"
 
-    rpc_on "${CTX_B}" PutPlatform '{"platform":{"id":"bravo-agent","platformType":"uds-remote-agent","name":"Bravo Edge","status":"PLATFORM_STATUS_READY","latitude":33.45,"longitude":-112.07,"capabilities":["deploy"]}}' >/dev/null
-    pass "Wrote platform on Bravo"
+    rpc_on "${CTX_B}" PutNode '{"node":{"id":"bravo-agent","nodeType":"uds-remote-agent","name":"Bravo Edge","status":"NODE_STATUS_READY","latitude":33.45,"longitude":-112.07,"capabilities":["deploy"]}}' >/dev/null
+    pass "Wrote node on Bravo"
 
     SYNCED=false
     for i in $(seq 1 30); do
-        COUNT=$(rpc_on "${CTX_A}" GetPlatforms | jq_py "print(len(json.load(sys.stdin).get('platforms',[])))" || echo 0)
+        COUNT=$(rpc_on "${CTX_A}" GetNodes | jq_py "print(len(json.load(sys.stdin).get('nodes',[])))" || echo 0)
         if [ "${COUNT}" = "2" ]; then
-            pass "Both platforms visible on Alpha in ${i}s"
+            pass "Both nodes visible on Alpha in ${i}s"
             SYNCED=true
             break
         fi
         sleep 1
     done
-    ${SYNCED} || fail "Bravo platform did not sync to Alpha within 30s"
+    ${SYNCED} || fail "Bravo node did not sync to Alpha within 30s"
 
     # Final fleet-wide state check
-    ALPHA_COUNT=$(rpc_on "${CTX_A}" GetPlatforms | jq_py "print(len(json.load(sys.stdin).get('platforms',[])))")
-    BRAVO_COUNT=$(rpc_on "${CTX_B}" GetPlatforms | jq_py "print(len(json.load(sys.stdin).get('platforms',[])))")
+    ALPHA_COUNT=$(rpc_on "${CTX_A}" GetNodes | jq_py "print(len(json.load(sys.stdin).get('nodes',[])))")
+    BRAVO_COUNT=$(rpc_on "${CTX_B}" GetNodes | jq_py "print(len(json.load(sys.stdin).get('nodes',[])))")
     [ "${ALPHA_COUNT}" = "2" ] && [ "${BRAVO_COUNT}" = "2" ] \
-        && pass "Fleet converged: both clusters see 2 platforms" \
+        && pass "Fleet converged: both clusters see 2 nodes" \
         || fail "fleet state mismatch: alpha=${ALPHA_COUNT} bravo=${BRAVO_COUNT}"
 
     # ── Test 5: GetSyncStats reports non-zero byte counters ─────

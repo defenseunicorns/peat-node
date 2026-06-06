@@ -122,10 +122,10 @@ map directly to the heartbeat fields:
 
 | Heartbeat Field | CRDT Collection | Source |
 |----------------|-----------------|--------|
-| `agent_status` | `platforms/{agent-id}` | `GET /status` |
+| `agent_status` | `nodes/{agent-id}` | `GET /status` |
 | `workloads` | `deployments/{agent-id}:{pkg}` | `ListPackages` |
-| `version` | `platforms/{agent-id}.version` | `GET /status` |
-| `labels` | `platforms/{agent-id}.labels` | Agent settings |
+| `version` | `nodes/{agent-id}.version` | `GET /status` |
+| `labels` | `nodes/{agent-id}.labels` | Agent settings |
 
 The Fleet Command Hub runs its own peat-node. It reads the CRDT
 mesh state and either:
@@ -180,7 +180,7 @@ graph LR
     subgraph pod["Kubernetes Pod"]
         agent["uds-remote-agent<br/>Connect RPC :8080"]
         watcher["peat-node<br/>Agent Watcher"]
-        crdt["CRDT Store<br/>platforms/ · deployments/ · packages/"]
+        crdt["CRDT Store<br/>nodes/ · deployments/ · packages/"]
         mesh["Iroh QUIC<br/>Mesh Transport"]
     end
     watcher -- "polls /status,<br/>ListPackages" --> agent
@@ -233,7 +233,7 @@ The peat-node agent watcher connects to the local agent using the
 
 Every `--agent-poll-interval` seconds (default: 10):
 
-1. `GET /status` → write to `platforms/{agent-id}`
+1. `GET /status` → write to `nodes/{agent-id}`
 2. `ListPackages` (ZarfAPI) → write to `deployments/{agent-id}:{pkg}`
 3. `ListPulledPackages` (RegistryAPI) → write to `packages/{agent-id}:{ref}`
 
@@ -336,7 +336,7 @@ containers:
 |--------|------------------------|--------------|
 | Local service | OCI registry (HTTP :5000) | UDS Remote Agent (Connect RPC :8080) |
 | Watches local service | Enumerates registry digests | Polls agent APIs |
-| Writes to CRDT | DigestSet documents | Platform/deployment/package documents |
+| Writes to CRDT | DigestSet documents | Node/deployment/package documents |
 | Syncs with peers | Automerge + Iroh | Automerge + Iroh |
 | Zero changes to local service | Yes | Yes |
 

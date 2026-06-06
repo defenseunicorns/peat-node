@@ -151,7 +151,7 @@ fn subcommand_help_renders() {
 fn query_without_creds_exits_auth_error() {
     // ADR-001 "Shell integration discipline": auth failure → exit 2, empty
     // stdout, explanation on stderr. Passing a path that doesn't exist
-    // bypasses any platform-default config that may be present on the
+    // bypasses any node-default config that may be present on the
     // developer's machine.
     peat()
         .args([

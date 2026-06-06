@@ -756,15 +756,15 @@ async fn lifecycle_node_config_registered_type() {
         "NodeConfig",
         &[
             "id=node-1",
-            "platform_type=platform-a",
+            "node_type=node-a",
             "comm_range_m=1500.0",
             "max_speed_mps=12.5",
         ],
-        &["NodeConfig", "platform-a"],
-        "platform_type=platform-b",
+        &["NodeConfig", "node-a"],
+        "node_type=node-b",
         |merged| {
             assert_eq!(merged["id"], json!("node-1"));
-            assert_eq!(merged["platform_type"], json!("platform-b"));
+            assert_eq!(merged["node_type"], json!("node-b"));
         },
     )
     .await;

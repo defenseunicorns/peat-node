@@ -164,8 +164,8 @@ async fn eq_query_filters_to_matching_documents() {
     let (node, service) = fresh_service().await;
 
     let req = SubscribeRequest {
-        collections: vec!["platforms".to_string()],
-        query: buffa::MessageField::some(pq_eq("platform_type", "\"vehicle\"")),
+        collections: vec!["nodes".to_string()],
+        query: buffa::MessageField::some(pq_eq("node_type", "\"vehicle\"")),
         ..Default::default()
     };
     let view = subscribe_view(req);
@@ -177,23 +177,23 @@ async fn eq_query_filters_to_matching_documents() {
     // Three docs: 2 match, 1 doesn't.
     put(
         &node,
-        "platforms",
+        "nodes",
         "p1",
-        r#"{"platform_type":"vehicle","name":"v1"}"#,
+        r#"{"node_type":"vehicle","name":"v1"}"#,
     )
     .await;
     put(
         &node,
-        "platforms",
+        "nodes",
         "p2",
-        r#"{"platform_type":"aircraft","name":"a1"}"#,
+        r#"{"node_type":"aircraft","name":"a1"}"#,
     )
     .await;
     put(
         &node,
-        "platforms",
+        "nodes",
         "p3",
-        r#"{"platform_type":"vehicle","name":"v2"}"#,
+        r#"{"node_type":"vehicle","name":"v2"}"#,
     )
     .await;
 
@@ -219,7 +219,7 @@ async fn collection_filter_and_query_compose() {
     let (node, service) = fresh_service().await;
 
     let req = SubscribeRequest {
-        collections: vec!["platforms".to_string()],
+        collections: vec!["nodes".to_string()],
         query: buffa::MessageField::some(pq_eq("status", "\"ready\"")),
         ..Default::default()
     };
@@ -230,11 +230,11 @@ async fn collection_filter_and_query_compose() {
         .expect("subscribe");
 
     // Matches collection + predicate.
-    put(&node, "platforms", "p1", r#"{"status":"ready"}"#).await;
+    put(&node, "nodes", "p1", r#"{"status":"ready"}"#).await;
     // Matches predicate but wrong collection.
     put(&node, "tracks", "t1", r#"{"status":"ready"}"#).await;
     // Right collection but doesn't match predicate.
-    put(&node, "platforms", "p2", r#"{"status":"busy"}"#).await;
+    put(&node, "nodes", "p2", r#"{"status":"busy"}"#).await;
 
     let events = collect(&mut stream, 1, Duration::from_secs(2)).await;
     assert_eq!(
@@ -242,7 +242,7 @@ async fn collection_filter_and_query_compose() {
         1,
         "expected exactly one match, got {events:?}"
     );
-    assert_eq!(events[0].collection, "platforms");
+    assert_eq!(events[0].collection, "nodes");
     assert_eq!(events[0].doc_id, "p1");
 }
 
@@ -254,8 +254,8 @@ async fn delete_events_pass_through_query_filter() {
     let (node, service) = fresh_service().await;
 
     let req = SubscribeRequest {
-        collections: vec!["platforms".to_string()],
-        query: buffa::MessageField::some(pq_eq("platform_type", "\"vehicle\"")),
+        collections: vec!["nodes".to_string()],
+        query: buffa::MessageField::some(pq_eq("node_type", "\"vehicle\"")),
         ..Default::default()
     };
     let view = subscribe_view(req);
@@ -264,8 +264,8 @@ async fn delete_events_pass_through_query_filter() {
         .await
         .expect("subscribe");
 
-    put(&node, "platforms", "p1", r#"{"platform_type":"vehicle"}"#).await;
-    node.delete_document("platforms", "p1")
+    put(&node, "nodes", "p1", r#"{"node_type":"vehicle"}"#).await;
+    node.delete_document("nodes", "p1")
         .await
         .expect("delete_document");
 
@@ -285,13 +285,13 @@ async fn delete_events_pass_through_query_filter() {
 
 #[tokio::test]
 async fn and_combinator_filters_correctly() {
-    // (platform_type == "vehicle") AND (readiness > 0.5)
+    // (node_type == "vehicle") AND (readiness > 0.5)
     let (node, service) = fresh_service().await;
 
     let req = SubscribeRequest {
-        collections: vec!["platforms".to_string()],
+        collections: vec!["nodes".to_string()],
         query: buffa::MessageField::some(pq_and(vec![
-            pq_eq("platform_type", "\"vehicle\""),
+            pq_eq("node_type", "\"vehicle\""),
             pq_gt("readiness", "0.5"),
         ])),
         ..Default::default()
@@ -305,25 +305,25 @@ async fn and_combinator_filters_correctly() {
     // Matches both clauses.
     put(
         &node,
-        "platforms",
+        "nodes",
         "p1",
-        r#"{"platform_type":"vehicle","readiness":0.9}"#,
+        r#"{"node_type":"vehicle","readiness":0.9}"#,
     )
     .await;
     // Matches type, not readiness.
     put(
         &node,
-        "platforms",
+        "nodes",
         "p2",
-        r#"{"platform_type":"vehicle","readiness":0.2}"#,
+        r#"{"node_type":"vehicle","readiness":0.2}"#,
     )
     .await;
     // Matches readiness, not type.
     put(
         &node,
-        "platforms",
+        "nodes",
         "p3",
-        r#"{"platform_type":"aircraft","readiness":0.9}"#,
+        r#"{"node_type":"aircraft","readiness":0.9}"#,
     )
     .await;
 

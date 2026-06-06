@@ -178,50 +178,46 @@ impl pb::PeatSidecar for PeatSidecarService {
 
     // --- Typed Collections ---
 
-    async fn put_platform(
+    async fn put_node(
         &self,
         ctx: Context,
-        request: OwnedView<pb::PutPlatformRequestView<'static>>,
-    ) -> Result<(pb::PutPlatformResponse, Context), ConnectError> {
+        request: OwnedView<pb::PutNodeRequestView<'static>>,
+    ) -> Result<(pb::PutNodeResponse, Context), ConnectError> {
         let req = request.to_owned_message();
-        let platform = req
-            .platform
-            .ok_or_else(|| ConnectError::invalid_argument("platform is required"))?;
-        let json = serde_json::to_string(&platform_to_map(&platform))
+        let node = req
+            .node
+            .ok_or_else(|| ConnectError::invalid_argument("node is required"))?;
+        let json = serde_json::to_string(&node_to_map(&node))
             .map_err(|e| ConnectError::internal(format!("serialization error: {e}")))?;
         self.node
-            .put_document("platforms", &platform.id, &json)
+            .put_document("nodes", &node.id, &json)
             .await
             .map_err(internal)?;
-        Ok((pb::PutPlatformResponse::default(), ctx))
+        Ok((pb::PutNodeResponse::default(), ctx))
     }
 
-    async fn get_platforms(
+    async fn get_nodes(
         &self,
         ctx: Context,
-        _request: OwnedView<pb::GetPlatformsRequestView<'static>>,
-    ) -> Result<(pb::GetPlatformsResponse, Context), ConnectError> {
-        let doc_ids = self
-            .node
-            .list_documents("platforms")
-            .await
-            .map_err(internal)?;
-        let mut platforms = Vec::with_capacity(doc_ids.len());
+        _request: OwnedView<pb::GetNodesRequestView<'static>>,
+    ) -> Result<(pb::GetNodesResponse, Context), ConnectError> {
+        let doc_ids = self.node.list_documents("nodes").await.map_err(internal)?;
+        let mut nodes = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
             if let Some(json) = self
                 .node
-                .get_document("platforms", &doc_id)
+                .get_document("nodes", &doc_id)
                 .await
                 .map_err(internal)?
             {
-                if let Ok(p) = map_to_platform(&doc_id, &json) {
-                    platforms.push(p);
+                if let Ok(p) = map_to_node(&doc_id, &json) {
+                    nodes.push(p);
                 }
             }
         }
         Ok((
-            pb::GetPlatformsResponse {
-                platforms,
+            pb::GetNodesResponse {
+                nodes,
                 ..Default::default()
             },
             ctx,
@@ -528,10 +524,10 @@ impl pb::PeatSidecar for PeatSidecarService {
 
 // --- Proto ↔ JSON conversion helpers ---
 
-fn platform_to_map(p: &pb::Platform) -> serde_json::Value {
+fn node_to_map(p: &pb::Node) -> serde_json::Value {
     serde_json::json!({
         "id": p.id,
-        "platform_type": p.platform_type,
+        "node_type": p.node_type,
         "name": p.name,
         "status": p.status.to_i32(),
         "latitude": p.latitude,
@@ -544,11 +540,11 @@ fn platform_to_map(p: &pb::Platform) -> serde_json::Value {
     })
 }
 
-fn map_to_platform(id: &str, json: &str) -> anyhow::Result<pb::Platform> {
+fn map_to_node(id: &str, json: &str) -> anyhow::Result<pb::Node> {
     let v: serde_json::Value = serde_json::from_str(json)?;
-    Ok(pb::Platform {
+    Ok(pb::Node {
         id: id.to_string(),
-        platform_type: v["platform_type"].as_str().unwrap_or_default().to_string(),
+        node_type: v["node_type"].as_str().unwrap_or_default().to_string(),
         name: v["name"].as_str().unwrap_or_default().to_string(),
         status: buffa::EnumValue::from(v["status"].as_i64().unwrap_or_default() as i32),
         latitude: v["latitude"].as_f64().unwrap_or_default(),
@@ -574,7 +570,7 @@ fn cell_to_map(c: &pb::Cell) -> serde_json::Value {
         "id": c.id,
         "name": c.name,
         "status": c.status.to_i32(),
-        "platform_count": c.platform_count,
+        "node_count": c.node_count,
         "center_latitude": c.center_latitude,
         "center_longitude": c.center_longitude,
         "capabilities": c.capabilities,
@@ -589,7 +585,7 @@ fn map_to_cell(id: &str, json: &str) -> anyhow::Result<pb::Cell> {
         id: id.to_string(),
         name: v["name"].as_str().unwrap_or_default().to_string(),
         status: buffa::EnumValue::from(v["status"].as_i64().unwrap_or_default() as i32),
-        platform_count: v["platform_count"].as_u64().unwrap_or_default() as u32,
+        node_count: v["node_count"].as_u64().unwrap_or_default() as u32,
         center_latitude: v["center_latitude"].as_f64().unwrap_or_default(),
         center_longitude: v["center_longitude"].as_f64().unwrap_or_default(),
         capabilities: v["capabilities"]
@@ -609,7 +605,7 @@ fn map_to_cell(id: &str, json: &str) -> anyhow::Result<pb::Cell> {
 fn track_to_map(t: &pb::Track) -> serde_json::Value {
     serde_json::json!({
         "id": t.id,
-        "source_platform": t.source_platform,
+        "source_node": t.source_node,
         "cell_id": t.cell_id,
         "formation_id": t.formation_id,
         "latitude": t.latitude,
@@ -628,10 +624,7 @@ fn map_to_track(id: &str, json: &str) -> anyhow::Result<pb::Track> {
     let v: serde_json::Value = serde_json::from_str(json)?;
     Ok(pb::Track {
         id: id.to_string(),
-        source_platform: v["source_platform"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
+        source_node: v["source_node"].as_str().unwrap_or_default().to_string(),
         cell_id: v["cell_id"].as_str().map(|s| s.to_string()),
         formation_id: v["formation_id"].as_str().map(|s| s.to_string()),
         latitude: v["latitude"].as_f64().unwrap_or_default(),
