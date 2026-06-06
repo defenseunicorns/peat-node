@@ -27,6 +27,7 @@ async fn sidecar_binds_unix_socket_path_and_accepts_connection() {
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: "uds-test".to_string(),
             app_id: "test".to_string(),
             shared_key: String::new(),

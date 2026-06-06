@@ -12,6 +12,7 @@ use peat_node::node::{ChangeType, SidecarConfig, SidecarNode};
 async fn fresh_node() -> SidecarNode {
     let dir = tempfile::tempdir().unwrap();
     SidecarNode::new(SidecarConfig {
+        blob_stall_timeout: None,
         node_id: "test-sub".to_string(),
         app_id: "test".to_string(),
         shared_key: String::new(),

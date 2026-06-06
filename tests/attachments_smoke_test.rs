@@ -58,6 +58,7 @@ async fn boot_server_with_attachments(port: u16) -> BootedServer {
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("attach-smoke-{port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),
@@ -92,6 +93,7 @@ async fn boot_server_without_attachments(port: u16) -> String {
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("attach-disabled-{port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),

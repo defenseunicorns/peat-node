@@ -67,6 +67,7 @@ impl TestPeer {
         let app_id = TEST_APP_ID.to_string();
 
         let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
+            download_stall_timeout: None,
             data_dir: dir.path().to_path_buf(),
             formation_id: app_id.clone(),
             base64_shared_key: formation_key_b64.clone(),

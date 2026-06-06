@@ -23,6 +23,7 @@ async fn boot_server(grpc_port: u16, iroh_udp_port: u16) -> (reqwest::Client, St
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("test-{grpc_port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),

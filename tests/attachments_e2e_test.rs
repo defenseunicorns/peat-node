@@ -78,6 +78,7 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("e2e-{label}"),
             app_id: "e2e-attachments".into(),
             shared_key: String::new(),

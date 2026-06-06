@@ -19,6 +19,7 @@ async fn boot(
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("test-{grpc_port}"),
             app_id: app_id.to_string(),
             shared_key: shared_key.to_string(),

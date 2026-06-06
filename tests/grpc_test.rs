@@ -17,6 +17,7 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("test-{port}"),
             app_id: "test".to_string(),
             shared_key: String::new(),

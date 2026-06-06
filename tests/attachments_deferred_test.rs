@@ -71,6 +71,7 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
     .unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("d23-{label}"),
             app_id: "d23".into(),
             shared_key: String::new(),
@@ -511,6 +512,7 @@ async fn unknown_node_id_marked_failed_after_grace() {
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: "grace-test".into(),
             app_id: "test".into(),
             shared_key: String::new(),
