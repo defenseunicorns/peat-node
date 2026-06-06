@@ -76,6 +76,21 @@ jobs:
                 verb="--request-changes"
                 ;;
             esac
+            # Defense in depth over the agent-written verdict file: the review
+            # BODY is authoritative for the *safe* direction. If the verdict says
+            # approve but the body carries a request-changes finding tag
+            # ([BLOCKER]/[WARNING]/[ARCH]) as a heading/bullet/line-start marker,
+            # downgrade to --request-changes. Anchored to line-start markers so
+            # prose/backtick mentions ("no [BLOCKER] issues", "any `[WARNING]`
+            # tag") do NOT false-trigger; [IDIOM] is intentionally not a trigger.
+            # This only ever downgrades approve->request-changes, never upgrades,
+            # so it closes the body/verdict divergence window fail-closed.
+            if [ "$verb" = "--approve" ] && \
+               grep -qE '^[[:space:]]*(#{1,6}[[:space:]]+|[-*][[:space:]]+)?\[(BLOCKER|WARNING|ARCH)\]' \
+                 "$RUNNER_TEMP/peat-qa-review.md" 2>/dev/null; then
+              echo "::warning::verdict file said 'approve' but the review body contains a [BLOCKER]/[WARNING]/[ARCH] finding — downgrading to --request-changes (fail-closed)"
+              verb="--request-changes"
+            fi
             peat_bot_token=$(gh auth token --user peat-bot 2>/dev/null)
             if [ -z "$peat_bot_token" ]; then
               echo "::error::could not retrieve peat-bot token from host gh credential store"
