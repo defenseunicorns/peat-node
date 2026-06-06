@@ -79,13 +79,18 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-      # Toolchain (rustup/cargo) + protoc are pre-provisioned, but rustup
-      # installs cargo to ~/.cargo/bin which GitHub's non-login step shell
-      # doesn't put on PATH. Add it so `cargo` resolves.
-      - name: Put cargo on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # Toolchain (rustup/cargo) + protoc are pre-provisioned under the runner
+      # user's ~/.cargo, but this self-hosted runner's non-login step shell does
+      # NOT reliably export $HOME — so `echo "$HOME/.cargo/bin" >> $GITHUB_PATH`
+      # added a bogus `/.cargo/bin` and `cargo` exited 127 (command not found).
+      # Derive the real home from passwd (independent of $HOME) and set HOME
+      # (rustup needs it to locate the toolchain) + PATH in the same step.
       - name: Run peat-cli e2e tests (incl. mDNS via --include-ignored)
-        run: cargo test -p peat-cli --test e2e -- --include-ignored
+        run: |
+          export HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo --version
+          cargo test -p peat-cli --test e2e -- --include-ignored
 
   build:
     name: Build
