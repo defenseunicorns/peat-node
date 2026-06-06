@@ -181,9 +181,9 @@ async fn poll_status(
 
     let status: AgentStatus = resp.json().await?;
 
-    let platform_json = serde_json::json!({
+    let node_json = serde_json::json!({
         "agent_id": agent_id,
-        "platform_type": "uds-remote-agent",
+        "node_type": "uds-remote-agent",
         "version": status.version,
         "architecture": status.architecture,
         "classification": status.classification,
@@ -194,7 +194,7 @@ async fn poll_status(
         "last_seen": chrono::Utc::now().timestamp(),
     });
 
-    node.put_document("platforms", agent_id, &platform_json.to_string())
+    node.put_document("nodes", agent_id, &node_json.to_string())
         .await?;
 
     debug!(agent_id, "synced agent status to mesh");

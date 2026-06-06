@@ -1,7 +1,7 @@
 //! Subprocess-driven two-node sync test — closes #44.
 //!
 //! Spawns two real `peat-node` binaries (via `CARGO_BIN_EXE_peat-node`),
-//! peers them over direct UDP, drives Platform + Document writes both
+//! peers them over direct UDP, drives Node + Document writes both
 //! directions, then asserts `GetSyncStats.bytes_sent` / `bytes_received`
 //! are non-zero on both sides.
 //!
@@ -139,21 +139,21 @@ async fn two_subprocess_sync_increments_byte_counters() {
     call(&client, &base_a, "StartSync", serde_json::json!({})).await;
     call(&client, &base_b, "StartSync", serde_json::json!({})).await;
 
-    // Drive writes on A (Platform + Document), mirroring the deleted
+    // Drive writes on A (Node + Document), mirroring the deleted
     // Go synctest's pattern that empirically produced non-zero counter
     // exchanges on every CI run. A single tiny document write isn't
     // always enough to land bytes through the cooldown-protected sync
-    // path; a typed Platform plus a generic doc reliably is.
+    // path; a typed Node plus a generic doc reliably is.
     call(
         &client,
         &base_a,
-        "PutPlatform",
+        "PutNode",
         serde_json::json!({
-            "platform": {
+            "node": {
                 "id": "cluster-alpha-agent",
-                "platformType": "uds-remote-agent",
+                "nodeType": "uds-remote-agent",
                 "name": "UDS Remote Agent @ cluster-alpha",
-                "status": "PLATFORM_STATUS_READY",
+                "status": "NODE_STATUS_READY",
                 "latitude": 38.8977,
                 "longitude": -77.0365,
                 "capabilities": ["package-management", "registry-sync"]
@@ -173,8 +173,8 @@ async fn two_subprocess_sync_increments_byte_counters() {
     )
     .await;
 
-    // Confirm B sees A's platform.
-    poll_for_platforms(&client, &base_b, "cluster-alpha-agent").await;
+    // Confirm B sees A's node.
+    poll_for_nodes(&client, &base_b, "cluster-alpha-agent").await;
 
     // Also fetch the deployment document on B — Go reference does this
     // and the extra GetDocument shapes the in-flight sync state.
@@ -192,13 +192,13 @@ async fn two_subprocess_sync_increments_byte_counters() {
     call(
         &client,
         &base_b,
-        "PutPlatform",
+        "PutNode",
         serde_json::json!({
-            "platform": {
+            "node": {
                 "id": "cluster-bravo-agent",
-                "platformType": "uds-remote-agent",
+                "nodeType": "uds-remote-agent",
                 "name": "UDS Remote Agent @ cluster-bravo",
-                "status": "PLATFORM_STATUS_READY",
+                "status": "NODE_STATUS_READY",
                 "latitude": 34.0522,
                 "longitude": -118.2437,
                 "capabilities": ["package-management"]
@@ -206,7 +206,7 @@ async fn two_subprocess_sync_increments_byte_counters() {
         }),
     )
     .await;
-    poll_for_platforms(&client, &base_a, "cluster-bravo-agent").await;
+    poll_for_nodes(&client, &base_a, "cluster-bravo-agent").await;
 
     // The core assertion #44 exists to recover: counters must show real
     // traffic moved.
@@ -271,16 +271,16 @@ fn json_u64(v: &serde_json::Value) -> u64 {
     0
 }
 
-async fn poll_for_platforms(client: &reqwest::Client, base: &str, want_id: &str) {
+async fn poll_for_nodes(client: &reqwest::Client, base: &str, want_id: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
-        let resp = call(client, base, "GetPlatforms", serde_json::json!({})).await;
-        if let Some(arr) = resp["platforms"].as_array() {
+        let resp = call(client, base, "GetNodes", serde_json::json!({})).await;
+        if let Some(arr) = resp["nodes"].as_array() {
             if arr.iter().any(|p| p["id"].as_str() == Some(want_id)) {
                 return;
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    panic!("platform {want_id} did not sync to {base} within 30s");
+    panic!("node {want_id} did not sync to {base} within 30s");
 }

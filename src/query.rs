@@ -10,7 +10,7 @@
 //! - `value` fields are JSON-encoded scalars: a string is `"\"vehicle\""`,
 //!   a number is `"42"`, a bool is `"true"`. This matches the existing
 //!   `string json_data` convention and keeps the wire trivially debuggable.
-//! - Field paths are flat top-level keys (e.g. `"platform_type"`). Dotted
+//! - Field paths are flat top-level keys (e.g. `"node_type"`). Dotted
 //!   paths into nested JSON are deliberately not supported yet — when the
 //!   need lands, extending here without a proto change is straightforward.
 //! - `Lt` / `Gt` compare numbers numerically and strings lexicographically.
@@ -324,9 +324,9 @@ mod tests {
 
     #[test]
     fn eq_string_match() {
-        let m = build(pq_eq("platform_type", "\"vehicle\""));
-        assert!(m.matches_upsert(r#"{"platform_type":"vehicle"}"#));
-        assert!(!m.matches_upsert(r#"{"platform_type":"aircraft"}"#));
+        let m = build(pq_eq("node_type", "\"vehicle\""));
+        assert!(m.matches_upsert(r#"{"node_type":"vehicle"}"#));
+        assert!(!m.matches_upsert(r#"{"node_type":"aircraft"}"#));
     }
 
     #[test]
@@ -413,12 +413,12 @@ mod tests {
     #[test]
     fn and_requires_all_clauses() {
         let m = build(pq_and(vec![
-            pq_eq("platform_type", "\"vehicle\""),
+            pq_eq("node_type", "\"vehicle\""),
             pq_gt("readiness", "0.5"),
         ]));
-        assert!(m.matches_upsert(r#"{"platform_type":"vehicle","readiness":0.8}"#));
-        assert!(!m.matches_upsert(r#"{"platform_type":"vehicle","readiness":0.2}"#));
-        assert!(!m.matches_upsert(r#"{"platform_type":"aircraft","readiness":0.8}"#));
+        assert!(m.matches_upsert(r#"{"node_type":"vehicle","readiness":0.8}"#));
+        assert!(!m.matches_upsert(r#"{"node_type":"vehicle","readiness":0.2}"#));
+        assert!(!m.matches_upsert(r#"{"node_type":"aircraft","readiness":0.8}"#));
     }
 
     #[test]
@@ -457,14 +457,14 @@ mod tests {
 
     #[test]
     fn nested_and_or_not() {
-        // (platform_type == "vehicle") AND NOT (status == "offline")
+        // (node_type == "vehicle") AND NOT (status == "offline")
         let m = build(pq_and(vec![
-            pq_eq("platform_type", "\"vehicle\""),
+            pq_eq("node_type", "\"vehicle\""),
             pq_not(pq_eq("status", "\"offline\"")),
         ]));
-        assert!(m.matches_upsert(r#"{"platform_type":"vehicle","status":"ready"}"#));
-        assert!(!m.matches_upsert(r#"{"platform_type":"vehicle","status":"offline"}"#));
-        assert!(!m.matches_upsert(r#"{"platform_type":"aircraft","status":"ready"}"#));
+        assert!(m.matches_upsert(r#"{"node_type":"vehicle","status":"ready"}"#));
+        assert!(!m.matches_upsert(r#"{"node_type":"vehicle","status":"offline"}"#));
+        assert!(!m.matches_upsert(r#"{"node_type":"aircraft","status":"ready"}"#));
     }
 
     // --- event_passes integration ---
@@ -484,34 +484,34 @@ mod tests {
 
     #[test]
     fn event_passes_query_filters_upserts_but_not_deletes() {
-        let m = build(pq_eq("platform_type", "\"vehicle\""));
+        let m = build(pq_eq("node_type", "\"vehicle\""));
         // Upsert that matches → pass
         assert!(event_passes(
             &[],
             Some(&m),
-            "platforms",
-            Some(r#"{"platform_type":"vehicle"}"#)
+            "nodes",
+            Some(r#"{"node_type":"vehicle"}"#)
         ));
         // Upsert that doesn't match → drop
         assert!(!event_passes(
             &[],
             Some(&m),
-            "platforms",
-            Some(r#"{"platform_type":"aircraft"}"#)
+            "nodes",
+            Some(r#"{"node_type":"aircraft"}"#)
         ));
         // Delete → pass (no payload to evaluate; subscriber needs to learn
         // the doc is gone or they keep stale state).
-        assert!(event_passes(&[], Some(&m), "platforms", None));
+        assert!(event_passes(&[], Some(&m), "nodes", None));
     }
 
     #[test]
     fn event_passes_collection_and_query_combine() {
         let m = build(pq_eq("status", "\"ready\""));
-        let cols = vec!["platforms".to_string()];
+        let cols = vec!["nodes".to_string()];
         assert!(event_passes(
             &cols,
             Some(&m),
-            "platforms",
+            "nodes",
             Some(r#"{"status":"ready"}"#)
         ));
         // Wrong collection → drop, even with matching payload.

@@ -46,8 +46,8 @@ service PeatSidecar {
   // --- Typed Collections ---
   // Convenience RPCs for common Peat domain objects.
 
-  rpc PutPlatform(PutPlatformRequest) returns (PutPlatformResponse);
-  rpc GetPlatforms(GetPlatformsRequest) returns (GetPlatformsResponse);
+  rpc PutNode(PutNodeRequest) returns (PutNodeResponse);
+  rpc GetNodes(GetNodesRequest) returns (GetNodesResponse);
 
   rpc PutCell(PutCellRequest) returns (PutCellResponse);
   rpc GetCells(GetCellsRequest) returns (GetCellsResponse);
@@ -211,12 +211,12 @@ message ListDocumentsResponse {
 
 // --- Typed Collection Messages ---
 
-// Platform represents a mesh participant's state.
-message Platform {
+// Node represents a mesh participant's state.
+message Node {
   string id = 1;
-  string platform_type = 2;
+  string node_type = 2;
   string name = 3;
-  PlatformStatus status = 4;
+  NodeStatus status = 4;
   double latitude = 5;
   double longitude = 6;
   double altitude_m = 7;
@@ -226,32 +226,32 @@ message Platform {
   optional string callsign = 11;
 }
 
-enum PlatformStatus {
-  PLATFORM_STATUS_UNSPECIFIED = 0;
-  PLATFORM_STATUS_READY = 1;
-  PLATFORM_STATUS_BUSY = 2;
-  PLATFORM_STATUS_DEGRADED = 3;
-  PLATFORM_STATUS_OFFLINE = 4;
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_READY = 1;
+  NODE_STATUS_BUSY = 2;
+  NODE_STATUS_DEGRADED = 3;
+  NODE_STATUS_OFFLINE = 4;
 }
 
-message PutPlatformRequest {
-  Platform platform = 1;
+message PutNodeRequest {
+  Node node = 1;
 }
 
-message PutPlatformResponse {}
+message PutNodeResponse {}
 
-message GetPlatformsRequest {}
+message GetNodesRequest {}
 
-message GetPlatformsResponse {
-  repeated Platform platforms = 1;
+message GetNodesResponse {
+  repeated Node nodes = 1;
 }
 
-// Cell represents a formation of platforms.
+// Cell represents a formation of nodes.
 message Cell {
   string id = 1;
   string name = 2;
   CellStatus status = 3;
-  uint32 platform_count = 4;
+  uint32 node_count = 4;
   double center_latitude = 5;
   double center_longitude = 6;
   repeated string capabilities = 7;
@@ -281,7 +281,7 @@ message GetCellsResponse {
 // Track represents an ISR track.
 message Track {
   string id = 1;
-  string source_platform = 2;
+  string source_node = 2;
   optional string cell_id = 3;
   optional string formation_id = 4;
   double latitude = 5;
@@ -385,7 +385,7 @@ message SubscriptionQuery {
 }
 
 message QueryEq {
-  // Top-level JSON field name, e.g. "platform_type". Nested paths
+  // Top-level JSON field name, e.g. "node_type". Nested paths
   // (e.g. "location.lat") are not supported in v1; the matcher does a
   // single-level object lookup. Dotted-path support is planned and will
   // be additive — no wire change required.
