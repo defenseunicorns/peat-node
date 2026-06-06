@@ -62,6 +62,7 @@ async fn boot_server(port: u16, cfg_override: impl FnOnce(&mut AttachmentConfig)
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("accept-{port}"),
             app_id: "test".into(),
             shared_key: String::new(),

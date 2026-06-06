@@ -30,6 +30,7 @@ async fn fresh_service() -> (Arc<SidecarNode>, PeatSidecarService) {
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: "test-sub-query".to_string(),
             app_id: "test".to_string(),
             shared_key: String::new(),

@@ -11,6 +11,7 @@ async fn test_node_with_encryption(
     encryption_key: Option<String>,
 ) -> SidecarNode {
     SidecarNode::new(SidecarConfig {
+        blob_stall_timeout: None,
         node_id: "test-node".to_string(),
         app_id: "test".to_string(),
         shared_key: String::new(),

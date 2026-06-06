@@ -48,6 +48,7 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: "subscribe-test".into(),
             app_id: "test".into(),
             shared_key: String::new(),

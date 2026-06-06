@@ -68,6 +68,7 @@ async fn boot(grpc_port: u16, iroh_port: u16) -> BootedNode {
 
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
+            blob_stall_timeout: None,
             node_id: format!("multi-{grpc_port}"),
             app_id: "multi-peer-test".into(),
             shared_key: String::new(),
