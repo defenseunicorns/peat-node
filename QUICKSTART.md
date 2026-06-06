@@ -226,7 +226,7 @@ The 25 RPCs split into five categories:
 | Subscriptions | `Subscribe` (server-streaming, every change to a collection or doc) |
 | Sync control | `StartSync`, `StopSync`, `GetSyncStats` |
 
-Plus typed convenience RPCs over peat-schema collections (`PutPlatform`, `GetCells`, etc.) and attachment-distribution RPCs (PRD-006, disabled by default).
+Plus typed convenience RPCs over peat-schema collections (`PutNode`, `GetCells`, etc.) and attachment-distribution RPCs (PRD-006, disabled by default).
 
 ## Common operator patterns
 
