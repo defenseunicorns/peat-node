@@ -103,7 +103,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.36", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.37", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
