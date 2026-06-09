@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::fanout::FanoutKind;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
@@ -218,11 +219,19 @@ impl SidecarNode {
         // and an observer connected to b never sees the change.
         // peat-mesh documents this channel as the gossip-driver
         // contract (peat-mesh#891 / #907).
+        // QoS-priority relay fanout (peat-node#138; mirrors peat-mesh#247 /
+        // ADR-0013). The listener enqueues each change non-blockingly; a
+        // single worker drains highest-QoS-first and performs the fanout, so a
+        // latency-sensitive document preempts a lower-priority backlog instead
+        // of being head-of-line-blocked behind it in the inline loop.
         let sync_rx = backend.store().subscribe_to_changes_with_origin();
-        let sync_coordinator = Arc::clone(backend.coordinator());
-        let sync_transport = Arc::clone(backend.transport());
+        let fanout = crate::fanout::PriorityFanout::new();
+        tokio::spawn(Arc::clone(&fanout).run(
+            Arc::clone(backend.coordinator()),
+            Arc::clone(backend.transport()),
+        ));
         tokio::spawn(async move {
-            Self::sync_on_change(sync_rx, sync_coordinator, sync_transport).await;
+            Self::sync_on_change(sync_rx, fanout).await;
         });
 
         // PRD-006: bundle handle table is always present (the cheap empty
@@ -471,39 +480,40 @@ impl SidecarNode {
             .to_string()
     }
 
-    /// React to document changes (local writes AND sync-received writes)
-    /// by pushing them to all connected peers except the source peer of
-    /// a remote-origin change. Echo suppression compares each connected
-    /// peer's `EndpointId::to_string()` against `ChangeOrigin::Remote(..)`'s
-    /// inner string per peat-mesh's transport-agnostic contract.
+    /// React to document changes (local writes AND sync-received writes) by
+    /// enqueuing them onto the QoS-priority relay fanout queue (peat-node#138).
+    /// The queue's worker performs the actual fanout, draining
+    /// highest-QoS-first; this listener stays non-blocking so the change
+    /// broadcast is drained promptly and fanout *ordering* is decided by
+    /// priority rather than arrival order.
+    ///
+    /// Local writes fan to every peer ([`FanoutKind::AllPeers`]); a
+    /// remote-origin change fans to every peer **except** its source
+    /// ([`FanoutKind::ExcludeSource`]) — echo suppression, the peat-mesh#239
+    /// gossip-amplification guard, preserved through the queue. The source is
+    /// matched by `EndpointId::to_string()` per peat-mesh's transport-agnostic
+    /// contract.
     async fn sync_on_change(
         mut rx: broadcast::Receiver<DocChange>,
-        coordinator: Arc<peat_mesh::storage::AutomergeSyncCoordinator>,
-        transport: Arc<peat_mesh::storage::MeshSyncTransport>,
+        fanout: Arc<crate::fanout::PriorityFanout>,
     ) {
         loop {
             match rx.recv().await {
-                Ok(DocChange { key, origin }) => match origin {
-                    ChangeOrigin::Local => {
-                        if let Err(e) = coordinator.sync_document_with_all_peers(&key).await {
-                            warn!(doc_key = %key, "sync to peers failed: {e}");
-                        }
-                    }
-                    ChangeOrigin::Remote(source) => {
-                        for peer in transport.connected_peers() {
-                            if peer.to_string() == source {
-                                continue;
-                            }
-                            if let Err(e) = coordinator.sync_document_with_peer(&key, peer).await {
-                                warn!(doc_key = %key, %peer, "fanout sync failed: {e}");
-                            }
-                        }
-                    }
-                },
+                Ok(DocChange { key, origin }) => {
+                    let kind = match origin {
+                        ChangeOrigin::Local => FanoutKind::AllPeers,
+                        ChangeOrigin::Remote(source) => FanoutKind::ExcludeSource(source),
+                    };
+                    fanout.enqueue(&key, kind);
+                }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("sync change listener lagged {n} messages");
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    // Broadcast closed (shutdown): let the worker drain and exit.
+                    fanout.close();
+                    break;
+                }
             }
         }
     }
