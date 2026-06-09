@@ -2,20 +2,52 @@
 //! must not exchange documents even if peered at the transport level.
 //!
 //! Equivalent to the deleted Go `functest` Phase 5.
+//!
+//! Ports are allocated dynamically (a free TCP port for the gRPC server, a
+//! free UDP port for the iroh endpoint) and the spawned servers are aborted
+//! at the end of the test. An earlier version hard-coded `50101/50102`
+//! (gRPC) and `51201/51202` (iroh) and never shut the servers down: a
+//! crashed or re-run test left listeners bound on those fixed ports, so the
+//! next run's servers failed to bind (`serve().unwrap()` panic) and its
+//! clients silently talked to the *stale* servers — manufacturing a
+//! cross-formation "leak" that was a harness artifact, not a product bug
+//! (peat-mesh isolates correctly; verified at the library level).
 
+use std::net::{TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
+use tokio::task::JoinHandle;
 
-async fn boot(
-    grpc_port: u16,
-    iroh_port: u16,
-    app_id: &str,
-    shared_key: &str,
-) -> (reqwest::Client, String) {
+/// Grab a currently-free TCP port by binding to `:0` and reading it back.
+/// There's a small race between drop and the server's rebind; acceptable for
+/// a test and far less flaky than fixed ports.
+fn free_tcp_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Grab a currently-free UDP port (for the iroh endpoint).
+fn free_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Boot a sidecar on dynamically-chosen ports. Returns the HTTP client, the
+/// base URL, the gRPC server task handle (abort it to shut the server down),
+/// and the iroh UDP port (so a peer can be given a concrete dial address).
+async fn boot(app_id: &str, shared_key: &str) -> (reqwest::Client, String, JoinHandle<()>, u16) {
+    let grpc_port = free_tcp_port();
+    let iroh_port = free_udp_port();
     let dir = tempfile::tempdir().unwrap();
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
@@ -35,15 +67,22 @@ async fn boot(
     let service = Arc::new(PeatSidecarService::new(node));
     let router = service.register(connectrpc::Router::new());
     let addr: std::net::SocketAddr = format!("127.0.0.1:{grpc_port}").parse().unwrap();
-    tokio::spawn(async move {
-        connectrpc::Server::new(router).serve(addr).await.unwrap();
+    let handle = tokio::spawn(async move {
+        // On a clean dynamic port this serves until aborted; we don't unwrap
+        // a teardown error into a panic.
+        let _ = connectrpc::Server::new(router).serve(addr).await;
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    (client, format!("http://127.0.0.1:{grpc_port}"))
+    (
+        client,
+        format!("http://127.0.0.1:{grpc_port}"),
+        handle,
+        iroh_port,
+    )
 }
 
 async fn call(
@@ -76,22 +115,22 @@ const BRAVO_KEY: &str = "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s="; // 0xBB 
 
 #[tokio::test]
 async fn different_formations_do_not_exchange_documents() {
-    let (client_a, base_a) = boot(50101, 51201, "alpha", ALPHA_KEY).await;
-    let (client_b, base_b) = boot(50102, 51202, "bravo", BRAVO_KEY).await;
+    let (client_a, base_a, handle_a, iroh_a) = boot("alpha", ALPHA_KEY).await;
+    let (client_b, base_b, handle_b, _iroh_b) = boot("bravo", BRAVO_KEY).await;
 
     let status_a = call(&client_a, &base_a, "GetStatus", serde_json::json!({})).await;
     let endpoint_a = status_a["endpointAddr"].as_str().unwrap().to_string();
 
-    // Attempt to peer. May succeed or fail at the transport layer
-    // depending on when the formation key handshake rejects — either is
-    // fine; the assertion is that nothing leaks across formations.
+    // Attempt to peer. May succeed or fail at the transport layer depending
+    // on when the formation key handshake rejects — either is fine; the
+    // assertion is that nothing leaks across formations.
     let _ = call(
         &client_b,
         &base_b,
         "ConnectPeer",
         serde_json::json!({
             "endpointId": endpoint_a,
-            "addresses": [format!("127.0.0.1:{}", 51201)],
+            "addresses": [format!("127.0.0.1:{iroh_a}")],
         }),
     )
     .await;
@@ -122,9 +161,12 @@ async fn different_formations_do_not_exchange_documents() {
     )
     .await;
 
+    let leaked = resp["jsonData"].as_str();
+    handle_a.abort();
+    handle_b.abort();
+
     assert!(
-        resp["jsonData"].as_str().is_none(),
-        "document leaked across formations: {}",
-        resp
+        leaked.is_none(),
+        "document leaked across formations: {resp}"
     );
 }
