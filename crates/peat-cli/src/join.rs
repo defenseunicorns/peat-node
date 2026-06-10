@@ -147,6 +147,9 @@ impl MeshSession {
             cipher: None,
             // CLI uses peat-mesh's default stall threshold (peat-mesh#137).
             download_stall_timeout: None,
+            // CLI is short-lived; no tombstone reaping or GC needed.
+            ttl_config: None,
+            gc_config: None,
         })
         .await
         .map_err(|e| {
