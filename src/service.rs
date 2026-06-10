@@ -588,9 +588,7 @@ impl pb::PeatSidecar for PeatSidecarService {
                 },
                 ctx,
             )),
-            None => Err(ConnectError::not_found(format!(
-                "no explicit config for collection '{collection}'"
-            ))),
+            None => Ok((pb::GetCollectionConfigResponse::default(), ctx)),
         }
     }
 

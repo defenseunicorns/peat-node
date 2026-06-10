@@ -482,10 +482,20 @@ impl SidecarNode {
         let collection_configs_path = config.data_dir.join("collection_configs.json");
         let collection_configs: HashMap<String, CollectionConfigEntry> =
             if collection_configs_path.exists() {
-                std::fs::read_to_string(&collection_configs_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_default()
+                match std::fs::read_to_string(&collection_configs_path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| serde_json::from_str(&s).map_err(anyhow::Error::from))
+                {
+                    Ok(map) => map,
+                    Err(e) => {
+                        warn!(
+                            path = %collection_configs_path.display(),
+                            "collection_configs.json is unreadable or corrupt — \
+                             starting with empty config (persisted policies lost): {e}"
+                        );
+                        HashMap::new()
+                    }
+                }
             } else {
                 HashMap::new()
             };

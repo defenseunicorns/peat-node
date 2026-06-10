@@ -94,16 +94,20 @@ async fn set_and_get_collection_config_round_trip() {
 }
 
 #[tokio::test]
-async fn get_unconfigured_collection_returns_not_found() {
+async fn get_unconfigured_collection_returns_empty() {
     let (_node, service) = fresh_service().await;
 
-    match service
+    // An unconfigured collection returns a 200 with no config field (not a NOT_FOUND
+    // error). This lets callers check for the presence of a config without treating
+    // absence as an error condition.
+    let (resp, _ctx) = service
         .get_collection_config(Context::default(), get_request("nonexistent"))
         .await
-    {
-        Err(e) => assert_eq!(e.code, ErrorCode::NotFound),
-        Ok(_) => panic!("expected NOT_FOUND"),
-    }
+        .expect("get_collection_config must succeed for unknown collection");
+    assert!(
+        resp.config.into_option().is_none(),
+        "expected no config for unconfigured collection"
+    );
 }
 
 #[tokio::test]
