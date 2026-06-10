@@ -185,3 +185,7 @@ rcgen = "0.13"
 # relevant tests pins them to one-at-a-time execution within their
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
+
+[patch.crates-io]
+# Local peat-mesh branch for peat-node#136 / peat-mesh#246/#236 (remove before merge, replace with rc version).
+peat-mesh = { path = "../peat-mesh" }

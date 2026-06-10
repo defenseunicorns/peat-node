@@ -82,6 +82,28 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_BLOB_STALL_TIMEOUT_SECS")]
     blob_stall_timeout_secs: Option<u64>,
 
+    // --- Tombstone / GC config (peat-node#136) ---
+    /// Tombstone retention window in hours. Tombstones are kept for at least
+    /// this long before being reaped; peers dark for longer than this risk
+    /// resurrecting deleted documents on reconnect (ADR-016 invariant).
+    /// Default: 168 h (7 days) — the conservative DDIL floor. Values below
+    /// 24 h produce a startup warning. Set lower only for test environments
+    /// with bounded partition windows.
+    #[arg(long, env = "PEAT_NODE_TOMBSTONE_TTL_HOURS")]
+    tombstone_ttl_hours: Option<u32>,
+
+    /// Garbage-collection interval, in seconds. Controls how often the
+    /// background GC task sweeps for expired tombstones and implicit-TTL
+    /// documents. Default: 300 s (5 min).
+    #[arg(long, env = "PEAT_NODE_GC_INTERVAL_SECS")]
+    gc_interval_secs: Option<u64>,
+
+    /// Maximum number of tombstones processed per GC sweep. Default: 1000.
+    /// Lower this on memory-constrained edge nodes to reduce peak GC
+    /// allocation.
+    #[arg(long, env = "PEAT_NODE_GC_BATCH_SIZE")]
+    gc_batch_size: Option<usize>,
+
     // --- Agent Watcher ---
     /// Local UDS Remote Agent address to watch. If not set, the watcher is disabled.
     /// Example: http://localhost:8080
@@ -302,6 +324,9 @@ async fn main() -> anyhow::Result<()> {
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
         blob_stall_timeout: args.blob_stall_timeout_secs.map(Duration::from_secs),
+        tombstone_ttl_hours: args.tombstone_ttl_hours,
+        gc_interval_secs: args.gc_interval_secs,
+        gc_batch_size: args.gc_batch_size,
         attachment_config,
     };
 

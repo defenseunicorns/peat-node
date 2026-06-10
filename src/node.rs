@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use crate::fanout::FanoutKind;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport};
+use peat_mesh::qos::GcConfig;
+use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
@@ -47,6 +48,14 @@ pub struct SidecarConfig {
     /// unreachable preferred peer otherwise costs the full stall on the
     /// first fetch before the peer-health index demotes it (peat-mesh#137).
     pub blob_stall_timeout: Option<Duration>,
+    /// Tombstone retention window in hours. `None` → 168 h (7-day default).
+    /// Values below 24 h emit a startup warning (ADR-016: tombstone TTL must
+    /// be ≥ the longest expected peer offline/partition window). peat-node#136.
+    pub tombstone_ttl_hours: Option<u32>,
+    /// GC sweep interval in seconds. `None` → 300 s (5-min default). peat-node#136.
+    pub gc_interval_secs: Option<u64>,
+    /// Max tombstones per GC sweep. `None` → 1000. peat-node#136.
+    pub gc_batch_size: Option<usize>,
     /// Attachment distribution (PRD-006). Empty roots → service handlers
     /// return `Unimplemented`. The `IrohFileDistribution` substrate is only
     /// constructed when at least one root is configured.
@@ -158,6 +167,27 @@ impl SidecarNode {
             })
             .transpose()?;
 
+        // Build TtlConfig from operator config, defaulting to TtlConfig::new()
+        // (168 h tombstone TTL — the DDIL-safe floor). The warning for short
+        // TTLs fires inside AutomergeBackend::with_iroh. peat-node#136.
+        let ttl_config = {
+            let mut cfg = TtlConfig::new();
+            if let Some(hours) = config.tombstone_ttl_hours {
+                cfg.tombstone_ttl_hours = hours;
+            }
+            Some(cfg)
+        };
+        let gc_config = {
+            let mut cfg = GcConfig::default();
+            if let Some(secs) = config.gc_interval_secs {
+                cfg.gc_interval = std::time::Duration::from_secs(secs);
+            }
+            if let Some(batch) = config.gc_batch_size {
+                cfg.tombstone_batch_size = batch;
+            }
+            Some(cfg)
+        };
+
         let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
             data_dir: config.data_dir.clone(),
             formation_id: config.app_id.clone(),
@@ -173,6 +203,8 @@ impl SidecarNode {
             // the higher-layer encryption; would let us remove the
             // higher-layer path if/when we want).
             cipher: None,
+            ttl_config,
+            gc_config,
         })
         .await?;
 
