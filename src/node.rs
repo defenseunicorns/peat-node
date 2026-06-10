@@ -573,7 +573,11 @@ impl SidecarNode {
                         let raw = match store.get(&key) {
                             Ok(Some(doc)) => {
                                 let j = automerge_to_json(&doc);
-                                if let Some(s) = j.get("value").and_then(|v| v.as_str()) {
+                                if let Some(s) = j
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| crate::crypto::is_encrypted(s))
+                                {
                                     Some(s.to_string())
                                 } else {
                                     serde_json::to_string(&j).ok()
@@ -974,7 +978,11 @@ impl SidecarNode {
                 //   - Structured (unencrypted gRPC writes and all peat-cli
                 //     writes): direct Automerge map fields. Serialize to
                 //     JSON and return as-is.
-                if let Some(s) = json.get("value").and_then(|v| v.as_str()) {
+                if let Some(s) = json
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| crate::crypto::is_encrypted(s))
+                {
                     Ok(self.maybe_decrypt(Some(s.to_string()))?)
                 } else {
                     Ok(Some(serde_json::to_string(&json)?))

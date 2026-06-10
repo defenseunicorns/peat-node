@@ -298,3 +298,64 @@ async fn connect_peer_rejects_empty_addressing() {
         "error message should mention addresses or relay_url, got: {body}"
     );
 }
+
+#[tokio::test]
+async fn connect_protocol_structured_doc_with_value_field() {
+    // Regression for peat-node#7 (blocker): a document whose JSON has a
+    // top-level "value" string field must round-trip intact through the Connect
+    // surface — the is_encrypted() gate in get_document must not confuse user
+    // data with the encrypted-wrapper sentinel at the HTTP layer.
+    let (client, base) = boot_server(50085, None).await;
+
+    // Payload with a "value" key (the former encrypted-wrapper field name)
+    call(
+        &client,
+        &base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "test",
+            "docId": "doc-value-field",
+            "jsonData": r#"{"value":"hello","name":"alice"}"#
+        }),
+    )
+    .await;
+
+    let doc = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "test", "docId": "doc-value-field"}),
+    )
+    .await;
+
+    let json_data = doc["jsonData"].as_str().expect("jsonData must be present");
+    let v: serde_json::Value = serde_json::from_str(json_data).unwrap();
+    assert_eq!(v["value"], "hello", "value field must be preserved");
+    assert_eq!(v["name"], "alice", "name field must not be dropped");
+
+    // Nested object with a "value" key at depth — also must round-trip correctly
+    call(
+        &client,
+        &base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "test",
+            "docId": "doc-nested",
+            "jsonData": r#"{"outer":{"value":"nested"},"count":3}"#
+        }),
+    )
+    .await;
+
+    let doc2 = call(
+        &client,
+        &base,
+        "GetDocument",
+        serde_json::json!({"collection": "test", "docId": "doc-nested"}),
+    )
+    .await;
+
+    let json_data2 = doc2["jsonData"].as_str().expect("jsonData must be present");
+    let v2: serde_json::Value = serde_json::from_str(json_data2).unwrap();
+    assert_eq!(v2["outer"]["value"], "nested");
+    assert_eq!(v2["count"], 3);
+}
