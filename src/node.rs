@@ -343,6 +343,16 @@ impl SidecarNode {
         // registry of peers the operator originally asked to connect
         // to, and re-dialing any that have dropped out.
         //
+        // Design decision (peat-node#100): the watchdog lives here rather
+        // than inside MeshSyncTransport or peat-mesh because the
+        // operator-intent registry (which peers should be auto-reconnected
+        // vs. left dropped) is a peat-node concept — it's populated by the
+        // gRPC ConnectPeer / DisconnectPeer calls, which are above the
+        // transport layer. Pushing the watchdog into MeshSyncTransport would
+        // require exposing that policy downward. The alternative (factoring
+        // a shared ReconnectionManager into peat-mesh) is tracked in #100
+        // as a future option if a second consumer duplicates this pattern.
+        //
         // The watchdog holds `Weak` references rather than `Arc` so
         // it exits cleanly when `SidecarNode` is dropped — important
         // for integration tests that spin nodes up and down.
