@@ -134,37 +134,36 @@ impl MeshSession {
             "bootstrapping peat-cli backend"
         );
 
-        let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
-            data_dir: data_dir.path().to_path_buf(),
-            formation_id: creds.app_id.clone(),
-            base64_shared_key: creds.shared_key.clone(),
-            // CLI is a transient client; let iroh pick an ephemeral UDP port.
-            iroh_bind_addr: None,
-            // At-rest cipher is handled at the peat-node layer for now
-            // (matches the rc.26 comment in peat-node/src/node.rs). The CLI's
-            // tempdir-backed store is short-lived enough that omitting it is
-            // safe for Phase 2; revisit if persistent state is added.
-            cipher: None,
-            // CLI uses peat-mesh's default stall threshold (peat-mesh#137).
-            download_stall_timeout: None,
-        })
-        .await
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            // redb holds an exclusive file lock on the store while open.
-            // "Cannot acquire lock" means another peat process is running
-            // against the same data_dir.
-            if msg.contains("Cannot acquire lock") || msg.contains("Database already open") {
-                CliError::Generic(format!(
-                    "backend bootstrap: {msg}\n\
+        let mut backend_cfg = AutomergeBackendConfig::default();
+        backend_cfg.data_dir = data_dir.path().to_path_buf();
+        backend_cfg.formation_id = creds.app_id.clone();
+        backend_cfg.base64_shared_key = creds.shared_key.clone();
+        // CLI is a transient client; let iroh pick an ephemeral UDP port.
+        backend_cfg.iroh_bind_addr = None;
+        // At-rest cipher is handled at the peat-node layer for now.
+        // The CLI's tempdir-backed store is short-lived enough that
+        // omitting it is safe for Phase 2.
+        backend_cfg.cipher = None;
+        // CLI uses peat-mesh's default stall threshold (peat-mesh#137).
+        backend_cfg.download_stall_timeout = None;
+        let backend = AutomergeBackend::with_iroh(backend_cfg)
+            .await
+            .map_err(|e| {
+                let msg = format!("{e:#}");
+                // redb holds an exclusive file lock on the store while open.
+                // "Cannot acquire lock" means another peat process is running
+                // against the same data_dir.
+                if msg.contains("Cannot acquire lock") || msg.contains("Database already open") {
+                    CliError::Generic(format!(
+                        "backend bootstrap: {msg}\n\
                      hint: the local store at {} is locked — another `peat` \
                      process is likely running. Stop it and retry.",
-                    data_dir.path().display()
-                ))
-            } else {
-                CliError::Generic(format!("backend bootstrap: {msg}"))
-            }
-        })?;
+                        data_dir.path().display()
+                    ))
+                } else {
+                    CliError::Generic(format!("backend bootstrap: {msg}"))
+                }
+            })?;
 
         // ── mDNS peer discovery ────────────────────────────────────────────
         // Start mDNS before explicit peer connects so the daemon begins
