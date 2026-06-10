@@ -79,18 +79,36 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-      # Toolchain (rustup/cargo) + protoc are pre-provisioned under the runner
-      # user's ~/.cargo, but this self-hosted runner's non-login step shell does
-      # NOT reliably export $HOME — so `echo "$HOME/.cargo/bin" >> $GITHUB_PATH`
-      # added a bogus `/.cargo/bin` and `cargo` exited 127 (command not found).
-      # Derive the real home from passwd (independent of $HOME) and set HOME
-      # (rustup needs it to locate the toolchain) + PATH in the same step.
-      - name: Run peat-cli e2e tests (incl. mDNS via --include-ignored)
+      # dtolnay/rust-toolchain is a JavaScript action: it resolves the runner
+      # user's real home via Node.js os.homedir() (reads /etc/passwd directly),
+      # bypassing the non-login-shell $HOME gap that made the old getent-passwd
+      # workaround fragile. It adds the toolchain bin dir to $GITHUB_PATH at the
+      # runner-daemon level, so subsequent run steps see cargo unconditionally.
+      # Fast path when the toolchain is already installed; installs it if missing.
+      - uses: dtolnay/rust-toolchain@stable
+      # Repair the runner's .path file so cargo is on PATH for ALL future jobs
+      # on this runner — not just those that include the toolchain action above.
+      # Idempotent: skips if cargo bin is already present in .path. Uses
+      # $RUNNER_WORKSPACE (set by the Actions daemon) to locate the runner root
+      # without relying on $HOME. continue-on-error so a path-file layout change
+      # never blocks tests.
+      - name: Repair runner .path (persistent cargo PATH fix)
+        continue-on-error: true
         run: |
-          export HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          cargo --version
-          cargo test -p peat-cli --test e2e -- --include-ignored
+          REAL_HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+          RUNNER_PATH_FILE="$(dirname "$RUNNER_WORKSPACE")/.path"
+          if [ -f "$RUNNER_PATH_FILE" ]; then
+            if ! grep -qF "$REAL_HOME/.cargo/bin" "$RUNNER_PATH_FILE"; then
+              echo "$REAL_HOME/.cargo/bin:$(cat "$RUNNER_PATH_FILE")" > "$RUNNER_PATH_FILE"
+              echo "Prepended $REAL_HOME/.cargo/bin to $RUNNER_PATH_FILE"
+            else
+              echo ".path already contains cargo bin — no change needed"
+            fi
+          else
+            echo "Runner .path not found at $RUNNER_PATH_FILE — skipping"
+          fi
+      - name: Run peat-cli e2e tests (incl. mDNS via --include-ignored)
+        run: cargo test -p peat-cli --test e2e -- --include-ignored
 
   build:
     name: Build
