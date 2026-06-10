@@ -428,31 +428,30 @@ impl pb::PeatSidecar for PeatSidecarService {
         }
 
         let filter_collections_live = filter_collections.clone();
-        let live_stream =
-            BroadcastStream::new(rx).filter_map(move |result| match result {
-                Ok(event) => {
-                    if !event_passes(
-                        &filter_collections_live,
-                        matcher.as_ref(),
-                        &event.collection,
-                        event.json_data.as_deref(),
-                    ) {
-                        return None;
-                    }
-                    let change_type = match event.change_type {
-                        NodeChangeType::Upsert => pb::ChangeType::CHANGE_TYPE_UPSERT,
-                        NodeChangeType::Delete => pb::ChangeType::CHANGE_TYPE_DELETE,
-                    };
-                    Some(Ok(pb::DocumentChange {
-                        collection: event.collection,
-                        doc_id: event.doc_id,
-                        change_type: change_type.into(),
-                        json_data: event.json_data,
-                        ..Default::default()
-                    }))
+        let live_stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(event) => {
+                if !event_passes(
+                    &filter_collections_live,
+                    matcher.as_ref(),
+                    &event.collection,
+                    event.json_data.as_deref(),
+                ) {
+                    return None;
                 }
-                Err(_) => None,
-            });
+                let change_type = match event.change_type {
+                    NodeChangeType::Upsert => pb::ChangeType::CHANGE_TYPE_UPSERT,
+                    NodeChangeType::Delete => pb::ChangeType::CHANGE_TYPE_DELETE,
+                };
+                Some(Ok(pb::DocumentChange {
+                    collection: event.collection,
+                    doc_id: event.doc_id,
+                    change_type: change_type.into(),
+                    json_data: event.json_data,
+                    ..Default::default()
+                }))
+            }
+            Err(_) => None,
+        });
 
         let combined = futures::stream::iter(snapshot).chain(live_stream);
         Ok((Box::pin(combined), ctx))
@@ -569,7 +568,8 @@ impl pb::PeatSidecar for PeatSidecarService {
                 "collection name must not be empty",
             ));
         }
-        let entry = proto_config_to_entry(cfg).map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
+        let entry = proto_config_to_entry(cfg)
+            .map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
         self.node.set_collection_config(entry).map_err(internal)?;
         Ok((pb::SetCollectionConfigResponse::default(), ctx))
     }

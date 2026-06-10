@@ -449,7 +449,11 @@ async fn subscribe_initial_snapshot_includes_existing_docs() {
 
     // Expect the 3 snapshot events; they should arrive without any writes.
     let events = collect(&mut stream, 3, Duration::from_secs(2)).await;
-    assert_eq!(events.len(), 3, "expected 3 snapshot events; got {events:?}");
+    assert_eq!(
+        events.len(),
+        3,
+        "expected 3 snapshot events; got {events:?}"
+    );
 
     let mut doc_ids: Vec<_> = events.iter().map(|e| e.doc_id.clone()).collect();
     doc_ids.sort();
@@ -477,10 +481,17 @@ async fn subscribe_initial_snapshot_filtered_by_query() {
         .expect("subscribe");
 
     let events = collect(&mut stream, 2, Duration::from_secs(2)).await;
-    assert_eq!(events.len(), 2, "expected 2 snapshot events (vehicles only); got {events:?}");
+    assert_eq!(
+        events.len(),
+        2,
+        "expected 2 snapshot events (vehicles only); got {events:?}"
+    );
 
     let mut doc_ids: Vec<_> = events.iter().map(|e| e.doc_id.clone()).collect();
     doc_ids.sort();
     assert_eq!(doc_ids, ["v1", "v2"]);
-    assert!(!events.iter().any(|e| e.doc_id == "a1"), "aircraft leaked past filter");
+    assert!(
+        !events.iter().any(|e| e.doc_id == "a1"),
+        "aircraft leaked past filter"
+    );
 }

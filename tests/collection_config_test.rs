@@ -38,7 +38,9 @@ async fn fresh_service() -> (Arc<SidecarNode>, PeatSidecarService) {
     (node, service)
 }
 
-fn set_request(cfg: CollectionConfig) -> OwnedView<peat_node::pb::SetCollectionConfigRequestView<'static>> {
+fn set_request(
+    cfg: CollectionConfig,
+) -> OwnedView<peat_node::pb::SetCollectionConfigRequestView<'static>> {
     let req = SetCollectionConfigRequest {
         config: buffa::MessageField::some(cfg),
         ..Default::default()
@@ -46,7 +48,9 @@ fn set_request(cfg: CollectionConfig) -> OwnedView<peat_node::pb::SetCollectionC
     OwnedView::from_owned(&req).expect("encode set_collection_config request")
 }
 
-fn get_request(collection: &str) -> OwnedView<peat_node::pb::GetCollectionConfigRequestView<'static>> {
+fn get_request(
+    collection: &str,
+) -> OwnedView<peat_node::pb::GetCollectionConfigRequestView<'static>> {
     let req = GetCollectionConfigRequest {
         collection: collection.to_string(),
         ..Default::default()
@@ -198,8 +202,7 @@ async fn set_collection_config_persists_to_disk() {
     let config_path = data_dir.join("collection_configs.json");
     let json_str = std::fs::read_to_string(&config_path)
         .expect("collection_configs.json must exist after set");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&json_str).expect("valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
     let commands = &parsed["commands"];
     assert_eq!(commands["collection"], "commands");
     assert_eq!(commands["deletion_policy"], "Immutable");
