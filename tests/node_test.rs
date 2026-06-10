@@ -172,7 +172,9 @@ async fn subscribe_change_event_includes_json_data() {
         .expect("timeout")
         .expect("recv error");
 
-    let json_data = event.json_data.expect("json_data must be present for gRPC writes");
+    let json_data = event
+        .json_data
+        .expect("json_data must be present for gRPC writes");
     let v: serde_json::Value = serde_json::from_str(&json_data).unwrap();
     assert_eq!(v["name"], "alice");
 }
