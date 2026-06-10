@@ -424,3 +424,63 @@ async fn empty_query_oneof_is_invalid_argument() {
         ),
     }
 }
+
+// --- Initial snapshot tests (peat-node#55) ---
+
+#[tokio::test]
+async fn subscribe_initial_snapshot_includes_existing_docs() {
+    // Docs written BEFORE subscribe must arrive as the initial snapshot
+    // before any live updates (peat-node#55 acceptance criteria).
+    let (node, service) = fresh_service().await;
+
+    // Write 3 docs to a collection before subscribing.
+    put(&node, "nodes", "n1", r#"{"node_type":"vehicle"}"#).await;
+    put(&node, "nodes", "n2", r#"{"node_type":"aircraft"}"#).await;
+    put(&node, "nodes", "n3", r#"{"node_type":"vehicle"}"#).await;
+
+    let req = SubscribeRequest {
+        collections: vec!["nodes".to_string()],
+        ..Default::default()
+    };
+    let (mut stream, _ctx) = service
+        .subscribe(Context::default(), subscribe_view(req))
+        .await
+        .expect("subscribe");
+
+    // Expect the 3 snapshot events; they should arrive without any writes.
+    let events = collect(&mut stream, 3, Duration::from_secs(2)).await;
+    assert_eq!(events.len(), 3, "expected 3 snapshot events; got {events:?}");
+
+    let mut doc_ids: Vec<_> = events.iter().map(|e| e.doc_id.clone()).collect();
+    doc_ids.sort();
+    assert_eq!(doc_ids, ["n1", "n2", "n3"]);
+}
+
+#[tokio::test]
+async fn subscribe_initial_snapshot_filtered_by_query() {
+    // The initial snapshot must respect the Eq query — only matching
+    // docs arrive, not the whole collection.
+    let (node, service) = fresh_service().await;
+
+    put(&node, "nodes", "v1", r#"{"node_type":"vehicle"}"#).await;
+    put(&node, "nodes", "a1", r#"{"node_type":"aircraft"}"#).await;
+    put(&node, "nodes", "v2", r#"{"node_type":"vehicle"}"#).await;
+
+    let req = SubscribeRequest {
+        collections: vec!["nodes".to_string()],
+        query: buffa::MessageField::some(pq_eq("node_type", "\"vehicle\"")),
+        ..Default::default()
+    };
+    let (mut stream, _ctx) = service
+        .subscribe(Context::default(), subscribe_view(req))
+        .await
+        .expect("subscribe");
+
+    let events = collect(&mut stream, 2, Duration::from_secs(2)).await;
+    assert_eq!(events.len(), 2, "expected 2 snapshot events (vehicles only); got {events:?}");
+
+    let mut doc_ids: Vec<_> = events.iter().map(|e| e.doc_id.clone()).collect();
+    doc_ids.sort();
+    assert_eq!(doc_ids, ["v1", "v2"]);
+    assert!(!events.iter().any(|e| e.doc_id == "a1"), "aircraft leaked past filter");
+}

@@ -97,6 +97,10 @@ pub struct SidecarNode {
     /// is treated as "don't reconnect," distinguishing operator-initiated
     /// teardown from transient link loss.
     registered_peers: Arc<RwLock<HashMap<iroh::EndpointId, PeerRegistration>>>,
+    /// Per-collection lifecycle configs (peat-node#55). Stored in memory and
+    /// persisted to `data_dir/collection_configs.json` on each write.
+    collection_configs: Arc<RwLock<HashMap<String, CollectionConfigEntry>>>,
+    collection_configs_path: std::path::PathBuf,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -141,6 +145,32 @@ const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(5);
 /// permanently-departed peer, short enough that a 2-minute partition
 /// still recovers within one cycle.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(120);
+
+/// Deletion semantics for a collection (peat-node#55 / ADR-016).
+///
+/// Mirrors `peat_mesh::qos::DeletionPolicy` for the sidecar API surface.
+/// Full peat-mesh enforcement per collection requires `AutomergeBackend`
+/// to gain a `set_deletion_policy()` surface; until then the policy is
+/// persisted and surfaced through the collection-config RPCs so callers can
+/// implement application-layer delete routing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub enum StoredDeletionPolicy {
+    SoftDelete,
+    Tombstone,
+    ImplicitTTL,
+    Immutable,
+}
+
+/// Per-collection lifecycle configuration persisted to disk (peat-node#55).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CollectionConfigEntry {
+    pub collection: String,
+    pub deletion_policy: StoredDeletionPolicy,
+    /// ADR-016 Tier 1 TTL in seconds. `None` = use mesh default.
+    pub soft_delete_ttl_secs: Option<u64>,
+    /// ADR-016 Tier 2 tombstone TTL in seconds. `None` = use mesh default (168 h).
+    pub tombstone_ttl_secs: Option<u64>,
+}
 
 /// Internal change event for the broadcast channel.
 #[derive(Debug, Clone)]
@@ -448,6 +478,18 @@ impl SidecarNode {
             });
         }
 
+        // Load per-collection lifecycle configs (peat-node#55).
+        let collection_configs_path = config.data_dir.join("collection_configs.json");
+        let collection_configs: HashMap<String, CollectionConfigEntry> =
+            if collection_configs_path.exists() {
+                std::fs::read_to_string(&collection_configs_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+
         Ok(Self {
             node_id: config.node_id,
             backend,
@@ -459,6 +501,8 @@ impl SidecarNode {
             file_distribution,
             bundle_runtime: Arc::new(BundleRuntimeStore::new()),
             registered_peers,
+            collection_configs: Arc::new(RwLock::new(collection_configs)),
+            collection_configs_path,
         })
     }
 
@@ -1030,6 +1074,36 @@ impl SidecarNode {
     /// Subscribe to document changes. Returns a broadcast receiver.
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
         self.change_tx.subscribe()
+    }
+
+    // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
+
+    pub fn set_collection_config(&self, entry: CollectionConfigEntry) -> anyhow::Result<()> {
+        let mut configs = self
+            .collection_configs
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        configs.insert(entry.collection.clone(), entry);
+        let json = serde_json::to_string_pretty(&*configs)?;
+        std::fs::write(&self.collection_configs_path, json)?;
+        Ok(())
+    }
+
+    pub fn get_collection_config(&self, collection: &str) -> Option<CollectionConfigEntry> {
+        self.collection_configs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(collection)
+            .cloned()
+    }
+
+    pub fn list_collection_configs(&self) -> Vec<CollectionConfigEntry> {
+        self.collection_configs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Shutdown the node gracefully.

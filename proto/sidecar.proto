@@ -61,6 +61,11 @@ service PeatSidecar {
   // --- Subscriptions ---
 
   // Subscribe streams document changes across all or filtered collections.
+  //
+  // The server sends an initial snapshot of all currently-stored matching
+  // documents as CHANGE_TYPE_UPSERT events, then streams live changes.
+  // Clients can distinguish snapshot from live events by consuming until
+  // the server indicates readiness, or by treating all Upserts idempotently.
   rpc Subscribe(SubscribeRequest) returns (stream DocumentChange);
 
   // --- Sync Control ---
@@ -120,6 +125,24 @@ service PeatSidecar {
   // not rolled back. Returns NOT_FOUND when distribution_id is unknown.
   rpc CancelAttachmentDistribution(CancelAttachmentDistributionRequest)
       returns (CancelAttachmentDistributionResponse);
+
+  // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
+
+  // SetCollectionConfig persists deletion-policy and TTL settings for a named
+  // collection. Settings survive node restarts. Applying a new config to an
+  // existing collection replaces the prior config wholesale.
+  rpc SetCollectionConfig(SetCollectionConfigRequest)
+      returns (SetCollectionConfigResponse);
+
+  // GetCollectionConfig returns the explicit config for a collection.
+  // Returns NOT_FOUND when no config has been set (the default policy applies).
+  rpc GetCollectionConfig(GetCollectionConfigRequest)
+      returns (GetCollectionConfigResponse);
+
+  // ListCollectionConfigs returns all explicitly configured collections.
+  // Collections using the default policy are not included.
+  rpc ListCollectionConfigs(ListCollectionConfigsRequest)
+      returns (ListCollectionConfigsResponse);
 }
 
 // --- Lifecycle Messages ---
@@ -656,4 +679,59 @@ message CancelAttachmentDistributionResponse {
   // in a terminal state (COMPLETED / FAILED / CANCELLED) when the request
   // arrived.
   bool was_cancelled = 1;
+}
+
+// --- Collection Lifecycle Configuration Messages (peat-node#55 / ADR-016) ---
+
+message SetCollectionConfigRequest {
+  CollectionConfig config = 1;
+}
+
+message SetCollectionConfigResponse {}
+
+message GetCollectionConfigRequest {
+  string collection = 1;
+}
+
+message GetCollectionConfigResponse {
+  CollectionConfig config = 1;
+}
+
+message ListCollectionConfigsRequest {}
+
+message ListCollectionConfigsResponse {
+  repeated CollectionConfig configs = 1;
+}
+
+// CollectionConfig controls deletion semantics and TTLs for a named collection.
+//
+// The deletion_policy field maps to peat_mesh::qos::DeletionPolicy. Policy
+// enforcement through peat-mesh is per-collection once peat-mesh gains a
+// set_deletion_policy() surface on AutomergeBackend (tracked separately).
+// In this release, policy is persisted and surfaced via GetCollectionConfig /
+// ListCollectionConfigs; callers may also inspect it to implement
+// application-layer delete routing.
+message CollectionConfig {
+  string collection = 1;
+  DeletionPolicy deletion_policy = 2;
+  // ADR-016 Tier 1: how long soft-deleted documents are retained before GC.
+  // 0 means "use the mesh default". Only meaningful with DELETION_POLICY_SOFT_DELETE.
+  optional uint64 soft_delete_ttl_secs = 3;
+  // ADR-016 Tier 2: how long tombstones are retained before GC.
+  // 0 means "use the mesh default (168h)". Only meaningful with DELETION_POLICY_TOMBSTONE.
+  optional uint64 tombstone_ttl_secs = 4;
+}
+
+// DeletionPolicy mirrors peat_mesh::qos::DeletionPolicy for the sidecar API.
+enum DeletionPolicy {
+  DELETION_POLICY_UNSPECIFIED = 0;
+  // Documents are marked _deleted=true but never removed. Full audit trail.
+  // Default when no explicit policy is set.
+  DELETION_POLICY_SOFT_DELETE = 1;
+  // Explicit tombstones propagate to peers and are GC'd after tombstone_ttl.
+  DELETION_POLICY_TOMBSTONE = 2;
+  // Documents superseded by newer versions; old docs GC'd after soft_delete_ttl.
+  DELETION_POLICY_IMPLICIT_TTL = 3;
+  // Deletion is not allowed for this collection.
+  DELETION_POLICY_IMMUTABLE = 4;
 }

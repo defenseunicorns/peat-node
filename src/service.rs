@@ -13,7 +13,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::error;
 
-use crate::node::{ChangeType as NodeChangeType, SidecarNode};
+use crate::node::{
+    ChangeType as NodeChangeType, CollectionConfigEntry, SidecarNode, StoredDeletionPolicy,
+};
 use crate::pb;
 use crate::query::{event_passes, Matcher};
 
@@ -382,10 +384,6 @@ impl pb::PeatSidecar for PeatSidecarService {
         let filter_collections: Vec<String> =
             request.collections.iter().map(|s| s.to_string()).collect();
 
-        // Translate the optional wire-level query into an owned matcher.
-        // Materialize the view as an owned proto first so the matcher
-        // doesn't have to thread the View lifetime through the stream
-        // closure.
         let matcher: Option<Matcher> = match request.query.as_option() {
             Some(view) => {
                 let owned = view.to_owned_message();
@@ -396,34 +394,68 @@ impl pb::PeatSidecar for PeatSidecarService {
             None => None,
         };
 
+        // Subscribe to live updates BEFORE fetching the snapshot to avoid
+        // missing events that arrive during the snapshot query.
         let rx = self.node.subscribe();
 
-        let stream = BroadcastStream::new(rx).filter_map(move |result| match result {
-            Ok(event) => {
-                if !event_passes(
-                    &filter_collections,
-                    matcher.as_ref(),
-                    &event.collection,
-                    event.json_data.as_deref(),
-                ) {
-                    return None;
+        // Build an initial snapshot for collections named explicitly in the
+        // request. Wildcard subscribe (empty collections list) skips the
+        // snapshot — there's no index of all collection names in the store.
+        let mut snapshot: Vec<Result<pb::DocumentChange, ConnectError>> = vec![];
+        for collection in &filter_collections {
+            let ids = self
+                .node
+                .list_documents(collection)
+                .await
+                .map_err(internal)?;
+            for doc_id in ids {
+                if let Ok(Some(json)) = self.node.get_document(collection, &doc_id).await {
+                    let passes = match &matcher {
+                        Some(m) => m.matches_upsert(&json),
+                        None => true,
+                    };
+                    if passes {
+                        snapshot.push(Ok(pb::DocumentChange {
+                            collection: collection.clone(),
+                            doc_id,
+                            change_type: pb::ChangeType::CHANGE_TYPE_UPSERT.into(),
+                            json_data: Some(json),
+                            ..Default::default()
+                        }));
+                    }
                 }
-                let change_type = match event.change_type {
-                    NodeChangeType::Upsert => pb::ChangeType::CHANGE_TYPE_UPSERT,
-                    NodeChangeType::Delete => pb::ChangeType::CHANGE_TYPE_DELETE,
-                };
-                Some(Ok(pb::DocumentChange {
-                    collection: event.collection,
-                    doc_id: event.doc_id,
-                    change_type: change_type.into(),
-                    json_data: event.json_data,
-                    ..Default::default()
-                }))
             }
-            Err(_) => None,
-        });
+        }
 
-        Ok((Box::pin(stream), ctx))
+        let filter_collections_live = filter_collections.clone();
+        let live_stream =
+            BroadcastStream::new(rx).filter_map(move |result| match result {
+                Ok(event) => {
+                    if !event_passes(
+                        &filter_collections_live,
+                        matcher.as_ref(),
+                        &event.collection,
+                        event.json_data.as_deref(),
+                    ) {
+                        return None;
+                    }
+                    let change_type = match event.change_type {
+                        NodeChangeType::Upsert => pb::ChangeType::CHANGE_TYPE_UPSERT,
+                        NodeChangeType::Delete => pb::ChangeType::CHANGE_TYPE_DELETE,
+                    };
+                    Some(Ok(pb::DocumentChange {
+                        collection: event.collection,
+                        doc_id: event.doc_id,
+                        change_type: change_type.into(),
+                        json_data: event.json_data,
+                        ..Default::default()
+                    }))
+                }
+                Err(_) => None,
+            });
+
+        let combined = futures::stream::iter(snapshot).chain(live_stream);
+        Ok((Box::pin(combined), ctx))
     }
 
     // --- Sync Control ---
@@ -519,6 +551,67 @@ impl pb::PeatSidecar for PeatSidecarService {
         let resp =
             crate::attachments::handlers::cancel_attachment_distribution(&self.node, req).await?;
         Ok((resp, ctx))
+    }
+
+    // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
+
+    async fn set_collection_config(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::SetCollectionConfigRequestView<'static>>,
+    ) -> Result<(pb::SetCollectionConfigResponse, Context), ConnectError> {
+        let req = request.to_owned_message();
+        let cfg = req
+            .config
+            .ok_or_else(|| ConnectError::invalid_argument("config is required"))?;
+        if cfg.collection.is_empty() {
+            return Err(ConnectError::invalid_argument(
+                "collection name must not be empty",
+            ));
+        }
+        let entry = proto_config_to_entry(cfg).map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
+        self.node.set_collection_config(entry).map_err(internal)?;
+        Ok((pb::SetCollectionConfigResponse::default(), ctx))
+    }
+
+    async fn get_collection_config(
+        &self,
+        ctx: Context,
+        request: OwnedView<pb::GetCollectionConfigRequestView<'static>>,
+    ) -> Result<(pb::GetCollectionConfigResponse, Context), ConnectError> {
+        let collection = request.collection;
+        match self.node.get_collection_config(collection) {
+            Some(entry) => Ok((
+                pb::GetCollectionConfigResponse {
+                    config: buffa::MessageField::some(entry_to_proto_config(entry)),
+                    ..Default::default()
+                },
+                ctx,
+            )),
+            None => Err(ConnectError::not_found(format!(
+                "no explicit config for collection '{collection}'"
+            ))),
+        }
+    }
+
+    async fn list_collection_configs(
+        &self,
+        ctx: Context,
+        _request: OwnedView<pb::ListCollectionConfigsRequestView<'static>>,
+    ) -> Result<(pb::ListCollectionConfigsResponse, Context), ConnectError> {
+        let configs = self
+            .node
+            .list_collection_configs()
+            .into_iter()
+            .map(entry_to_proto_config)
+            .collect();
+        Ok((
+            pb::ListCollectionConfigsResponse {
+                configs,
+                ..Default::default()
+            },
+            ctx,
+        ))
     }
 }
 
@@ -663,5 +756,38 @@ fn map_to_command(id: &str, json: &str) -> anyhow::Result<pb::Command> {
         expires_at: v["expires_at"].as_i64().unwrap_or_default(),
         payload_json: v["payload_json"].as_str().unwrap_or_default().to_string(),
         ..Default::default()
+    })
+}
+
+// --- Collection config proto ↔ node type conversions ---
+
+fn entry_to_proto_config(e: CollectionConfigEntry) -> pb::CollectionConfig {
+    let policy = match e.deletion_policy {
+        StoredDeletionPolicy::SoftDelete => pb::DeletionPolicy::DELETION_POLICY_SOFT_DELETE,
+        StoredDeletionPolicy::Tombstone => pb::DeletionPolicy::DELETION_POLICY_TOMBSTONE,
+        StoredDeletionPolicy::ImplicitTTL => pb::DeletionPolicy::DELETION_POLICY_IMPLICIT_TTL,
+        StoredDeletionPolicy::Immutable => pb::DeletionPolicy::DELETION_POLICY_IMMUTABLE,
+    };
+    pb::CollectionConfig {
+        collection: e.collection,
+        deletion_policy: policy.into(),
+        soft_delete_ttl_secs: e.soft_delete_ttl_secs,
+        tombstone_ttl_secs: e.tombstone_ttl_secs,
+        ..Default::default()
+    }
+}
+
+fn proto_config_to_entry(cfg: pb::CollectionConfig) -> anyhow::Result<CollectionConfigEntry> {
+    let policy = match cfg.deletion_policy.to_i32() {
+        2 => StoredDeletionPolicy::Tombstone,
+        3 => StoredDeletionPolicy::ImplicitTTL,
+        4 => StoredDeletionPolicy::Immutable,
+        _ => StoredDeletionPolicy::SoftDelete, // 0 = unspecified, 1 = explicit SoftDelete
+    };
+    Ok(CollectionConfigEntry {
+        collection: cfg.collection,
+        deletion_policy: policy,
+        soft_delete_ttl_secs: cfg.soft_delete_ttl_secs,
+        tombstone_ttl_secs: cfg.tombstone_ttl_secs,
     })
 }
