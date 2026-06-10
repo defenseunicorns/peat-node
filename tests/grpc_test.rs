@@ -359,3 +359,206 @@ async fn connect_protocol_structured_doc_with_value_field() {
     assert_eq!(v2["outer"]["value"], "nested");
     assert_eq!(v2["count"], 3);
 }
+
+#[tokio::test]
+async fn connect_protocol_collection_config_rpcs() {
+    // Blocker from peat-node#55 QA review: SetCollectionConfig, GetCollectionConfig,
+    // and ListCollectionConfigs must be exercised at the Connect HTTP+JSON layer
+    // to verify wire encoding of CollectionConfig (DeletionPolicy enum, optional TTL
+    // fields) end-to-end.
+    let (client, base) = boot_server(50086, None).await;
+
+    // GetCollectionConfig on a collection that has no config → empty response
+    let not_found = call(
+        &client,
+        &base,
+        "GetCollectionConfig",
+        serde_json::json!({"collection": "logs"}),
+    )
+    .await;
+    assert!(
+        not_found.get("config").is_none() || not_found["config"].is_null(),
+        "expected no config for unconfigured collection, got: {not_found}"
+    );
+
+    // SetCollectionConfig — tombstone policy with a TTL
+    call(
+        &client,
+        &base,
+        "SetCollectionConfig",
+        serde_json::json!({
+            "config": {
+                "collection": "logs",
+                "deletionPolicy": "DELETION_POLICY_TOMBSTONE",
+                "tombstoneTtlSecs": 86400
+            }
+        }),
+    )
+    .await;
+
+    // GetCollectionConfig — round-trip
+    let resp = call(
+        &client,
+        &base,
+        "GetCollectionConfig",
+        serde_json::json!({"collection": "logs"}),
+    )
+    .await;
+    let cfg = &resp["config"];
+    assert_eq!(cfg["collection"], "logs");
+    assert_eq!(cfg["deletionPolicy"], "DELETION_POLICY_TOMBSTONE");
+    // proto3 JSON encodes uint64 as a decimal string
+    assert_eq!(cfg["tombstoneTtlSecs"], "86400");
+
+    // Set a second collection
+    call(
+        &client,
+        &base,
+        "SetCollectionConfig",
+        serde_json::json!({
+            "config": {
+                "collection": "events",
+                "deletionPolicy": "DELETION_POLICY_IMPLICIT_TTL",
+                "softDeleteTtlSecs": 3600
+            }
+        }),
+    )
+    .await;
+
+    // ListCollectionConfigs — both configs present
+    let list_resp = call(
+        &client,
+        &base,
+        "ListCollectionConfigs",
+        serde_json::json!({}),
+    )
+    .await;
+    let configs = list_resp["configs"].as_array().expect("configs array");
+    assert_eq!(configs.len(), 2, "expected 2 configs, got {configs:?}");
+    let names: Vec<&str> = configs
+        .iter()
+        .map(|c| c["collection"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"logs"), "logs must be in list");
+    assert!(names.contains(&"events"), "events must be in list");
+
+    // Empty-name validation — must fail
+    let url = format!("{base}/peat.sidecar.v1.PeatSidecar/SetCollectionConfig");
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({"config": {"collection": "", "deletionPolicy": "DELETION_POLICY_SOFT_DELETE"}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "SetCollectionConfig with empty collection name must fail, got HTTP {}",
+        resp.status()
+    );
+}
+
+/// Read all Connect streaming frames from the response body.
+/// Connect stream frame: [flags:u8][length:u32_be][payload:length]
+/// flags=0x00 → message; flags=0x02 → end-of-stream trailer (stop reading).
+fn read_connect_stream(body: &[u8]) -> Vec<serde_json::Value> {
+    let mut messages = vec![];
+    let mut pos = 0usize;
+    while pos + 5 <= body.len() {
+        let flags = body[pos];
+        let len = u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]])
+            as usize;
+        pos += 5;
+        if pos + len > body.len() {
+            break;
+        }
+        let payload = &body[pos..pos + len];
+        pos += len;
+        if flags & 0x02 != 0 {
+            break;
+        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+            messages.push(v);
+        }
+    }
+    messages
+}
+
+#[tokio::test]
+async fn connect_protocol_subscribe_initial_snapshot() {
+    // Warning from peat-node#55 QA review: Subscribe snapshot interleaving with
+    // live events is verified at the trait surface in subscribe_query_test.rs but
+    // should also be exercised at the Connect HTTP+JSON wire layer.
+    let (client, base) = boot_server(50087, None).await;
+
+    // Write 2 documents before subscribing
+    for (id, payload) in [("snap-1", r#"{"k":1}"#), ("snap-2", r#"{"k":2}"#)] {
+        call(
+            &client,
+            &base,
+            "PutDocument",
+            serde_json::json!({"collection": "snap", "docId": id, "jsonData": payload}),
+        )
+        .await;
+    }
+
+    // Subscribe with a short timeout — we only need the snapshot, not live events.
+    // Server-streaming Connect RPCs require application/connect+json and a
+    // length-prefixed request frame: [flags:u8=0][len:u32_be][json_payload].
+    let url = format!("{base}/peat.sidecar.v1.PeatSidecar/Subscribe");
+    let payload = serde_json::to_vec(&serde_json::json!({"collections": ["snap"]})).unwrap();
+    let mut frame = vec![0u8]; // flags = 0 (message)
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    let mut resp = client
+        .post(&url)
+        .header("content-type", "application/connect+json")
+        .body(frame)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "Subscribe returned {}",
+        resp.status()
+    );
+
+    // Subscribe is long-lived — read chunks until we have ≥2 UPSERT events or timeout.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut buf: Vec<u8> = vec![];
+    let mut messages: Vec<serde_json::Value> = vec![];
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(500), resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                buf.extend_from_slice(&chunk);
+                let parsed = read_connect_stream(&buf);
+                messages = parsed;
+                if messages.len() >= 2 {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    assert!(
+        messages.len() >= 2,
+        "expected ≥2 snapshot events, got {}",
+        messages.len()
+    );
+    let doc_ids: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m["docId"].as_str())
+        .collect();
+    assert!(doc_ids.contains(&"snap-1"), "snap-1 must be in snapshot");
+    assert!(doc_ids.contains(&"snap-2"), "snap-2 must be in snapshot");
+    for m in &messages {
+        assert_eq!(
+            m["changeType"], "CHANGE_TYPE_UPSERT",
+            "snapshot events must be UPSERT"
+        );
+    }
+}
