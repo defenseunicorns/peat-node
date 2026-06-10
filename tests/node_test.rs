@@ -153,6 +153,75 @@ async fn subscribe_receives_changes() {
     assert_eq!(event.doc_id, "doc-1");
 }
 
+#[tokio::test]
+async fn subscribe_change_event_includes_json_data() {
+    // Regression for peat-node#7: after switching put_document to structured
+    // Automerge storage (no {"value":"<json>"} wrapper), forward_store_changes
+    // must use the same two-format fallback as get_document — otherwise
+    // json_data is None for all gRPC-written docs.
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let mut rx = node.subscribe();
+
+    node.put_document("test", "doc-1", r#"{"name":"alice"}"#)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv error");
+
+    let json_data = event
+        .json_data
+        .expect("json_data must be present for gRPC writes");
+    let v: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+    assert_eq!(v["name"], "alice");
+}
+
+#[tokio::test]
+async fn structured_doc_with_value_field_not_corrupted() {
+    // Regression for peat-node#7 (blocker): a user document that happens to
+    // have a top-level "value":"<string>" field must survive a put/get round-
+    // trip intact. Before the is_encrypted() gate, get_document extracted only
+    // the inner string and dropped all other fields.
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+
+    node.put_document("test", "d", r#"{"value":"hello","name":"alice"}"#)
+        .await
+        .unwrap();
+
+    let result = node.get_document("test", "d").await.unwrap().unwrap();
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(v["value"], "hello", "value field must be preserved");
+    assert_eq!(v["name"], "alice", "name field must not be dropped");
+}
+
+#[tokio::test]
+async fn subscribe_change_event_value_field_not_corrupted() {
+    // Regression for peat-node#7 (blocker): the same is_encrypted() gate must
+    // hold in forward_store_changes — a doc with "value":"..." must arrive with
+    // all fields intact in the change event's json_data.
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let mut rx = node.subscribe();
+
+    node.put_document("test", "d", r#"{"value":"hello","name":"alice"}"#)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv error");
+
+    let json_data = event.json_data.expect("json_data must be present");
+    let v: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+    assert_eq!(v["value"], "hello", "value field must be preserved");
+    assert_eq!(v["name"], "alice", "name field must not be dropped");
+}
+
 // --- Encryption at rest tests ---
 
 fn test_encryption_key() -> String {
