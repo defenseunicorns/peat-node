@@ -26,6 +26,9 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
             encryption_key,
             iroh_udp_port: None,
             attachment_config: Default::default(),
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),

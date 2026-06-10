@@ -15,8 +15,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::fanout::FanoutKind;
-use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::qos::GcConfig;
+use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;

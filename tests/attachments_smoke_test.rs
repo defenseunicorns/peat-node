@@ -67,6 +67,9 @@ async fn boot_server_with_attachments(port: u16) -> BootedServer {
             encryption_key: None,
             iroh_udp_port: None,
             attachment_config,
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),
@@ -102,6 +105,9 @@ async fn boot_server_without_attachments(port: u16) -> String {
             encryption_key: None,
             iroh_udp_port: None,
             attachment_config: Default::default(),
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),
