@@ -15,9 +15,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::fanout::FanoutKind;
-use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
+use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
@@ -167,27 +166,6 @@ impl SidecarNode {
             })
             .transpose()?;
 
-        // Build TtlConfig from operator config, defaulting to TtlConfig::new()
-        // (168 h tombstone TTL — the DDIL-safe floor). The warning for short
-        // TTLs fires inside AutomergeBackend::with_iroh. peat-node#136.
-        let ttl_config = {
-            let mut cfg = TtlConfig::new();
-            if let Some(hours) = config.tombstone_ttl_hours {
-                cfg.tombstone_ttl_hours = hours;
-            }
-            Some(cfg)
-        };
-        let gc_config = {
-            let mut cfg = GcConfig::default();
-            if let Some(secs) = config.gc_interval_secs {
-                cfg.gc_interval = std::time::Duration::from_secs(secs);
-            }
-            if let Some(batch) = config.gc_batch_size {
-                cfg.tombstone_batch_size = batch;
-            }
-            Some(cfg)
-        };
-
         let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
             data_dir: config.data_dir.clone(),
             formation_id: config.app_id.clone(),
@@ -203,8 +181,11 @@ impl SidecarNode {
             // the higher-layer encryption; would let us remove the
             // higher-layer path if/when we want).
             cipher: None,
-            ttl_config,
-            gc_config,
+            // tombstone_ttl_hours / gc_interval_secs / gc_batch_size are
+            // accepted here and stored in SidecarConfig, but the wiring into
+            // AutomergeBackendConfig::ttl_config / gc_config requires
+            // peat-mesh#251 to be merged and published as a new rc pin.
+            // Wire-up lands in the follow-up commit on this branch.
         })
         .await?;
 

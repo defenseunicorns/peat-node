@@ -3525,6 +3525,8 @@ dependencies = [
 [[package]]
 name = "peat-mesh"
 version = "0.9.0-rc.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20fc749745a401dc7e2e3b9ed55f0e4e8f934f23f82875162acc4314ced38e69"
 dependencies = [
  "aes-gcm",
  "anyhow",
