@@ -15,8 +15,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::fanout::FanoutKind;
+use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
-use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport};
+use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::IrohFileDistribution;
 use tokio::sync::broadcast;
@@ -47,6 +48,14 @@ pub struct SidecarConfig {
     /// unreachable preferred peer otherwise costs the full stall on the
     /// first fetch before the peer-health index demotes it (peat-mesh#137).
     pub blob_stall_timeout: Option<Duration>,
+    /// Tombstone retention window in hours. `None` → 168 h (7-day default).
+    /// Values below 24 h emit a startup warning (ADR-016: tombstone TTL must
+    /// be ≥ the longest expected peer offline/partition window). peat-node#136.
+    pub tombstone_ttl_hours: Option<u32>,
+    /// GC sweep interval in seconds. `None` → 300 s (5-min default). peat-node#136.
+    pub gc_interval_secs: Option<u64>,
+    /// Max tombstones per GC sweep. `None` → 1000. peat-node#136.
+    pub gc_batch_size: Option<usize>,
     /// Attachment distribution (PRD-006). Empty roots → service handlers
     /// return `Unimplemented`. The `IrohFileDistribution` substrate is only
     /// constructed when at least one root is configured.
@@ -158,23 +167,40 @@ impl SidecarNode {
             })
             .transpose()?;
 
-        let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
-            data_dir: config.data_dir.clone(),
-            formation_id: config.app_id.clone(),
-            base64_shared_key: config.shared_key.clone(),
-            iroh_bind_addr,
-            download_stall_timeout: config.blob_stall_timeout,
-            // peat-mesh rc.12 introduced an optional at-rest cipher hook on
-            // AutomergeBackendConfig. peat-node already encrypts at a higher
-            // layer via `StoreCipher` (see `forward_store_changes` below),
-            // so leave the peat-mesh-level cipher as None for now. Plumbing
-            // peat-node's StoreCipher into this field is the follow-up the
-            // peat-mesh rc.12 changelog called out (currently redundant with
-            // the higher-layer encryption; would let us remove the
-            // higher-layer path if/when we want).
-            cipher: None,
-        })
-        .await?;
+        let ttl_config = config.tombstone_ttl_hours.map(|hours| TtlConfig {
+            tombstone_ttl_hours: hours,
+            ..TtlConfig::default()
+        });
+
+        let gc_config = if config.gc_interval_secs.is_some() || config.gc_batch_size.is_some() {
+            Some(GcConfig {
+                gc_interval: config
+                    .gc_interval_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| GcConfig::default().gc_interval),
+                tombstone_batch_size: config
+                    .gc_batch_size
+                    .unwrap_or_else(|| GcConfig::default().tombstone_batch_size),
+                ..GcConfig::default()
+            })
+        } else {
+            None
+        };
+
+        let mut backend_cfg = AutomergeBackendConfig::default();
+        backend_cfg.data_dir = config.data_dir.clone();
+        backend_cfg.formation_id = config.app_id.clone();
+        backend_cfg.base64_shared_key = config.shared_key.clone();
+        backend_cfg.iroh_bind_addr = iroh_bind_addr;
+        backend_cfg.download_stall_timeout = config.blob_stall_timeout;
+        // peat-node already encrypts at a higher layer via `StoreCipher`
+        // (see `forward_store_changes` below), so leave the peat-mesh-level
+        // cipher as None for now.
+        backend_cfg.cipher = None;
+        backend_cfg.ttl_config = ttl_config;
+        backend_cfg.gc_config = gc_config;
+
+        let backend = AutomergeBackend::with_iroh(backend_cfg).await?;
 
         info!(
             node_id = %config.node_id,

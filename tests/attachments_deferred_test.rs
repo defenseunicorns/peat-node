@@ -80,6 +80,9 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
             encryption_key: None,
             iroh_udp_port: Some(iroh_port),
             attachment_config,
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),
@@ -521,6 +524,9 @@ async fn unknown_node_id_marked_failed_after_grace() {
             encryption_key: None,
             iroh_udp_port: None,
             attachment_config,
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),

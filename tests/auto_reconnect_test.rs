@@ -60,6 +60,9 @@ async fn boot(node_id: &str) -> BootedNode {
             encryption_key: None,
             iroh_udp_port: Some(0),
             attachment_config: Default::default(),
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
         })
         .await
         .unwrap(),

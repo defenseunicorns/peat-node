@@ -66,17 +66,17 @@ impl TestPeer {
         let formation_key_b64 = test_formation_key();
         let app_id = TEST_APP_ID.to_string();
 
-        let backend = AutomergeBackend::with_iroh(AutomergeBackendConfig {
-            download_stall_timeout: None,
-            data_dir: dir.path().to_path_buf(),
-            formation_id: app_id.clone(),
-            base64_shared_key: formation_key_b64.clone(),
-            // None → kernel-assigned ephemeral port on a loopback Iroh socket.
-            iroh_bind_addr: None,
-            cipher: None,
-        })
-        .await
-        .expect("AutomergeBackend bootstrap");
+        let mut backend_cfg = AutomergeBackendConfig::default();
+        backend_cfg.data_dir = dir.path().to_path_buf();
+        backend_cfg.formation_id = app_id.clone();
+        backend_cfg.base64_shared_key = formation_key_b64.clone();
+        // None → kernel-assigned ephemeral port on a loopback Iroh socket.
+        backend_cfg.iroh_bind_addr = None;
+        backend_cfg.cipher = None;
+        backend_cfg.download_stall_timeout = None;
+        let backend = AutomergeBackend::with_iroh(backend_cfg)
+            .await
+            .expect("AutomergeBackend bootstrap");
 
         let endpoint_id = backend.blob_store().endpoint_id();
         let udp_port = backend
