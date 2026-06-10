@@ -556,15 +556,22 @@ impl SidecarNode {
                 Ok(key) => {
                     // Keys are "collection:doc_id"
                     if let Some((collection, doc_id)) = key.split_once(':') {
-                        // Try to read the current value to include in the change event
+                        // Read the current doc and extract a JSON string for the event.
+                        // Two storage formats co-exist (peat-node#7):
+                        //   - encrypted: {"value":"<ENC:v1:...>"} — extract & decrypt
+                        //   - structured: direct Automerge map — serialize as JSON
                         let raw = match store.get(&key) {
-                            Ok(Some(doc)) => automerge_to_json(&doc)
-                                .get("value")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string()),
+                            Ok(Some(doc)) => {
+                                let j = automerge_to_json(&doc);
+                                if let Some(s) = j.get("value").and_then(|v| v.as_str()) {
+                                    Some(s.to_string())
+                                } else {
+                                    serde_json::to_string(&j).ok()
+                                }
+                            }
                             _ => None,
                         };
-                        // Decrypt if encrypted
+                        // Decrypt if the raw value carries an ENC prefix.
                         let json_data = match raw {
                             Some(v) if crate::crypto::is_encrypted(&v) => match &cipher {
                                 Some(c) => match c.decrypt(&v) {
@@ -896,8 +903,9 @@ impl SidecarNode {
     }
 
     // --- Document Operations ---
-    // Documents are stored as Automerge documents with a single "value" key
-    // containing the JSON string.
+    // Unencrypted documents are stored as structured Automerge maps (field-level
+    // CRDT — peat-node#7). Encrypted documents use a {"value":"<ciphertext>"}
+    // wrapper because the ciphertext is an opaque string, not a JSON map.
 
     pub async fn put_document(
         &self,
@@ -905,23 +913,27 @@ impl SidecarNode {
         doc_id: &str,
         json_data: &str,
     ) -> anyhow::Result<()> {
-        // Validate JSON
-        let _: serde_json::Value =
+        let parsed: serde_json::Value =
             serde_json::from_str(json_data).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
 
         let key = format!("{collection}:{doc_id}");
-
-        // Optionally encrypt the payload before storing
-        let store_value = match &self.cipher {
-            Some(c) => c.encrypt(json_data)?,
-            None => json_data.to_string(),
-        };
-
-        // Create or update an Automerge document with the (possibly encrypted) value
-        let json_value = serde_json::json!({ "value": store_value });
         let store = self.backend.store();
         let existing = store.get(&key)?;
-        let doc = json_to_automerge(&json_value, existing.as_ref())?;
+
+        let doc = match &self.cipher {
+            Some(c) => {
+                // Ciphertext is opaque — wrap in {"value":"<ciphertext>"} so
+                // json_to_automerge has a map root to work with.
+                let ciphertext = c.encrypt(json_data)?;
+                let wrapped = serde_json::json!({ "value": ciphertext });
+                json_to_automerge(&wrapped, existing.as_ref())?
+            }
+            None => {
+                // Write user JSON directly as structured Automerge fields for
+                // field-level CRDT merging (peat-node#7).
+                json_to_automerge(&parsed, existing.as_ref())?
+            }
+        };
 
         store.put(&key, &doc)?;
 
@@ -945,22 +957,13 @@ impl SidecarNode {
         match self.backend.store().get(&key)? {
             Some(doc) => {
                 let json = automerge_to_json(&doc);
-                // Two doc shapes co-exist in the same store:
+                // Two doc shapes co-exist in the same store (peat-node#7):
                 //
-                //   - PutDocument (gRPC) writes `{"value": "<json-string>"}`
-                //     — the user's original JSON payload encoded as a string
-                //     in a single Automerge field. Optionally encrypted at
-                //     rest when a cipher is configured (peat-mesh#124).
-                //   - peat-cli (`create --set`/`update --set`) writes the
-                //     user's data directly as structural Automerge fields
-                //     (e.g. `{"name": "alice"}`). No string-encoding, no
-                //     encryption — the doc IS the user's data.
-                //
-                // Return the inner string for value-wrapped docs (the
-                // existing contract); fall back to serializing the doc as
-                // JSON for CLI-written docs so GetDocument is a single
-                // entry point regardless of which writer produced the
-                // record.
+                //   - Encrypted: {"value":"<ENC:v1:...>"} — extract the
+                //     inner string and decrypt.
+                //   - Structured (unencrypted gRPC writes and all peat-cli
+                //     writes): direct Automerge map fields. Serialize to
+                //     JSON and return as-is.
                 if let Some(s) = json.get("value").and_then(|v| v.as_str()) {
                     Ok(self.maybe_decrypt(Some(s.to_string()))?)
                 } else {

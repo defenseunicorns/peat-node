@@ -153,6 +153,30 @@ async fn subscribe_receives_changes() {
     assert_eq!(event.doc_id, "doc-1");
 }
 
+#[tokio::test]
+async fn subscribe_change_event_includes_json_data() {
+    // Regression for peat-node#7: after switching put_document to structured
+    // Automerge storage (no {"value":"<json>"} wrapper), forward_store_changes
+    // must use the same two-format fallback as get_document — otherwise
+    // json_data is None for all gRPC-written docs.
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let mut rx = node.subscribe();
+
+    node.put_document("test", "doc-1", r#"{"name":"alice"}"#)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv error");
+
+    let json_data = event.json_data.expect("json_data must be present for gRPC writes");
+    let v: serde_json::Value = serde_json::from_str(&json_data).unwrap();
+    assert_eq!(v["name"], "alice");
+}
+
 // --- Encryption at rest tests ---
 
 fn test_encryption_key() -> String {
