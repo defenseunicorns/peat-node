@@ -36,7 +36,7 @@ async fn sidecar_binds_unix_socket_path_and_accepts_connection() {
             encryption_key: None,
             iroh_udp_port: None,
             attachment_config: Default::default(),
-        disable_mdns: true,
+            disable_mdns: true,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,

@@ -586,8 +586,7 @@ impl SidecarNode {
         formation_id: String,
     ) {
         let our_id = backend.transport().endpoint().id().to_string();
-        let mut auth_failed: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut auth_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(event) = rx.recv().await {
             let peer = match event {
                 DiscoveryEvent::PeerFound(p) | DiscoveryEvent::PeerUpdated(p) => p,
