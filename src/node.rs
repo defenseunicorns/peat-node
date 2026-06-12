@@ -503,6 +503,7 @@ impl SidecarNode {
                 Ok(mut m) => {
                     if let Err(e) = m.start().await {
                         warn!("mDNS start failed: {e}");
+                        None
                     } else {
                         let ep = backend.transport().endpoint();
                         let eid = ep.id().to_string();
@@ -525,15 +526,15 @@ impl SidecarNode {
                                 Err(e) => warn!("mDNS advertise failed: {e}"),
                             }
                         }
+                        if let Ok(rx) = m.event_stream() {
+                            let backend_arc = Arc::clone(&backend);
+                            let formation_id = config.app_id.clone();
+                            tokio::spawn(async move {
+                                Self::mdns_watcher(backend_arc, rx, formation_id).await;
+                            });
+                        }
+                        Some(m)
                     }
-                    if let Ok(rx) = m.event_stream() {
-                        let backend_arc = Arc::clone(&backend);
-                        let formation_id = config.app_id.clone();
-                        tokio::spawn(async move {
-                            Self::mdns_watcher(backend_arc, rx, formation_id).await;
-                        });
-                    }
-                    Some(m)
                 }
             }
         };
