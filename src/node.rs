@@ -15,6 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::fanout::FanoutKind;
+use peat_mesh::discovery::{DiscoveryEvent, DiscoveryStrategy, MdnsDiscovery, PeerInfo};
 use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
@@ -60,6 +61,12 @@ pub struct SidecarConfig {
     /// return `Unimplemented`. The `IrohFileDistribution` substrate is only
     /// constructed when at least one root is configured.
     pub attachment_config: AttachmentConfig,
+    /// Disable mDNS peer discovery. mDNS is on by default so that same-host
+    /// nodes (e.g. `docker compose` or bare-metal dev) find each other
+    /// automatically. Set to `true` in environments where multicast is
+    /// unavailable or undesired (Kubernetes, air-gapped networks). Mirrors
+    /// `PeatCredentials::disable_mdns` in `peat-cli`.
+    pub disable_mdns: bool,
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -101,6 +108,9 @@ pub struct SidecarNode {
     /// persisted to `data_dir/collection_configs.json` on each write.
     collection_configs: Arc<RwLock<HashMap<String, CollectionConfigEntry>>>,
     collection_configs_path: std::path::PathBuf,
+    /// Kept alive so mDNS advertisement and browsing continue for the
+    /// node lifetime. `None` when mDNS is disabled or failed to init.
+    _mdns: Option<MdnsDiscovery>,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -478,6 +488,57 @@ impl SidecarNode {
             });
         }
 
+        // ── mDNS peer discovery ──────────────────────────────────────────────
+        // On by default; `disable_mdns: true` (or `--disable-mdns`) opts out.
+        // In environments without multicast (Kubernetes, most containers) init
+        // fails with a warn and the node continues without local discovery.
+        let mdns = if config.disable_mdns {
+            None
+        } else {
+            match MdnsDiscovery::new() {
+                Err(e) => {
+                    warn!("mDNS init failed (no local discovery): {e}");
+                    None
+                }
+                Ok(mut m) => {
+                    if let Err(e) = m.start().await {
+                        warn!("mDNS start failed: {e}");
+                        None
+                    } else {
+                        let ep = backend.transport().endpoint();
+                        let eid = ep.id().to_string();
+                        let port = ep
+                            .bound_sockets()
+                            .into_iter()
+                            .find(|s| s.is_ipv4())
+                            .map(|s| s.port())
+                            .unwrap_or(0);
+                        if port > 0 {
+                            let loopback = std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                port,
+                            );
+                            let mut meta = std::collections::HashMap::new();
+                            meta.insert("port".to_string(), port.to_string());
+                            meta.insert("formation_id".to_string(), config.app_id.clone());
+                            match m.advertise_with_addr(&eid, loopback, Some(meta)) {
+                                Ok(()) => info!("mDNS: advertising on 127.0.0.1:{port}"),
+                                Err(e) => warn!("mDNS advertise failed: {e}"),
+                            }
+                        }
+                        if let Ok(rx) = m.event_stream() {
+                            let backend_arc = Arc::clone(&backend);
+                            let formation_id = config.app_id.clone();
+                            tokio::spawn(async move {
+                                Self::mdns_watcher(backend_arc, rx, formation_id).await;
+                            });
+                        }
+                        Some(m)
+                    }
+                }
+            }
+        };
+
         // Load per-collection lifecycle configs (peat-node#55).
         let collection_configs_path = config.data_dir.join("collection_configs.json");
         let collection_configs: HashMap<String, CollectionConfigEntry> =
@@ -513,7 +574,100 @@ impl SidecarNode {
             registered_peers,
             collection_configs: Arc::new(RwLock::new(collection_configs)),
             collection_configs_path,
+            _mdns: mdns,
         })
+    }
+
+    /// Background task: connect to mDNS peers as they announce.
+    /// Mirrors `MeshSession::mdns_watcher` in `peat-cli/src/join.rs`.
+    async fn mdns_watcher(
+        backend: Arc<AutomergeBackend>,
+        mut rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+        formation_id: String,
+    ) {
+        let our_id = backend.transport().endpoint().id().to_string();
+        let mut auth_failed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(event) = rx.recv().await {
+            let peer = match event {
+                DiscoveryEvent::PeerFound(p) | DiscoveryEvent::PeerUpdated(p) => p,
+                DiscoveryEvent::PeerLost(_) => continue,
+            };
+            if peer.node_id == our_id || auth_failed.contains(&peer.node_id) {
+                continue;
+            }
+            if let Some(fid) = peer.metadata.get("formation_id") {
+                if fid != &formation_id {
+                    continue;
+                }
+            }
+            let already = backend
+                .transport()
+                .connected_peers()
+                .iter()
+                .any(|id| id.to_string() == peer.node_id);
+            if already {
+                continue;
+            }
+            for addr in Self::mdns_peer_addresses(&peer) {
+                let registration = PeerRegistration {
+                    addresses: vec![addr.to_string()],
+                    relay_url: String::new(),
+                    next_attempt: std::time::Instant::now(),
+                    backoff: RECONNECT_BACKOFF_MIN,
+                };
+                let peer_id_str = &peer.node_id;
+                let Ok(peer_id) = peer_id_str.parse::<iroh::EndpointId>() else {
+                    continue;
+                };
+                match Self::dial_and_attach(&backend, peer_id, &registration).await {
+                    Ok(()) => {
+                        info!(peer = %peer.node_id, %addr, "mDNS: connected to peer");
+                        let pid = backend
+                            .transport()
+                            .connected_peers()
+                            .into_iter()
+                            .find(|id| id.to_string() == peer.node_id);
+                        if let Some(pid) = pid {
+                            let _ = backend
+                                .coordinator()
+                                .sync_all_documents_with_peer(pid)
+                                .await;
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("formation")
+                            || msg.contains("mismatch")
+                            || msg.contains("auth")
+                        {
+                            auth_failed.insert(peer.node_id.clone());
+                        }
+                        warn!(peer = %peer.node_id, %addr, "mDNS: connect failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn mdns_peer_addresses(peer: &PeerInfo) -> Vec<std::net::SocketAddr> {
+        if !peer.addresses.is_empty() {
+            return peer.addresses.clone();
+        }
+        if let Some(port_str) = peer.metadata.get("port") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                warn!(
+                    peer = %peer.node_id,
+                    "mDNS: addresses empty, using metadata port fallback 127.0.0.1:{port}"
+                );
+                return vec![std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    port,
+                )];
+            }
+        }
+        debug!(peer = %peer.node_id, "mDNS: no usable address for peer");
+        vec![]
     }
 
     /// PRD-006 per-bundle runtime store (progress channels + per-

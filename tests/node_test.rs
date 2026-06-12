@@ -20,6 +20,7 @@ async fn test_node_with_encryption(
         encryption_key,
         iroh_udp_port: None,
         attachment_config: Default::default(),
+        disable_mdns: true,
         tombstone_ttl_hours: None,
         gc_interval_secs: None,
         gc_batch_size: None,
