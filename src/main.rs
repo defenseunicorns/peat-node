@@ -60,6 +60,14 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_PEERS", value_delimiter = ',')]
     peer: Vec<String>,
 
+    /// Disable mDNS peer discovery. mDNS is on by default so same-host nodes
+    /// find each other automatically. Set this flag (or
+    /// `PEAT_NODE_DISABLE_MDNS=true`) in environments where multicast is
+    /// unavailable or undesired (Kubernetes, most containers). Mirrors
+    /// `disable_mdns` in `peat-cli` credentials.
+    #[arg(long, env = "PEAT_NODE_DISABLE_MDNS", default_value = "false")]
+    disable_mdns: bool,
+
     /// Auto-start sync on boot.
     #[arg(long, env = "PEAT_NODE_AUTO_SYNC", default_value = "true")]
     auto_sync: bool,
@@ -323,6 +331,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
+        disable_mdns: args.disable_mdns,
         blob_stall_timeout: args.blob_stall_timeout_secs.map(Duration::from_secs),
         tombstone_ttl_hours: args.tombstone_ttl_hours,
         gc_interval_secs: args.gc_interval_secs,

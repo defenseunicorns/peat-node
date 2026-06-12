@@ -77,6 +77,7 @@ async fn boot(grpc_port: u16, iroh_port: u16) -> BootedNode {
             encryption_key: None,
             iroh_udp_port: Some(iroh_port),
             attachment_config,
+        disable_mdns: true,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
