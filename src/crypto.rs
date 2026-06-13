@@ -14,6 +14,8 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
 use anyhow::{bail, Context};
 use base64::Engine;
+use hkdf::Hkdf;
+use sha2::Sha256;
 
 const PREFIX: &str = "ENC:v1:";
 
@@ -89,6 +91,28 @@ pub fn is_encrypted(value: &str) -> bool {
     value.starts_with(PREFIX)
 }
 
+/// Derive a 32-byte iroh `SecretKey` seed from `(formation_secret, pod_name)`.
+///
+/// Uses `HKDF-SHA256(ikm=formation_secret, info="iroh:" + pod_name)` — the
+/// same derivation as `peat_mesh::peer_connector::PeerConnector::derive_peer_endpoint_id`.
+/// All nodes in the same formation that know the formation secret can compute
+/// any peer's iroh `EndpointId` from its pod name alone:
+///
+/// ```ignore
+/// let seed = derive_iroh_node_key(formation_secret, pod_name);
+/// let endpoint_id = iroh::SecretKey::from_bytes(&seed).public();
+/// ```
+///
+/// This is FIPS-approved: HKDF-SHA256 per ADR-049. The output bytes are passed
+/// to `AutomergeBackendConfig::iroh_secret_key` at node startup.
+pub fn derive_iroh_node_key(formation_secret: &[u8], pod_name: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, formation_secret);
+    let mut okm = [0u8; 32];
+    hk.expand(format!("iroh:{pod_name}").as_bytes(), &mut okm)
+        .expect("HKDF-SHA256 32-byte expand never fails");
+    okm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +162,30 @@ mod tests {
     fn is_encrypted_check() {
         assert!(is_encrypted("ENC:v1:AAAA"));
         assert!(!is_encrypted(r#"{"hello":"world"}"#));
+    }
+
+    #[test]
+    fn derive_iroh_node_key_is_deterministic() {
+        let secret = b"test-formation-secret-32-bytes!!";
+        let k1 = derive_iroh_node_key(secret, "peat-node-0");
+        let k2 = derive_iroh_node_key(secret, "peat-node-0");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn derive_iroh_node_key_differs_per_pod() {
+        let secret = b"test-formation-secret-32-bytes!!";
+        let k0 = derive_iroh_node_key(secret, "peat-node-0");
+        let k1 = derive_iroh_node_key(secret, "peat-node-1");
+        assert_ne!(k0, k1);
+    }
+
+    #[test]
+    fn derive_iroh_node_key_differs_per_formation() {
+        let s1 = b"formation-secret-A-32-bytes-long";
+        let s2 = b"formation-secret-B-32-bytes-long";
+        let k1 = derive_iroh_node_key(s1, "peat-node-0");
+        let k2 = derive_iroh_node_key(s2, "peat-node-0");
+        assert_ne!(k1, k2);
     }
 }

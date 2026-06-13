@@ -61,6 +61,7 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),

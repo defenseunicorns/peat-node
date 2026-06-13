@@ -36,6 +36,7 @@ async fn boot_server(grpc_port: u16, iroh_udp_port: u16) -> (reqwest::Client, St
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
