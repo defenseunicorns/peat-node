@@ -90,9 +90,12 @@ Usage in a parent chart:
     - name: RUST_LOG
       value: "peat_node=debug,peat_mesh=debug"
     {{- end }}
-    {{- /* PRD-006 attachment distribution. Roots map renders as
-           `name=path,name2=path2,...` for PEAT_NODE_ATTACHMENT_ROOT.
-           Empty roots → env var omitted → RPCs return Unimplemented. */}}
+    {{- /* PRD-006 attachment distribution.
+           Sender-side vars (roots, caps, priority) are only emitted when
+           roots are configured. Receiver-side vars (inbox) are emitted
+           independently — a receive-only node needs no roots. Shared vars
+           (handle retention, bundle cap) are emitted when either side is
+           active. */}}
     {{- if .Values.attachment.roots }}
     - name: PEAT_NODE_ATTACHMENT_ROOT
       value: "{{- $first := true -}}
@@ -120,10 +123,26 @@ Usage in a parent chart:
       value: {{ .Values.attachment.defaultPriority | quote }}
     - name: PEAT_NODE_ATTACHMENT_DISCOVERY_GRACE_SECS
       value: {{ .Values.attachment.discoveryGraceSecs | int64 | quote }}
+    {{- end }}
+    {{- /* Shared retention knobs — active whenever send or receive is on. */}}
+    {{- if or .Values.attachment.roots .Values.attachment.inbox }}
     - name: PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS
       value: {{ .Values.attachment.handleRetentionSecs | int64 | quote }}
     - name: PEAT_NODE_ATTACHMENT_MAX_KNOWN_BUNDLES
       value: {{ .Values.attachment.maxKnownBundles | int64 | quote }}
+    {{- end }}
+    {{- /* Receiver-side inbox (PRD-006 v1.1). */}}
+    {{- if .Values.attachment.inbox }}
+    - name: PEAT_NODE_ATTACHMENT_INBOX
+      value: {{ .Values.attachment.inbox | quote }}
+    - name: PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS
+      value: {{ .Values.attachment.inboxPollSecs | int64 | quote }}
+    {{- end }}
+    {{- /* mDNS — default true (disabled) for k8s; set disableMdns: false
+           for bare-metal chart deployments that want local discovery. */}}
+    {{- if .Values.disableMdns }}
+    - name: PEAT_NODE_DISABLE_MDNS
+      value: "true"
     {{- end }}
   ports:
     {{- if hasPrefix "tcp://" .Values.listen }}

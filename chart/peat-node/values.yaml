@@ -157,6 +157,25 @@ attachment:
   # retention window expires when exceeded.
   maxKnownBundles: 4096
 
+  # Receive-side inbox path (PRD-006 v1.1). When set, peat-node spawns a
+  # background watcher that polls the synced `file_distributions` collection,
+  # fetches blobs targeting this node's iroh endpoint, and writes them to
+  # `{inbox}/{distribution_id}/{filename}`. Unset (default) disables
+  # receive-side delivery. The directory is created if missing.
+  # Requires a matching volume mount via `extraVolumeMounts`.
+  inbox: ""
+
+  # Inbox watcher poll interval in seconds. Smaller = faster delivery,
+  # more `file_distributions` scans. Default 1s.
+  inboxPollSecs: 1
+
+# -- Disable mDNS peer discovery.
+# mDNS is on by default in the binary, but multicast is unavailable in
+# Kubernetes / containers, so the chart defaults to true. Set false only
+# for bare-metal deployments that use the chart and want automatic
+# same-host peer discovery.
+disableMdns: true
+
 # -- Verbose logging
 verbose: false
 
