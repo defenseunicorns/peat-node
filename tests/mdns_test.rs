@@ -41,6 +41,7 @@ async fn boot_mdns_node(
             gc_interval_secs: None,
             gc_batch_size: None,
             attachment_config: Default::default(),
+            ..Default::default()
         })
         .await
         .unwrap(),

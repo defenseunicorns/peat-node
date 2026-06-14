@@ -81,6 +81,7 @@ async fn boot(grpc_port: u16, iroh_port: u16) -> BootedNode {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),

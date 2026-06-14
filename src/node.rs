@@ -14,8 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
-use peat_mesh::discovery::{DiscoveryEvent, DiscoveryStrategy, MdnsDiscovery, PeerInfo};
+use base64::Engine as _;
+use peat_mesh::discovery::{
+    DiscoveryEvent, DiscoveryStrategy, KubernetesDiscovery, KubernetesDiscoveryConfig,
+    MdnsDiscovery, PeerInfo,
+};
 use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
@@ -67,6 +72,48 @@ pub struct SidecarConfig {
     /// unavailable or undesired (Kubernetes, air-gapped networks). Mirrors
     /// `PeatCredentials::disable_mdns` in `peat-cli`.
     pub disable_mdns: bool,
+    // --- Kubernetes peer discovery (peat-node#63) ---
+    /// Enable EndpointSlice-based peer discovery for in-cluster deployments.
+    /// When `true`, a `KubernetesDiscovery` watcher is started. Requires
+    /// `POD_NAME` env var (Kubernetes downward API) and a non-empty `shared_key`
+    /// for deterministic iroh keypair derivation; if either is absent, K8s
+    /// discovery is skipped with a warn log.
+    pub enable_kubernetes_discovery: bool,
+    /// Kubernetes namespace to watch. `None` → reads from the service-account
+    /// mount (`/var/run/secrets/kubernetes.io/serviceaccount/namespace`), falls
+    /// back to `"default"`.
+    pub kubernetes_discovery_namespace: Option<String>,
+    /// Label selector for EndpointSlice resources. Defaults to `"app=peat-node"`.
+    pub kubernetes_discovery_label_selector: String,
+    /// Annotation prefix for extracting peer metadata. Defaults to `"peat."`.
+    pub kubernetes_discovery_annotation_prefix: String,
+    /// EndpointSlice re-list interval in seconds. Defaults to 30.
+    pub kubernetes_discovery_interval_secs: u64,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            app_id: String::new(),
+            shared_key: String::new(),
+            data_dir: PathBuf::new(),
+            peers: Vec::new(),
+            encryption_key: None,
+            iroh_udp_port: None,
+            blob_stall_timeout: None,
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
+            attachment_config: AttachmentConfig::default(),
+            disable_mdns: false,
+            enable_kubernetes_discovery: false,
+            kubernetes_discovery_namespace: None,
+            kubernetes_discovery_label_selector: "app=peat-node".to_string(),
+            kubernetes_discovery_annotation_prefix: "peat.".to_string(),
+            kubernetes_discovery_interval_secs: 30,
+        }
+    }
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -111,6 +158,10 @@ pub struct SidecarNode {
     /// Kept alive so mDNS advertisement and browsing continue for the
     /// node lifetime. `None` when mDNS is disabled or failed to init.
     _mdns: Option<MdnsDiscovery>,
+    /// Kept alive so K8s EndpointSlice watching continues for the node
+    /// lifetime. `None` when `--enable-kubernetes-discovery` is false or
+    /// discovery failed to start.
+    _k8s_discovery: Option<KubernetesDiscovery>,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -239,6 +290,44 @@ impl SidecarNode {
         backend_cfg.cipher = None;
         backend_cfg.ttl_config = ttl_config;
         backend_cfg.gc_config = gc_config;
+
+        // peat-node#63 — deterministic iroh keypair for K8s peer discovery.
+        // All pods in the same formation derive their iroh SecretKey from
+        // HKDF-SHA256(ikm=shared_key, info="iroh:"+pod_name) so any peer can
+        // compute any other pod's EndpointId from its pod name alone.
+        // Requires POD_NAME env var (Kubernetes downward API) and a non-empty
+        // shared_key. Absent either, we skip derivation and let iroh generate
+        // a random key — K8s discovery will still start but won't be able to
+        // dial discovered pods (connect_peer will fail to parse the pod name
+        // as an iroh EndpointId and skip them), so a warn is logged.
+        let pod_name: Option<String> = std::env::var("POD_NAME").ok().filter(|s| !s.is_empty());
+        if config.enable_kubernetes_discovery {
+            match (pod_name.as_deref(), config.shared_key.as_str()) {
+                (Some(pn), sk) if !sk.is_empty() => {
+                    let sk_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(sk)
+                        .map_err(|e| anyhow::anyhow!("shared_key base64 decode failed: {e}"))?;
+                    let iroh_key = derive_iroh_node_key(&sk_bytes, pn);
+                    backend_cfg.iroh_secret_key = Some(iroh_key);
+                    info!(
+                        pod_name = pn,
+                        "K8s discovery: deterministic iroh keypair derived"
+                    );
+                }
+                (None, _) => {
+                    warn!(
+                        "K8s discovery enabled but POD_NAME env var is not set — \
+                         iroh keypair will be random; peer discovery will not work"
+                    );
+                }
+                _ => {
+                    warn!(
+                        "K8s discovery enabled but shared_key is empty — \
+                         iroh keypair will be random; peer discovery will not work"
+                    );
+                }
+            }
+        }
 
         let backend = AutomergeBackend::with_iroh(backend_cfg).await?;
 
@@ -539,6 +628,50 @@ impl SidecarNode {
             }
         };
 
+        // ── Kubernetes EndpointSlice peer discovery ──────────────────────────
+        // peat-node#63. Only active when --enable-kubernetes-discovery is set.
+        // Uses HKDF-SHA256-derived iroh keys so pods can dial each other by
+        // pod name; see the deterministic keypair derivation above.
+        let k8s_discovery = if config.enable_kubernetes_discovery {
+            let k8s_cfg = KubernetesDiscoveryConfig {
+                namespace: config.kubernetes_discovery_namespace.clone(),
+                label_selector: config.kubernetes_discovery_label_selector.clone(),
+                annotation_prefix: config.kubernetes_discovery_annotation_prefix.clone(),
+                poll_interval: Duration::from_secs(config.kubernetes_discovery_interval_secs),
+            };
+            let mut discovery = KubernetesDiscovery::new(k8s_cfg);
+            match discovery.start().await {
+                Err(e) => {
+                    warn!(
+                        "K8s discovery start failed (running outside a cluster?): {e}; \
+                         continuing without K8s peer discovery"
+                    );
+                    None
+                }
+                Ok(()) => {
+                    if let Ok(rx) = discovery.event_stream() {
+                        let backend_arc = Arc::clone(&backend);
+                        let shared_key_bytes = if config.shared_key.is_empty() {
+                            Vec::new()
+                        } else {
+                            base64::engine::general_purpose::STANDARD
+                                .decode(&config.shared_key)
+                                .unwrap_or_default()
+                        };
+                        let our_pod = pod_name.clone();
+                        tokio::spawn(async move {
+                            Self::k8s_discovery_watcher(backend_arc, rx, shared_key_bytes, our_pod)
+                                .await;
+                        });
+                    }
+                    info!("K8s peer discovery started");
+                    Some(discovery)
+                }
+            }
+        } else {
+            None
+        };
+
         // Load per-collection lifecycle configs (peat-node#55).
         let collection_configs_path = config.data_dir.join("collection_configs.json");
         let collection_configs: HashMap<String, CollectionConfigEntry> =
@@ -575,6 +708,7 @@ impl SidecarNode {
             collection_configs: Arc::new(RwLock::new(collection_configs)),
             collection_configs_path,
             _mdns: mdns,
+            _k8s_discovery: k8s_discovery,
         })
     }
 
@@ -644,6 +778,66 @@ impl SidecarNode {
                             auth_failed.insert(peer.node_id.clone());
                         }
                         warn!(peer = %peer.node_id, %addr, "mDNS: connect failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Background task: connect to K8s-discovered pods as they appear in
+    /// EndpointSlices (peat-node#63).
+    ///
+    /// Each pod's iroh `EndpointId` is derived deterministically from
+    /// `HKDF-SHA256(shared_key_bytes, "iroh:" + pod_name)` — the same formula
+    /// used to set `AutomergeBackendConfig::iroh_secret_key` at startup, so the
+    /// derived endpoint ID matches the peer's actual endpoint ID.
+    async fn k8s_discovery_watcher(
+        backend: Arc<AutomergeBackend>,
+        mut rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+        shared_key_bytes: Vec<u8>,
+        our_pod_name: Option<String>,
+    ) {
+        while let Some(event) = rx.recv().await {
+            let peer = match event {
+                DiscoveryEvent::PeerFound(p) | DiscoveryEvent::PeerUpdated(p) => p,
+                DiscoveryEvent::PeerLost(_) => continue,
+            };
+            if our_pod_name.as_deref() == Some(peer.node_id.as_str()) {
+                continue;
+            }
+            if peer.addresses.is_empty() {
+                debug!(pod = %peer.node_id, "K8s discovery: no addresses, skipping");
+                continue;
+            }
+            let key_seed = derive_iroh_node_key(&shared_key_bytes, &peer.node_id);
+            let peer_id = iroh::SecretKey::from_bytes(&key_seed).public();
+            let already = backend.transport().connected_peers().contains(&peer_id);
+            if already {
+                continue;
+            }
+            for addr in &peer.addresses {
+                let registration = PeerRegistration {
+                    addresses: vec![addr.to_string()],
+                    relay_url: String::new(),
+                    next_attempt: std::time::Instant::now(),
+                    backoff: RECONNECT_BACKOFF_MIN,
+                };
+                match Self::dial_and_attach(&backend, peer_id, &registration).await {
+                    Ok(()) => {
+                        info!(
+                            pod = %peer.node_id,
+                            %addr,
+                            endpoint_id = %peer_id.fmt_short(),
+                            "K8s discovery: connected to peer"
+                        );
+                        let _ = backend
+                            .coordinator()
+                            .sync_all_documents_with_peer(peer_id)
+                            .await;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(pod = %peer.node_id, %addr, "K8s discovery: connect failed: {e}");
                     }
                 }
             }

@@ -103,7 +103,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.38", features = ["automerge-backend"] }
+peat-mesh = { version = "0.9.0-rc.39", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
@@ -149,6 +149,12 @@ hex = "0.4"
 # Hashing (PRD-006 attachment ingest streams sha256 alongside blob ingest;
 # also exercised by validate.rs unit tests for hash equality).
 sha2 = "0.10"
+# HKDF-SHA256 for K8s peer discovery deterministic iroh keypair derivation
+# (peat-node#63). FIPS-approved per ADR-049.
+hkdf = "0.12"
+# Required by peat-mesh's `kubernetes` feature (k8s-openapi mandates that the
+# binary crate enables a v1_X feature to select the K8s API version).
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # O_NOFOLLOW for the attachment-ingest open path (PRD-006 §Validation Rule 5
 # TOCTOU mitigation). libc is already transitively pulled by iroh / tokio —
@@ -185,3 +191,4 @@ rcgen = "0.13"
 # relevant tests pins them to one-at-a-time execution within their
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
+

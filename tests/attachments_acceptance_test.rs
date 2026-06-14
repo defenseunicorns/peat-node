@@ -75,6 +75,7 @@ async fn boot_server(port: u16, cfg_override: impl FnOnce(&mut AttachmentConfig)
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
