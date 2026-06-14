@@ -329,7 +329,10 @@ impl SidecarNode {
         // tick interval scales with retention so tests that set short
         // retention windows observe eviction promptly, while the default
         // 24h retention only sweeps once a minute.
-        if config.attachment_config.has_roots()
+        // Guard covers both send-side (roots) and receive-side (inbox):
+        // receive-only nodes also accumulate terminal bundle handles and
+        // need time-based eviction just as senders do.
+        if (config.attachment_config.has_roots() || config.attachment_config.inbox_path.is_some())
             && config.attachment_config.handle_retention_secs > 0
         {
             let registry = Arc::clone(&bundle_registry);
@@ -358,15 +361,20 @@ impl SidecarNode {
             let sink = std::sync::Arc::new(crate::attachments::inbox::FilesystemInboxSink::new(
                 inbox_path.clone(),
             ));
+            let raw_poll_secs = config.attachment_config.inbox_poll_secs;
+            if raw_poll_secs == 0 {
+                warn!(
+                    "PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS=0 is not supported; \
+                     clamped to 1 — set a value ≥1 to suppress this warning"
+                );
+            }
             file_distribution
                 .as_ref()
                 .expect("file_distribution is Some when inbox_path is configured")
                 .start_receive_watcher(
                     endpoint_short,
                     sink,
-                    std::time::Duration::from_secs(
-                        config.attachment_config.inbox_poll_secs.max(1) as u64
-                    ),
+                    std::time::Duration::from_secs(raw_poll_secs.max(1) as u64),
                 );
         }
 

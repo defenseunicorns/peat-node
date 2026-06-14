@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inbox-only nodes now get time-based bundle eviction** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). The `PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS` knob and the background eviction ticker now cover receive-only nodes (inbox configured, no roots) as well as send-side nodes. Previously the ticker was gated on `has_roots()` only, so a receive-only node accumulated terminal bundle handles indefinitely until LRU pressure removed them — time-based eviction was silently inert.
+- **Chart: inbox without volume mount now fails at `helm install` time** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). Setting `attachment.inbox` without a corresponding `attachment.extraVolumeMounts` entry now produces a clear `helm install`/`helm upgrade` error rather than silently writing received blobs to ephemeral container storage (lost on pod restart).
+- **Binary warns on `PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS=0`** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). A poll interval of 0 is clamped to 1 s at startup and now emits a `WARN`-level log message so operators can distinguish "accepted" from "silently corrected".
+
+### Changed
+
+- **Chart: `disableMdns` defaults to `true` — bare-metal Helm users must opt in** (from [#148](https://github.com/defenseunicorns/peat-node/pull/148)). The peat-node binary defaults mDNS peer discovery to **on**; the Helm chart now defaults `disableMdns: true` (injecting `PEAT_NODE_DISABLE_MDNS=true`) because multicast is unavailable in Kubernetes and containers. **Bare-metal operators deploying via the chart** who relied on mDNS for same-host peer discovery must add `disableMdns: false` to their values override after a `helm upgrade`. No action is needed for Kubernetes deployments — mDNS was always a no-op there.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added
