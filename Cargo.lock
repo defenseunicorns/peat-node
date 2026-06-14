@@ -3606,9 +3606,9 @@ dependencies = [
 
 [[package]]
 name = "peat-protocol"
-version = "0.9.0-rc.24"
+version = "0.9.0-rc.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "400f87586e4a1568482dee3e3f3acdaf5f89a5153e9a3a7f9990804a9fcd94b5"
+checksum = "3349273039d47c85a41581ef599d472455a0b4c0cefc4273413180eda059e65c"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3648,9 +3648,9 @@ dependencies = [
 
 [[package]]
 name = "peat-schema"
-version = "0.9.0-rc.24"
+version = "0.9.0-rc.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "206a35bb45a8a11eca87c97b9ae7f3810ba22a0745117737762af4c0c89a08ff"
+checksum = "b4f3ff2f8ada9a00f103a4b136f4c2b3b97e970a71b8aae1ce5fbbd20c95bbf7"
 dependencies = [
  "chrono",
  "prost",
