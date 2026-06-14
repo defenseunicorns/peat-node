@@ -133,6 +133,9 @@ Usage in a parent chart:
     {{- end }}
     {{- /* Receiver-side inbox (PRD-006 v1.1). */}}
     {{- if .Values.attachment.inbox }}
+    {{- if not .Values.attachment.extraVolumeMounts }}
+    {{- fail "attachment.inbox is set but attachment.extraVolumeMounts is empty. Without a persistent volume mount at the inbox path, received blobs will be written to ephemeral container storage and lost on pod restart. Add at least one extraVolumeMounts entry pointing to a persistent volume at the inbox path. See values.yaml for an example." }}
+    {{- end }}
     - name: PEAT_NODE_ATTACHMENT_INBOX
       value: {{ .Values.attachment.inbox | quote }}
     - name: PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS
