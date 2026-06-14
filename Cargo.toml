@@ -103,10 +103,7 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-# path override during peat-node#63 development — points at local peat-mesh
-# feat/automerge-backend-deterministic-iroh-key (PR #253). Switch back to
-# registry pin once rc.39 ships.
-peat-mesh = { path = "../peat-mesh", features = ["automerge-backend", "kubernetes"] }
+peat-mesh = { version = "0.9.0-rc.39", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
@@ -195,9 +192,3 @@ rcgen = "0.13"
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
 
-# peat-node#63 dev override — force all transitive peat-mesh consumers
-# (peat-protocol, etc.) to resolve against the local branch rather than
-# the registry rc.38, preventing the "two peat-mesh versions" diamond.
-# Remove once the peat-mesh PR #253 ships as rc.39.
-[patch.crates-io]
-peat-mesh = { path = "../peat-mesh" }
