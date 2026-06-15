@@ -1061,6 +1061,11 @@ impl SidecarNode {
         // (target_nodes resolved to `[]` for AllNodes distributions
         // unless the operator called add_peer through a private API).
         backend.blob_store().add_peer(peer_id).await;
+        // Clear any stale health record from a prior session so this peer
+        // starts at Neutral rather than inheriting a pre-blackout Unhealthy
+        // rank. Known-peers and BlobPeerIndex entries are preserved — only
+        // the health verdict is reset.
+        backend.blob_store().reset_peer_health(&peer_id).await;
 
         Ok(())
     }

@@ -103,7 +103,20 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "=0.9.0-rc.38", features = ["automerge-backend"] }
+#
+# rc.39 (peat-mesh#254): deterministic iroh endpoint identity for K8s /
+#   containerised deployments — `NetworkConfig::node_secret_key` lets an
+#   operator supply a fixed Ed25519 key so the node ID survives pod
+#   restarts. No API change for nodes that don't set the key.
+#
+# rc.40 (peat-mesh#255): `NetworkedIrohBlobStore::reset_peer_health` +
+#   `peer_health_cooldown` default 120s→30s. `reset_peer_health` clears
+#   a peer's health verdict without touching `known_peers` or
+#   `BlobPeerIndex` — called from `dial_and_attach` so a peer that was
+#   Unhealthy before a blackout re-enters at Neutral on reconnect.
+#   30s cooldown matches the watchdog reconnect cycle; explicit reconnect
+#   via `reset_peer_health` supersedes it anyway.
+peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
