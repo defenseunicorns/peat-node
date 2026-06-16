@@ -3496,7 +3496,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "peat-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3525,9 +3525,9 @@ dependencies = [
 
 [[package]]
 name = "peat-mesh"
-version = "0.9.0-rc.38"
+version = "0.9.0-rc.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f729ec964e81563e4e4a690bbca5337613c34fe7f82da0a2ecceda90ff53f40b"
+checksum = "b8c72a87dba6ae90f9abd8ffc57ae7ff086f03ec4a62b2a0437c4062f79f2c87"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "peat-node"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
