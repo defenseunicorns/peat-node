@@ -287,10 +287,12 @@ jobs:
           fi
 
           # Idempotent: update an existing release rather than failing.
+          # $NOTES_ARG is always set above (--notes-file or --generate-notes)
+          # and must be passed on both paths — omitting it on the edit path
+          # leaves gh with no flags and exits non-zero.
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists, updating..."
-            gh release edit "$GITHUB_REF_NAME" $PRERELEASE_FLAG \
-              $(if [ "${{ steps.changelog.outputs.fallback }}" != "true" ]; then echo "--notes-file /tmp/release-notes.md"; fi)
+            gh release edit "$GITHUB_REF_NAME" $PRERELEASE_FLAG $NOTES_ARG
           else
             gh release create "$GITHUB_REF_NAME" $NOTES_ARG $PRERELEASE_FLAG
           fi

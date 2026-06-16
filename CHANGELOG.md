@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-16
+
+### Added
+
+- **`peat attach` subcommand** (`send` / `watch` / `status`) — distribute and receive binary files directly from the operator CLI over the Iroh blob store without a running `peat-node`. Supports `--scope` (`all` / `nodes:id1,id2` / `formation:id`), `--priority` (`critical` / `high` / `normal` / `low`), `--wait` (block until all targets confirm receipt), and `--dist-id` exit-on-delivery for `watch`. Updated README and QUICKSTART with command reference and two-terminal walkthrough. ([#155](https://github.com/defenseunicorns/peat-node/pull/155))
+
+### Fixed
+
+- **Peer health reset on reconnect** — peers that were marked `Unhealthy` before a QUIC idle-timeout blackout now re-enter `fetch_blob` ordering at `Neutral` after `dial_and_attach`, rather than carrying their pre-outage verdict forward. `BlobPeerIndex` and `known_peers` are preserved — only the health verdict is cleared. Bumps peat-mesh to `rc.40`, which also drops the `peer_health_cooldown` default from 120 s to 30 s (matching the watchdog reconnect cycle). ([#156](https://github.com/defenseunicorns/peat-node/pull/156))
+
+### Changed
+
+- **Reconnect watchdog — double-lock eliminated** — the watchdog error path no longer re-acquires `registered_peers` to read back the backoff it just wrote; the value is captured as a local before the write lock drops. ([#157](https://github.com/defenseunicorns/peat-node/pull/157))
+- **`peat attach watch --dist-id` — filesystem polling eliminated** — replaced 500 ms directory-scan polling with a `tokio::sync::Notify` fired by `InboxSink::deliver()` on the target distribution's atomic rename; the CLI wakes within one async tick of delivery. ([#157](https://github.com/defenseunicorns/peat-node/pull/157))
+
 ### Fixed
 
 - **Inbox-only nodes now get time-based bundle eviction** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). The `PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS` knob and the background eviction ticker now cover receive-only nodes (inbox configured, no roots) as well as send-side nodes. Previously the ticker was gated on `has_roots()` only, so a receive-only node accumulated terminal bundle handles indefinitely until LRU pressure removed them — time-based eviction was silently inert.
