@@ -1,3 +1,4 @@
+pub mod attach;
 pub mod create;
 pub mod delete;
 pub mod observe;
@@ -85,6 +86,9 @@ pub enum Command {
 
     /// Inspect the peat-schema type registry (offline — no creds or mesh).
     Schema(schema::SchemaArgs),
+
+    /// Distribute and receive file attachments over the mesh.
+    Attach(attach::AttachArgs),
 }
 
 /// Exit-code-bearing CLI error. Codes match the table in peat-node ADR-001.
@@ -140,6 +144,7 @@ impl Cli {
             // `CommonArgs::creds` / `--as` / `--timeout`. Output format
             // is the only common-arg piece it threads through.
             Command::Schema(args) => schema::run(args, self.common.output),
+            Command::Attach(args) => attach::run(args, self.common).await,
         }
     }
 }

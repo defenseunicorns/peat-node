@@ -13,8 +13,13 @@
 
 #![allow(dead_code)] // Each scenario uses a subset of these helpers.
 
+use async_trait::async_trait;
+use peat_mesh::storage::blob_traits::{BlobMetadata, BlobStore};
 use peat_mesh::storage::{ChangeOrigin, SyncTransport};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
+use peat_protocol::storage::{
+    DistributionDocument, FileDistribution, IrohFileDistribution, ReceiveSink,
+};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -188,6 +193,11 @@ impl TestPeer {
                 let current: HashSet<iroh::EndpointId> =
                     backend.transport().connected_peers().into_iter().collect();
                 for new_peer in current.difference(&seen) {
+                    // Register the inbound peer in the blob store so
+                    // IrohFileDistribution can fetch blobs from it (mirrors
+                    // peat-node dial_and_attach's add_peer call for the
+                    // inbound direction).
+                    backend.blob_store().add_peer(*new_peer).await;
                     let _ = backend
                         .coordinator()
                         .sync_all_documents_with_peer(*new_peer)
@@ -249,6 +259,160 @@ impl TestPeer {
         let path = dir.path().join("creds.yaml");
         self.write_creds(&path).expect("write creds.yaml");
         path
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attachment test helpers
+// ---------------------------------------------------------------------------
+
+/// Filesystem inbox sink for test use. Mirrors the production
+/// `FilesystemInboxSink` in `peat-node::attachments::inbox`: writes each
+/// delivered blob to `{inbox_root}/{distribution_id}/{filename}` via a
+/// tmp-then-rename pair. `already_delivered` checks for any regular file of
+/// the declared size — same logic as production so restart-idempotency works.
+pub struct TestInboxSink {
+    inbox_root: PathBuf,
+}
+
+impl TestInboxSink {
+    pub fn new(inbox_root: PathBuf) -> Self {
+        Self { inbox_root }
+    }
+}
+
+#[async_trait]
+impl ReceiveSink for TestInboxSink {
+    async fn already_delivered(&self, doc: &DistributionDocument) -> bool {
+        let dir = self.inbox_root.join(&doc.distribution_id);
+        if !dir.is_dir() {
+            return false;
+        }
+        let mut iter = match tokio::fs::read_dir(&dir).await {
+            Ok(i) => i,
+            Err(_) => return false,
+        };
+        while let Ok(Some(entry)) = iter.next_entry().await {
+            if entry
+                .path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with('.'))
+            {
+                continue;
+            }
+            if let Ok(md) = entry.metadata().await {
+                if md.is_file() && md.len() == doc.blob_size {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    async fn deliver(&self, doc: &DistributionDocument, blob_path: &Path) -> anyhow::Result<()> {
+        let dir = self.inbox_root.join(&doc.distribution_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let filename = test_inbox_filename(&doc.blob_metadata, &doc.distribution_id);
+        let target = dir.join(&filename);
+        let tmp = dir.join(format!(".{filename}.partial"));
+        tokio::fs::copy(blob_path, &tmp).await?;
+        tokio::fs::rename(&tmp, &target).await?;
+        Ok(())
+    }
+}
+
+fn test_inbox_filename(metadata: &BlobMetadata, distribution_id: &str) -> String {
+    if let Some(raw) = metadata.name.as_ref() {
+        let last = Path::new(raw)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.trim_start_matches('.'))
+            .filter(|s| !s.is_empty());
+        if let Some(name) = last {
+            return name.to_string();
+        }
+    }
+    format!("{distribution_id}.bin")
+}
+
+/// A `TestPeer` with attachment infrastructure wired: an `IrohFileDistribution`
+/// with a running receive watcher that delivers incoming blobs to `inbox_dir`.
+///
+/// * `file_dist` — call `file_dist.distribute(...)` to push blobs from the
+///   TestPeer side (used by receive-side scenarios that need TestPeer to send).
+/// * `inbox_dir` — check `inbox_dir.path()/{dist_id}/{filename}` to assert
+///   that a CLI-originated send arrived at the TestPeer.
+pub struct TestAttachPeer {
+    pub peer: TestPeer,
+    pub file_dist: Arc<IrohFileDistribution>,
+    pub inbox_dir: TempDir,
+}
+
+impl TestAttachPeer {
+    pub async fn start() -> Self {
+        let peer = TestPeer::start().await;
+        let inbox_dir = tempfile::tempdir().expect("inbox tempdir");
+
+        let file_dist = Arc::new(IrohFileDistribution::new(
+            peer.backend.blob_store().clone(),
+            peer.backend.store().clone(),
+        ));
+
+        let own_short_id = peer.backend.blob_store().endpoint_id().fmt_short().to_string();
+        let sink: Arc<dyn ReceiveSink> =
+            Arc::new(TestInboxSink::new(inbox_dir.path().to_path_buf()));
+        file_dist.start_receive_watcher(own_short_id, sink, Duration::from_secs(1));
+
+        Self {
+            peer,
+            file_dist,
+            inbox_dir,
+        }
+    }
+
+    /// Write credentials pointing at this peer into `dir/creds.yaml`.
+    pub fn creds_tempfile(&self, dir: &TempDir) -> PathBuf {
+        self.peer.creds_tempfile(dir)
+    }
+
+    /// Create a blob from `path` in this peer's blob store and distribute it
+    /// to all known peers. Returns `(token, handle)` so callers can assert on
+    /// the distribution ID.
+    pub async fn distribute_file(
+        &self,
+        path: &Path,
+        filename: &str,
+    ) -> (
+        peat_mesh::storage::blob_traits::BlobToken,
+        peat_protocol::storage::DistributionHandle,
+    ) {
+        // Register connected peers so AllNodes scope has targets.
+        for peer_id in self.peer.backend.transport().connected_peers() {
+            self.peer.backend.blob_store().add_peer(peer_id).await;
+        }
+        let metadata = BlobMetadata::with_name(filename.to_string());
+        let token = self
+            .peer
+            .backend
+            .blob_store()
+            .create_blob(path, metadata)
+            .await
+            .expect("create_blob");
+        let handle = self
+            .file_dist
+            .distribute(
+                &token,
+                peat_protocol::storage::DistributionScope::AllNodes,
+                peat_protocol::storage::TransferPriority::Normal,
+            )
+            .await
+            .expect("distribute");
+        (token, handle)
+    }
+
+    pub async fn stop(self) {
+        self.peer.stop().await;
     }
 }
 

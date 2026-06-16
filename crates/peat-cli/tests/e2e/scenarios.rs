@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Duration;
 
-use super::topology::{self, TestPeer};
+use super::topology::{self, TestAttachPeer, TestPeer};
 
 /// Spawn `peat <args>` against `creds`, asserting it exits 0, and return
 /// `(stdout, stderr)` as UTF-8. Centralises the subprocess plumbing so each
@@ -1149,4 +1149,173 @@ fn bad_data_dir_surfaces_root_cause_not_just_context() {
         stderr.trim_end() != bare_msg,
         "root cause is missing — error stops at the bare anyhow context: {stderr}"
     );
+}
+
+// ============================================================================
+// Attachment scenarios
+// ============================================================================
+
+/// CLI sends a file; the in-process TestAttachPeer receives it in its inbox.
+///
+/// Flow:
+///   1. TestAttachPeer boots with a receive watcher writing to a temp inbox.
+///   2. `peat attach send <file> --wait` — CLI distributes the file and blocks
+///      until TestPeer's receive watcher writes Completed status back.
+///   3. Test asserts the file content matches in TestPeer's inbox.
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn attach_send_delivers_file_to_peer_inbox() {
+    let attach_peer = TestAttachPeer::start().await;
+    let creds_dir = tempfile::tempdir().unwrap();
+    let creds = attach_peer.creds_tempfile(&creds_dir);
+
+    // Source file the CLI will distribute.
+    let file_dir = tempfile::tempdir().unwrap();
+    let src = file_dir.path().join("payload.txt");
+    std::fs::write(&src, b"attach e2e test payload").unwrap();
+
+    // CLI: send with --wait so it blocks until TestPeer reports Completed.
+    let (stdout, _stderr) = run_peat(
+        &creds,
+        &["attach", "send", src.to_str().unwrap(), "--wait"],
+    )
+    .await;
+
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout={stdout}"));
+    let dist_id = v["distribution_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no distribution_id in {stdout}"))
+        .to_string();
+    assert_eq!(v["status"], "complete", "CLI reported non-complete: {stdout}");
+    assert_eq!(v["completed"], 1, "expected 1 completed target: {stdout}");
+
+    // The receive watcher delivers to {inbox}/{dist_id}/{filename}.
+    let dist_dir = attach_peer.inbox_dir.path().join(&dist_id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if dist_dir.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&dist_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    !e.file_name()
+                        .to_str()
+                        .unwrap_or("")
+                        .starts_with('.')
+                })
+                .collect();
+            if let Some(entry) = entries.first() {
+                let content = std::fs::read(entry.path()).unwrap();
+                assert_eq!(
+                    content,
+                    b"attach e2e test payload",
+                    "delivered file content mismatch"
+                );
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file did not appear in inbox within deadline; dist_id={dist_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    attach_peer.stop().await;
+}
+
+/// TestAttachPeer distributes a file; the CLI receive-watches and writes it
+/// to a local inbox.
+///
+/// Flow:
+///   1. TestAttachPeer boots.
+///   2. CLI subprocess starts `peat attach watch --inbox <dir>` in the
+///      background (kill_on_drop).
+///   3. Test waits until CLI appears in TestPeer's connected_peers, then gives
+///      the CLI's add_peer registration time to complete.
+///   4. TestAttachPeer distributes the blob — CLI is now a known_peer so it
+///      lands in target_nodes and the receive watcher can fetch.
+///   5. Test polls the CLI's inbox until the file appears, then kills the
+///      watcher subprocess (it runs indefinitely without --dist-id).
+#[tokio::test]
+#[serial_test::serial(peat_cli_two_party)]
+async fn attach_watch_receives_file_from_peer() {
+    use peat_mesh::storage::SyncTransport;
+
+    let attach_peer = TestAttachPeer::start().await;
+    let creds_dir = tempfile::tempdir().unwrap();
+    let creds = attach_peer.creds_tempfile(&creds_dir);
+
+    let file_dir = tempfile::tempdir().unwrap();
+    let src = file_dir.path().join("from_peer.bin");
+    std::fs::write(&src, b"received from peer").unwrap();
+
+    let inbox_dir = tempfile::tempdir().unwrap();
+
+    // Start the CLI watcher in the background. kill_on_drop ensures it is
+    // cleaned up when `watcher` is dropped at the end of the test.
+    let watcher = topology::spawn_peat_streaming(
+        &creds,
+        &[
+            "attach",
+            "watch",
+            "--inbox",
+            inbox_dir.path().to_str().unwrap(),
+        ],
+    );
+
+    // Wait until CLI appears in TestPeer's connected_peers. The CLI's
+    // MeshSession::open has POST_JOIN_SETTLE=1s; allow up to 15s total.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if !attach_peer
+            .peer
+            .backend
+            .transport()
+            .connected_peers()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CLI subprocess did not connect to TestPeer within deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Give the CLI's IrohFileDistribution receive watcher a moment to start
+    // and its add_peer registration to complete.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Distribute from TestPeer now that CLI is connected and registered.
+    let (_token, handle) = attach_peer.distribute_file(&src, "from_peer.bin").await;
+    let dist_id = handle.distribution_id.clone();
+
+    // Poll CLI's inbox until the file appears.
+    let inbox_dist_dir = inbox_dir.path().join(&dist_id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let content = loop {
+        if inbox_dist_dir.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&inbox_dist_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| !e.file_name().to_str().unwrap_or("").starts_with('.'))
+                .collect();
+            if let Some(entry) = entries.first() {
+                break std::fs::read(entry.path()).unwrap();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "file did not appear in CLI inbox within deadline; dist_id={dist_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    };
+
+    assert_eq!(content, b"received from peer", "delivered file content mismatch");
+
+    // Clean up: kill the watcher subprocess and the TestPeer.
+    drop(watcher);
+    attach_peer.stop().await;
 }
