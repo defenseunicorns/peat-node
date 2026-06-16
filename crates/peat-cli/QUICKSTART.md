@@ -1,8 +1,8 @@
 # peat CLI — Quickstart
 
-A ~5–10 minute walkthrough from zero to reading/writing documents on a Peat mesh — closer to 5 on the recommended mDNS path, longer if you stand up the compose or `peat-node` alternatives. Stops along the way exercise everything you'll actually use in day-to-day operations.
+A ~10–15 minute walkthrough from zero to reading/writing documents and distributing file attachments on a Peat mesh — closer to 10 on the recommended mDNS path. Stops along the way exercise everything you'll actually use in day-to-day operations.
 
-> **What is `peat`?** A CRUD-shaped operator CLI that joins a Peat mesh as a real node, runs one command, and exits. Same protocol stack as `peat-node` — no admin-side API. See [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md) for the design.
+> **What is `peat`?** An operator CLI that joins a Peat mesh as a real node, runs one command, and exits. Supports CRUD document operations (`query`, `create`, `update`, `delete`, `observe`) and binary file distribution (`attach send/watch/status`). Same protocol stack as `peat-node` — no admin-side API. See [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md) for the design.
 
 ## What you'll need
 
@@ -327,6 +327,84 @@ Prints the canonical operation JSON to stdout. Exit 0 = the write would be valid
 kubectl exec -n peat -it deploy/peat-peat-node -c peat-node -- \
   peat --creds /tmp/creds.yaml query --all-collections
 ```
+
+---
+
+---
+
+## Step 6 — Distribute a file attachment
+
+`peat attach` moves binary files across the mesh using the Iroh blob store. The sender creates a distribution document that connected peers consume; receivers write blobs to a local inbox directory.
+
+### Send a file
+
+**Terminal A** — receiver (start this first so it's connected before the sender distributes):
+
+```sh
+peat --creds ./creds.yaml attach watch --inbox ./inbox --data-dir /tmp/myapp-recv
+```
+
+**Terminal B** — sender:
+
+```sh
+peat --creds ./creds.yaml attach send ./report.pdf --wait --data-dir /tmp/myapp-send
+```
+
+`send --wait` blocks until all connected peers confirm receipt. The distribution ID is printed on success:
+
+```json
+{
+  "distribution_id": "018f4b2c-…",
+  "status": "complete",
+  "completed": 1,
+  "failed": 0,
+  "total_targets": 1
+}
+```
+
+Terminal A exits once the file lands in `./inbox/<dist-id>/report.pdf`.
+
+### Fire-and-forget with status polling
+
+Omit `--wait` to get the distribution ID immediately and poll separately:
+
+```sh
+# Send without blocking.
+dist_id=$(peat --creds ./creds.yaml attach send ./payload.bin \
+  | jq -r .distribution_id)
+
+# Check status later.
+peat --creds ./creds.yaml attach status "$dist_id"
+```
+
+`status` reads the distribution document from the local Automerge store and prints the full node-by-node status as JSON. Re-run it until `completed + failed >= total_targets`.
+
+### Scope and priority
+
+By default `send` targets every peer connected at send time (`--scope all`). Narrow the recipients:
+
+```sh
+# Named nodes (Iroh endpoint short-ids printed by peat attach send output).
+peat --creds ./creds.yaml attach send ./firmware.bin \
+  --scope nodes:abc123,def456 --priority high
+
+# All nodes in a named formation.
+peat --creds ./creds.yaml attach send ./firmware.bin \
+  --scope formation:alpha-cell --priority critical
+```
+
+Priority levels: `critical` > `high` > `normal` (default) > `low`. Priority is advisory — the receiving peer's scheduler honours it, but no transfer is dropped.
+
+### Persistent watch daemon
+
+Run `watch` without `--dist-id` to receive all incoming attachments indefinitely:
+
+```sh
+peat --creds ./creds.yaml attach watch --inbox ./inbox --data-dir /tmp/myapp-recv
+# Ctrl-C to stop (exits 130).
+```
+
+Files land at `<inbox>/<distribution-id>/<original-filename>`. Concurrent deliveries from different senders each get their own subdirectory keyed by distribution ID, so they never collide.
 
 ---
 
