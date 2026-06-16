@@ -180,7 +180,7 @@ async fn run_status(args: StatusArgs, common: CommonArgs) -> Result<(), CliError
     )
     .await?;
 
-    let doc = read_distribution_document(&**session.backend().store(), &args.dist_id)
+    let doc = read_distribution_document(session.backend().store(), &args.dist_id)
         .map_err(|e| CliError::Generic(format!("read distribution: {e}")))?;
 
     match doc {
@@ -259,7 +259,7 @@ async fn run_watch(args: WatchArgs, common: CommonArgs) -> Result<(), CliError> 
         tokio::signal::ctrl_c()
             .await
             .map_err(|e| CliError::Generic(format!("signal handler: {e}")))?;
-        return Err(CliError::Interrupted);
+        Err(CliError::Interrupted)
     }
 }
 
