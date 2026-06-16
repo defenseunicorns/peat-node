@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use async_trait::async_trait;
 use clap::{Args, Subcommand};
 use peat_mesh::storage::blob_traits::{BlobMetadata, BlobStore};
@@ -238,55 +240,35 @@ async fn run_watch(args: WatchArgs, common: CommonArgs) -> Result<(), CliError> 
         .fmt_short()
         .to_string();
 
-    let sink: Arc<dyn ReceiveSink> = Arc::new(InboxSink::new(args.inbox.clone()));
-    file_dist.start_receive_watcher(own_short_id, sink, Duration::from_secs(1));
-
     if let Some(dist_id) = &args.dist_id {
-        let dist_dir = args.inbox.join(dist_id);
-        loop {
-            if dir_has_delivered_file(&dist_dir).await {
-                let out = serde_json::json!({
-                    "distribution_id": dist_id,
-                    "status": "delivered",
-                    "inbox": args.inbox.display().to_string(),
-                });
-                println!("{}", serde_json::to_string_pretty(&out).unwrap());
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        // Attach a Notify to the sink so deliver() wakes us the instant the
+        // target distribution lands — no filesystem polling needed.
+        let notify = Arc::new(Notify::new());
+        let sink: Arc<dyn ReceiveSink> = Arc::new(InboxSink::new_with_notify(
+            args.inbox.clone(),
+            dist_id.clone(),
+            Arc::clone(&notify),
+        ));
+        // Create the notified future BEFORE starting the watcher so a
+        // delivery that races the task spawn doesn't drop the permit.
+        let notified = notify.notified();
+        file_dist.start_receive_watcher(own_short_id, sink, Duration::from_secs(1));
+        notified.await;
+        let out = serde_json::json!({
+            "distribution_id": dist_id,
+            "status": "delivered",
+            "inbox": args.inbox.display().to_string(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        Ok(())
     } else {
+        let sink: Arc<dyn ReceiveSink> = Arc::new(InboxSink::new(args.inbox.clone()));
+        file_dist.start_receive_watcher(own_short_id, sink, Duration::from_secs(1));
         tokio::signal::ctrl_c()
             .await
             .map_err(|e| CliError::Generic(format!("signal handler: {e}")))?;
         Err(CliError::Interrupted)
     }
-}
-
-/// Returns true once at least one fully-written (non-.partial, non-hidden)
-/// regular file exists in `dir`.
-async fn dir_has_delivered_file(dir: &Path) -> bool {
-    let mut iter = match tokio::fs::read_dir(dir).await {
-        Ok(i) => i,
-        Err(_) => return false,
-    };
-    while let Ok(Some(entry)) = iter.next_entry().await {
-        let name = entry
-            .path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        if name.starts_with('.') {
-            continue;
-        }
-        if let Ok(md) = entry.metadata().await {
-            if md.is_file() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn parse_scope(s: &str) -> Result<DistributionScope, CliError> {
@@ -335,13 +317,30 @@ fn parse_priority(s: &str) -> Result<TransferPriority, CliError> {
 /// Inbox receive sink: writes each delivered blob to
 /// `{inbox_root}/{distribution_id}/{filename}` via a tmp-then-rename pair.
 /// Mirrors the `FilesystemInboxSink` in `peat-node::attachments::inbox`.
+///
+/// When constructed with [`InboxSink::new_with_notify`], fires the provided
+/// `Notify` after the target distribution's blob is successfully renamed into
+/// place, allowing `run_watch --dist-id` to wake immediately rather than
+/// polling the filesystem.
 struct InboxSink {
     inbox_root: PathBuf,
+    /// If set, `deliver()` fires this notify once the named distribution lands.
+    delivery_signal: Option<(String, Arc<Notify>)>,
 }
 
 impl InboxSink {
     fn new(inbox_root: PathBuf) -> Self {
-        Self { inbox_root }
+        Self {
+            inbox_root,
+            delivery_signal: None,
+        }
+    }
+
+    fn new_with_notify(inbox_root: PathBuf, target_dist_id: String, notify: Arc<Notify>) -> Self {
+        Self {
+            inbox_root,
+            delivery_signal: Some((target_dist_id, notify)),
+        }
     }
 }
 
@@ -382,6 +381,11 @@ impl ReceiveSink for InboxSink {
         let tmp = dir.join(format!(".{filename}.partial"));
         tokio::fs::copy(blob_path, &tmp).await?;
         tokio::fs::rename(&tmp, &target).await?;
+        if let Some((target_id, notify)) = &self.delivery_signal {
+            if doc.distribution_id == *target_id {
+                notify.notify_one();
+            }
+        }
         Ok(())
     }
 }

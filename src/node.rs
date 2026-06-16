@@ -463,32 +463,35 @@ impl SidecarNode {
                         // schedule the next attempt accordingly. If the
                         // operator explicitly disconnected during the dial,
                         // the entry will be missing — skip silently.
-                        let mut registered_guard =
-                            registered.write().unwrap_or_else(|e| e.into_inner());
-                        if let Some(entry) = registered_guard.get_mut(&peer_id) {
-                            match &dial_result {
-                                Ok(()) => {
-                                    entry.backoff = RECONNECT_BACKOFF_MIN;
-                                    entry.next_attempt = now;
+                        // Capture the updated backoff inside the write lock
+                        // so the error-path log doesn't need a second
+                        // lock acquisition.
+                        let next_backoff = {
+                            let mut guard = registered.write().unwrap_or_else(|e| e.into_inner());
+                            if let Some(entry) = guard.get_mut(&peer_id) {
+                                match &dial_result {
+                                    Ok(()) => {
+                                        entry.backoff = RECONNECT_BACKOFF_MIN;
+                                        entry.next_attempt = now;
+                                        None
+                                    }
+                                    Err(_) => {
+                                        entry.backoff =
+                                            (entry.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                                        entry.next_attempt = now + entry.backoff;
+                                        Some(entry.backoff)
+                                    }
                                 }
-                                Err(_) => {
-                                    entry.backoff = (entry.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                                    entry.next_attempt = now + entry.backoff;
-                                }
+                            } else {
+                                None
                             }
-                        }
-                        drop(registered_guard);
+                        };
                         match dial_result {
                             Ok(()) => info!(peer = %peer_id, "auto-reconnect succeeded"),
                             Err(e) => warn!(
                                 peer = %peer_id,
                                 "auto-reconnect failed (next attempt in {:?}): {e}",
-                                registered
-                                    .read()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get(&peer_id)
-                                    .map(|r| r.backoff)
-                                    .unwrap_or(RECONNECT_BACKOFF_MIN)
+                                next_backoff.unwrap_or(RECONNECT_BACKOFF_MIN)
                             ),
                         }
                     }
