@@ -359,7 +359,12 @@ impl TestAttachPeer {
             peer.backend.store().clone(),
         ));
 
-        let own_short_id = peer.backend.blob_store().endpoint_id().fmt_short().to_string();
+        let own_short_id = peer
+            .backend
+            .blob_store()
+            .endpoint_id()
+            .fmt_short()
+            .to_string();
         let sink: Arc<dyn ReceiveSink> =
             Arc::new(TestInboxSink::new(inbox_dir.path().to_path_buf()));
         file_dist.start_receive_watcher(own_short_id, sink, Duration::from_secs(1));

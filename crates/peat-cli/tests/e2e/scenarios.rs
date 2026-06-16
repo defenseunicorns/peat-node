@@ -1175,11 +1175,8 @@ async fn attach_send_delivers_file_to_peer_inbox() {
     std::fs::write(&src, b"attach e2e test payload").unwrap();
 
     // CLI: send with --wait so it blocks until TestPeer reports Completed.
-    let (stdout, _stderr) = run_peat(
-        &creds,
-        &["attach", "send", src.to_str().unwrap(), "--wait"],
-    )
-    .await;
+    let (stdout, _stderr) =
+        run_peat(&creds, &["attach", "send", src.to_str().unwrap(), "--wait"]).await;
 
     let v: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout={stdout}"));
@@ -1187,7 +1184,10 @@ async fn attach_send_delivers_file_to_peer_inbox() {
         .as_str()
         .unwrap_or_else(|| panic!("no distribution_id in {stdout}"))
         .to_string();
-    assert_eq!(v["status"], "complete", "CLI reported non-complete: {stdout}");
+    assert_eq!(
+        v["status"], "complete",
+        "CLI reported non-complete: {stdout}"
+    );
     assert_eq!(v["completed"], 1, "expected 1 completed target: {stdout}");
 
     // The receive watcher delivers to {inbox}/{dist_id}/{filename}.
@@ -1198,18 +1198,12 @@ async fn attach_send_delivers_file_to_peer_inbox() {
             let entries: Vec<_> = std::fs::read_dir(&dist_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    !e.file_name()
-                        .to_str()
-                        .unwrap_or("")
-                        .starts_with('.')
-                })
+                .filter(|e| !e.file_name().to_str().unwrap_or("").starts_with('.'))
                 .collect();
             if let Some(entry) = entries.first() {
                 let content = std::fs::read(entry.path()).unwrap();
                 assert_eq!(
-                    content,
-                    b"attach e2e test payload",
+                    content, b"attach e2e test payload",
                     "delivered file content mismatch"
                 );
                 break;
@@ -1313,7 +1307,10 @@ async fn attach_watch_receives_file_from_peer() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     };
 
-    assert_eq!(content, b"received from peer", "delivered file content mismatch");
+    assert_eq!(
+        content, b"received from peer",
+        "delivered file content mismatch"
+    );
 
     // Clean up: kill the watcher subprocess and the TestPeer.
     drop(watcher);

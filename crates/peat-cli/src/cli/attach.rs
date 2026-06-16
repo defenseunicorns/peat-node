@@ -94,9 +94,10 @@ async fn run_send(args: SendArgs, common: CommonArgs) -> Result<(), CliError> {
     let priority = parse_priority(&args.priority)?;
     let timeout = parse_timeout(&common.timeout)?;
 
-    let file_path = args.file.canonicalize().map_err(|e| {
-        CliError::Generic(format!("cannot access `{}`: {e}", args.file.display()))
-    })?;
+    let file_path = args
+        .file
+        .canonicalize()
+        .map_err(|e| CliError::Generic(format!("cannot access `{}`: {e}", args.file.display())))?;
     let filename = file_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -219,9 +220,8 @@ async fn run_watch(args: WatchArgs, common: CommonArgs) -> Result<(), CliError> 
         session.backend().blob_store().add_peer(peer_id).await;
     }
 
-    std::fs::create_dir_all(&args.inbox).map_err(|e| {
-        CliError::Generic(format!("create inbox `{}`: {e}", args.inbox.display()))
-    })?;
+    std::fs::create_dir_all(&args.inbox)
+        .map_err(|e| CliError::Generic(format!("create inbox `{}`: {e}", args.inbox.display())))?;
 
     let file_dist = IrohFileDistribution::new(
         session.backend().blob_store().clone(),
@@ -410,7 +410,10 @@ mod tests {
 
     #[test]
     fn scope_all() {
-        assert!(matches!(parse_scope("all"), Ok(DistributionScope::AllNodes)));
+        assert!(matches!(
+            parse_scope("all"),
+            Ok(DistributionScope::AllNodes)
+        ));
     }
 
     #[test]
@@ -448,9 +451,15 @@ mod tests {
 
     #[test]
     fn priority_all() {
-        assert!(matches!(parse_priority("critical"), Ok(TransferPriority::Critical)));
+        assert!(matches!(
+            parse_priority("critical"),
+            Ok(TransferPriority::Critical)
+        ));
         assert!(matches!(parse_priority("high"), Ok(TransferPriority::High)));
-        assert!(matches!(parse_priority("normal"), Ok(TransferPriority::Normal)));
+        assert!(matches!(
+            parse_priority("normal"),
+            Ok(TransferPriority::Normal)
+        ));
         assert!(matches!(parse_priority("low"), Ok(TransferPriority::Low)));
     }
 
