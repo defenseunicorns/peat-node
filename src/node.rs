@@ -525,15 +525,19 @@ impl SidecarNode {
                             .map(|s| s.port())
                             .unwrap_or(0);
                         if port > 0 {
-                            let loopback = std::net::SocketAddr::new(
-                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                                port,
-                            );
+                            // Advertise our REAL LAN interface addresses so peers on
+                            // OTHER hosts can discover and dial us. peat-mesh's
+                            // `advertise` enables mdns-sd address auto-detection, which
+                            // publishes every non-loopback interface address (and keeps
+                            // them current). The previous `advertise_with_addr(127.0.0.1)`
+                            // only ever reached nodes on the same host. `port` is still
+                            // carried in the TXT record as a fallback for resolvers that
+                            // yield no A records.
                             let mut meta = std::collections::HashMap::new();
                             meta.insert("port".to_string(), port.to_string());
                             meta.insert("formation_id".to_string(), config.app_id.clone());
-                            match m.advertise_with_addr(&eid, loopback, Some(meta)) {
-                                Ok(()) => info!("mDNS: advertising on 127.0.0.1:{port}"),
+                            match m.advertise(&eid, port, Some(meta)) {
+                                Ok(()) => info!("mDNS: advertising endpoint {eid} on LAN (port {port})"),
                                 Err(e) => warn!("mDNS advertise failed: {e}"),
                             }
                         }
