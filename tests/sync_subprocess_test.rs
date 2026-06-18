@@ -15,16 +15,37 @@
 //! bugs (CLI parsing, process lifecycle, real Iroh QUIC over a real
 //! UDP socket bound to a real port) that the in-process test can't.
 
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
 
-const A_GRPC: u16 = 50095;
-const A_IROH: u16 = 51195;
-const B_GRPC: u16 = 50096;
-const B_IROH: u16 = 51196;
+/// Reserve two distinct free TCP ports and two distinct free UDP ports for the
+/// two nodes' gRPC + iroh endpoints.
+///
+/// Hard-coded ports are the root cause of this test's historical flakiness:
+/// they collide with other workspace test binaries running in parallel, and
+/// with the not-yet-released ports of a prior run (ChildGuard's `start_kill`
+/// is asynchronous — the OS may still hold the socket when the next run binds).
+/// Binding `:0` lets the OS assign currently-free ports; all four sockets are
+/// held open simultaneously so the four numbers are guaranteed distinct, then
+/// dropped just before the children bind them. Returns `(a_grpc, a_iroh,
+/// b_grpc, b_iroh)`.
+fn reserve_ports() -> (u16, u16, u16, u16) {
+    let a_grpc = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b_grpc = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a_iroh = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let b_iroh = UdpSocket::bind("127.0.0.1:0").unwrap();
+    (
+        a_grpc.local_addr().unwrap().port(),
+        a_iroh.local_addr().unwrap().port(),
+        b_grpc.local_addr().unwrap().port(),
+        b_iroh.local_addr().unwrap().port(),
+    )
+    // All four sockets close here, freeing the ports for the child processes.
+}
 
 /// Kills the wrapped child on drop so a panicking test doesn't orphan binaries.
 struct ChildGuard(Child);
@@ -32,6 +53,33 @@ struct ChildGuard(Child);
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.start_kill();
+    }
+}
+
+/// Poll `GetStatus` until the node's gRPC server answers, tolerating the
+/// connection errors that occur while the process is still binding its socket.
+/// Replaces relying on a bare fixed sleep for *reachability* (the source of the
+/// `call()` connection-refused panics under load); the iroh address-publish
+/// settle is kept separately by the caller.
+async fn wait_grpc_ready(client: &reqwest::Client, base: &str) {
+    let url = format!("{base}/peat.sidecar.v1.PeatSidecar/GetStatus");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => return,
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node gRPC at {base} did not become ready within 20s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -84,25 +132,32 @@ async fn call(
 async fn two_subprocess_sync_increments_byte_counters() {
     let bin = env!("CARGO_BIN_EXE_peat-node");
 
+    // Unique ephemeral ports per run — no fixed-port collisions with other
+    // test binaries or a prior run's not-yet-released sockets.
+    let (a_grpc, a_iroh, b_grpc, b_iroh) = reserve_ports();
+
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
-    let _node_a = spawn_node(bin, A_GRPC, A_IROH, "node-a", dir_a.path());
-    let _node_b = spawn_node(bin, B_GRPC, B_IROH, "node-b", dir_b.path());
-
-    // Static settle, mirroring the previously-working Go synctest's
-    // 2-second sleep after process spawn. An aggressive `wait_ready`
-    // poll loop races with the Iroh endpoint's address-publish step in
-    // ways that observably suppress per-peer counter increments later;
-    // the calmer fixed sleep avoids that interaction.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _node_a = spawn_node(bin, a_grpc, a_iroh, "node-a", dir_a.path());
+    let _node_b = spawn_node(bin, b_grpc, b_iroh, "node-b", dir_b.path());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let base_a = format!("http://127.0.0.1:{A_GRPC}");
-    let base_b = format!("http://127.0.0.1:{B_GRPC}");
+    let base_a = format!("http://127.0.0.1:{a_grpc}");
+    let base_b = format!("http://127.0.0.1:{b_grpc}");
+
+    // Wait for both gRPC servers to actually answer before driving them — this
+    // is the reachability guarantee the old bare 2s sleep lacked. Then keep a
+    // short settle for the iroh endpoint's address-publish step: an *aggressive*
+    // readiness loop that immediately drove traffic was observed to suppress
+    // per-peer counter increments, so readiness and the iroh settle stay
+    // distinct concerns.
+    wait_grpc_ready(&client, &base_a).await;
+    wait_grpc_ready(&client, &base_b).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Two explicit Status calls, also mirroring the Go reference.
     let status_a = call(&client, &base_a, "GetStatus", serde_json::json!({})).await;
@@ -119,7 +174,7 @@ async fn two_subprocess_sync_increments_byte_counters() {
         "ConnectPeer",
         serde_json::json!({
             "endpointId": endpoint_a,
-            "addresses": [format!("127.0.0.1:{A_IROH}")],
+            "addresses": [format!("127.0.0.1:{a_iroh}")],
         }),
     )
     .await;
