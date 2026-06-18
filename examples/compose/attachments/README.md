@@ -170,6 +170,14 @@ Send with `SendAttachments` (scope `allNodes`); the receiver's inbox watcher
 fetches the blob over iroh and writes it to
 `{inbox}/{distribution_id}/{filename}`, byte-identical to the source.
 
+**Hands-off (synced-folder) mode.** Set `PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`
+on the sender (requires v0.4.5+) and you don't call `SendAttachments` at all:
+the sender's **outbox watcher** auto-distributes any stable new file in its
+root, and the receiver's inbox watcher writes it — drop a file in the outbox,
+it appears in the peer's inbox. The receive side is already automatic; this adds
+the symmetric send side. Both are pure-polling (no inotify), reliable across
+container bind mounts.
+
 > ⚠️ A `COMPLETED` status with **no connected peers** is the *vacuous*
 > zero-target case — nothing was transferred. Confirm
 > `GetStatus.connectedPeers >= 1` before trusting delivery.

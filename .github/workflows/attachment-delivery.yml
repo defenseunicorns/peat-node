@@ -44,3 +44,6 @@ jobs:
 
       - name: Run attachment-delivery-compose.sh
         run: ./test/attachment-delivery-compose.sh
+
+      - name: Run attachment-outbox-watch-compose.sh (outbox watcher)
+        run: ./test/attachment-outbox-watch-compose.sh

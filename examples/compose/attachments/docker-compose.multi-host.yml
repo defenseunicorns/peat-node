@@ -93,6 +93,11 @@ services:
       # Optional attachment delivery — uncomment with the volume(s) below:
       # PEAT_NODE_ATTACHMENT_ROOT: ${ATTACHMENT_ROOT}
       # PEAT_NODE_ATTACHMENT_INBOX: ${ATTACHMENT_INBOX}
+      # Hands-off mode: on the SENDER, also set the outbox watcher so files
+      # dropped into the root auto-distribute (AllNodes) with no SendAttachments
+      # call. The RECEIVER's inbox watcher (enabled by ATTACHMENT_INBOX above)
+      # already auto-fetches + writes them — together = a synced folder.
+      # PEAT_NODE_ATTACHMENT_OUTBOX_WATCH: "true"
     ports:
       # gRPC / Connect API. On separate machines each host owns :50051; when
       # simulating two nodes on ONE host, give each a distinct host-side port.
