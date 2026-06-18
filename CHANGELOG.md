@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-06-18
+
 ### Fixed
 
 - **Empty `PEAT_NODE_*` env vars no longer crash startup.** An empty
