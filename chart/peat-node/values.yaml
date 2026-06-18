@@ -176,6 +176,28 @@ attachment:
 # same-host peer discovery.
 disableMdns: true
 
+# -- Kubernetes peer-discovery via EndpointSlice watching (peat-node#63).
+# Requires peat-mesh >= 0.9.0-rc.39 (deterministic iroh keypair feature).
+# When enabled:
+#   - A ServiceAccount, Role, and RoleBinding are created for EndpointSlice RBAC.
+#   - A headless Service is created so K8s generates EndpointSlices for this Deployment.
+#   - POD_NAME is injected via the downward API so each pod can derive its iroh identity.
+#   - Each pod derives a deterministic iroh SecretKey from (sharedKey, POD_NAME) using
+#     HKDF-SHA256 — peers can compute each other's EndpointId without out-of-band exchange.
+# NOTE: K8s discovery requires a fixed iroh UDP port. Set irohUdpPort to a non-zero
+# value when enabling discovery so EndpointSlices carry the correct port.
+discovery:
+  enabled: false
+  # Namespace to watch for EndpointSlices. Defaults to the release namespace.
+  namespace: ""
+  # Label selector used by KubernetesDiscovery to filter peer pods.
+  # Must match the labels on peat-node pods in the target namespace.
+  labelSelector: "app.kubernetes.io/name=peat-node"
+  # Annotation prefix for peat-mesh metadata on pod objects.
+  annotationPrefix: "peat."
+  # EndpointSlice poll interval (seconds).
+  intervalSecs: 30
+
 # -- Verbose logging
 verbose: false
 

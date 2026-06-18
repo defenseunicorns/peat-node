@@ -24,6 +24,7 @@ async fn test_node_with_encryption(
         tombstone_ttl_hours: None,
         gc_interval_secs: None,
         gc_batch_size: None,
+        ..Default::default()
     })
     .await
     .expect("failed to create node")

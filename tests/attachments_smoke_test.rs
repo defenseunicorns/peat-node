@@ -71,6 +71,7 @@ async fn boot_server_with_attachments(port: u16) -> BootedServer {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -110,6 +111,7 @@ async fn boot_server_without_attachments(port: u16) -> String {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),

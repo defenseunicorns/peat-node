@@ -40,6 +40,7 @@ async fn sidecar_binds_unix_socket_path_and_accepts_connection() {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .expect("boot node"),

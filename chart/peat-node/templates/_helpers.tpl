@@ -147,6 +147,28 @@ Usage in a parent chart:
     - name: PEAT_NODE_DISABLE_MDNS
       value: "true"
     {{- end }}
+    {{- /* POD_NAME — downward API; always injected (useful for logs and
+           required by K8s peer discovery for deterministic iroh keypair
+           derivation). */}}
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    {{- /* Kubernetes peer discovery (peat-node#63). */}}
+    {{- if .Values.discovery.enabled }}
+    - name: PEAT_NODE_ENABLE_KUBERNETES_DISCOVERY
+      value: "true"
+    - name: PEAT_NODE_DISCOVERY_LABEL_SELECTOR
+      value: {{ .Values.discovery.labelSelector | quote }}
+    - name: PEAT_NODE_DISCOVERY_ANNOTATION_PREFIX
+      value: {{ .Values.discovery.annotationPrefix | quote }}
+    - name: PEAT_NODE_DISCOVERY_INTERVAL_SECS
+      value: {{ .Values.discovery.intervalSecs | int64 | quote }}
+    {{- if .Values.discovery.namespace }}
+    - name: PEAT_NODE_DISCOVERY_NAMESPACE
+      value: {{ .Values.discovery.namespace | quote }}
+    {{- end }}
+    {{- end }}
   ports:
     {{- if hasPrefix "tcp://" .Values.listen }}
     - name: grpc
