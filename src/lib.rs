@@ -1,6 +1,7 @@
 pub mod attachments;
 pub mod crypto;
 pub mod fanout;
+pub mod identity;
 pub mod node;
 pub mod query;
 pub mod service;

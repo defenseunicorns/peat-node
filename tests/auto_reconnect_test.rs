@@ -59,6 +59,7 @@ async fn boot(node_id: &str) -> BootedNode {
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: Some(0),
+            iroh_secret_key: None,
             attachment_config: Default::default(),
             disable_mdns: true,
             tombstone_ttl_hours: None,

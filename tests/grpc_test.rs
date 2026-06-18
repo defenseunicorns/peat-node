@@ -25,6 +25,7 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
             peers: vec![],
             encryption_key,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             attachment_config: Default::default(),
             disable_mdns: true,
             tombstone_ttl_hours: None,

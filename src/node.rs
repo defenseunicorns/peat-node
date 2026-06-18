@@ -49,6 +49,13 @@ pub struct SidecarConfig {
     /// Pin this for deployments where peers need a stable address (e.g. Docker Compose
     /// or any case relying on direct peer-to-peer reachability instead of a relay).
     pub iroh_udp_port: Option<u16>,
+    /// Deterministic iroh identity seed (peat-node#63 gap-4d). When `Some`, the
+    /// iroh endpoint binds this fixed 32-byte secret key so the node's
+    /// `EndpointId` is stable across restarts and computable offline by any
+    /// holder of the shared key (see [`crate::identity`]). When `None`, iroh
+    /// mints a random per-process identity. Derived in `main` from
+    /// `(shared_key, node_id)`.
+    pub iroh_secret_key: Option<[u8; 32]>,
     /// Blob-download stall threshold. `None` uses peat-mesh's default (30s).
     /// Lower it (e.g. 3-5s) for redundant-peer deployments where an
     /// unreachable preferred peer otherwise costs the full stall on the
@@ -101,6 +108,7 @@ impl Default for SidecarConfig {
             peers: Vec::new(),
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             blob_stall_timeout: None,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
@@ -290,6 +298,12 @@ impl SidecarNode {
         backend_cfg.cipher = None;
         backend_cfg.ttl_config = ttl_config;
         backend_cfg.gc_config = gc_config;
+        // Deterministic iroh identity (peat-node#63 gap-4d). `Some` → the
+        // endpoint binds a fixed keypair seeded from (shared_key, node_id) so
+        // the EndpointId is stable across restarts and computable offline by
+        // peers; `None` → iroh's random per-process identity. See
+        // [`crate::identity`].
+        backend_cfg.iroh_secret_key = config.iroh_secret_key;
 
         // peat-node#63 — deterministic iroh keypair for K8s peer discovery.
         // All pods in the same formation derive their iroh SecretKey from

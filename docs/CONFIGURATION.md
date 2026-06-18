@@ -9,22 +9,22 @@ if you add or rename a flag, update this file in the same PR.
 | Env var | Flag | Type | Default | Description |
 |---|---|---|---|---|
 | `PEAT_NODE_LISTEN` | `--listen` | string | `tcp://0.0.0.0:50051` | Listen address. Use `unix:///path/to/sock` for a Unix socket or `tcp://HOST:PORT` for TCP. The single port serves Connect RPC, gRPC, and gRPC-Web. |
-| `PEAT_NODE_DATA_DIR` | `--data-dir` | path | `/data/peat-node` | Persistent data directory. Contains the Automerge CRDT store under `automerge/` and the Iroh blob store under `iroh/`. Endpoint ID is stable across restarts as long as this directory persists. |
+| `PEAT_NODE_DATA_DIR` | `--data-dir` | path | `/data/peat-node` | Persistent data directory. Contains the Automerge CRDT store under `automerge/` and the Iroh blob store under `iroh/`. Note: the iroh **endpoint ID is not derived from this directory** — it is seeded deterministically from `(PEAT_NODE_SHARED_KEY, PEAT_NODE_NODE_ID)` (see [Deterministic identity](#deterministic-identity--offline-peer-id-derivation)), so it is stable across restarts and even across data-dir wipes, as long as those two inputs are unchanged. |
 
 ## Identity & formation
 
 | Env var | Flag | Type | Default | Description |
 |---|---|---|---|---|
-| `PEAT_NODE_NODE_ID` | `--node-id` | string | random UUID | Stable identifier for this node. Surfaces in `GetStatus.nodeId`. |
+| `PEAT_NODE_NODE_ID` | `--node-id` | string | random UUID | Stable identifier for this node. Surfaces in `GetStatus.nodeId`, **and seeds the deterministic iroh identity** (see [Deterministic identity](#deterministic-identity--offline-peer-id-derivation)). Set this to a stable value in any peered deployment — the default random UUID changes every boot, so the endpoint ID would too. |
 | `PEAT_NODE_APP_ID` | `--app-id` | string | `peat-default` | Formation / application identifier. Two nodes must share this AND the shared key to authenticate as peers. |
-| `PEAT_NODE_SHARED_KEY` | `--shared-key` | base64 | `""` | Base64-encoded 32-byte shared secret used to derive the formation key. Generate with `head -c 32 /dev/urandom \| base64`. |
+| `PEAT_NODE_SHARED_KEY` | `--shared-key` | base64 | `""` | Base64-encoded 32-byte shared secret used to derive the formation key. Generate with `head -c 32 /dev/urandom \| base64`. Also the HKDF input keying material for the deterministic iroh identity — any holder of this key can compute any node's endpoint ID from its `node_id`. |
 
 ## Peering
 
 | Env var | Flag | Type | Default | Description |
 |---|---|---|---|---|
 | `PEAT_NODE_IROH_UDP_PORT` | `--iroh-udp-port` | u16 | unset (ephemeral) | Bind the Iroh QUIC endpoint to a specific UDP port. **Pin this** for any deployment where peers reach this node via a stable host:port — Docker Compose, fleet-managed sidecars, anywhere the n0 public relay isn't (and shouldn't be) in the picture. |
-| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Peers in `endpoint_id@host:port` form, one per entry. The comma separates peers, not addresses within a peer — for multiple reachable addresses for one peer, use the `ConnectPeer` RPC at runtime. A bare endpoint ID is rejected (logged as an error and skipped); the n0 public relay is no longer used by default, so the peer's reachable address must be supplied alongside its ID. |
+| `PEAT_NODE_PEERS` | `--peer` | comma-separated | `""` | Peers in `endpoint_id@host:port` form, one per entry. The comma separates peers, not addresses within a peer — for multiple reachable addresses for one peer, use the `ConnectPeer` RPC at runtime. A bare endpoint ID is rejected (logged as an error and skipped); the n0 public relay is no longer used by default, so the peer's reachable address must be supplied alongside its ID. **You don't have to boot a peer to learn its `endpoint_id`** — compute it offline with `peat-node derive-id` (see [Deterministic identity](#deterministic-identity--offline-peer-id-derivation)). |
 | `PEAT_NODE_AUTO_SYNC` | `--auto-sync` | bool | `true` | If true, `StartSync` is invoked once startup completes. Set `false` to require an explicit `StartSync` RPC. |
 
 ### Relay
@@ -32,6 +32,65 @@ if you add or rename a flag, update this file in the same PR.
 The n0 public relay pool (`*.relay.iroh.network`) is **disabled by default**. Two endpoints peer either via direct UDP addresses (passed through `ConnectPeer.addresses`) or via an explicit relay URL the caller provides through `ConnectPeer.relay_url`. There is no implicit public-internet dependency.
 
 Production deployments that need relay-assisted NAT traversal can run their own relay (or use a known one) and pass its URL on each `ConnectPeer` call. A future env var may pin a default relay URL — track [#41](https://github.com/defenseunicorns/peat-node/issues/41) for the design.
+
+### Deterministic identity & offline peer-id derivation
+
+iroh is an **identity-addressed** transport: a peer is dialed by its public key (`endpoint_id`), and the IP:port in `PEAT_NODE_PEERS` is only a routing hint. The QUIC/TLS handshake verifies the node answering at that address actually holds the private key for that `endpoint_id` — so peering *requires* knowing each peer's id, and IP:port alone can never authenticate a peer.
+
+To make that id knowable without an out-of-band exchange, peat-node derives the iroh keypair deterministically:
+
+```
+endpoint_id = public_key( HKDF-SHA256(salt = none,
+                                      IKM  = base64_decode(PEAT_NODE_SHARED_KEY),
+                                      info = "iroh:" + PEAT_NODE_NODE_ID) )
+```
+
+Consequences:
+
+- **Stable across restarts.** Given a stable `PEAT_NODE_NODE_ID`, a node presents the same `endpoint_id` on every boot — and even after a `data_dir` wipe. (Without this, iroh mints a fresh random keypair on every start, so a hardcoded `PEAT_NODE_PEERS` entry goes stale the moment a peer restarts.)
+- **Computable offline.** Any holder of the shared key can compute *any* node's `endpoint_id` from its `node_id` alone — no booting the node, no network, no access to the remote machine.
+- **Identical to peat-mesh's discovery derivation**, so deterministic-identity nodes interoperate with mDNS/Kubernetes-discovered peers.
+
+> Requires a **stable `PEAT_NODE_NODE_ID`** and a non-empty `PEAT_NODE_SHARED_KEY`. If `PEAT_NODE_NODE_ID` is left unset (random UUID per boot), identity is *not* stable and peat-node logs a startup warning. With an empty shared key, identity falls back to iroh's random per-process key.
+
+#### `peat-node derive-id`
+
+Compute a peer's `endpoint_id` offline, for filling in `PEAT_NODE_PEERS`:
+
+```bash
+peat-node derive-id --shared-key "$PEAT_NODE_SHARED_KEY" --node-id node-b
+# 4229afe8d9c12d0acfd98cb56d4e2edd0e844442651a70a6995c2ed7ef100684
+```
+
+It prints only the id to stdout (pipe/`$(...)`-friendly) and never touches the network.
+
+#### Cross-machine peering (no mDNS, no access to the remote node)
+
+Two machines on different hosts — `node-a` at `10.0.0.10`, `node-b` at `10.0.0.20` — sharing a formation key `$K`. You configure both from one machine, knowing only IPs, ports, and the names you assign:
+
+```bash
+# Offline, on any machine that has $K:
+A_ID=$(peat-node derive-id --shared-key "$K" --node-id node-a)
+B_ID=$(peat-node derive-id --shared-key "$K" --node-id node-b)
+```
+
+**node-a** (`10.0.0.10`):
+```
+PEAT_NODE_NODE_ID=node-a
+PEAT_NODE_SHARED_KEY=$K
+PEAT_NODE_IROH_UDP_PORT=51071
+PEAT_NODE_PEERS=$B_ID@10.0.0.20:51072
+```
+
+**node-b** (`10.0.0.20`):
+```
+PEAT_NODE_NODE_ID=node-b
+PEAT_NODE_SHARED_KEY=$K
+PEAT_NODE_IROH_UDP_PORT=51072
+PEAT_NODE_PEERS=$A_ID@10.0.0.10:51071
+```
+
+Publish the **UDP** `PEAT_NODE_IROH_UDP_PORT` on each host (and open it in the firewall) — iroh's QUIC traffic must cross the host boundary; the gRPC TCP port alone is not enough. When `node-b` boots, it derives the same keypair from `(K, "node-b")` and presents exactly the `$B_ID` you wrote into `node-a`'s `PEAT_NODE_PEERS`. Nothing was discovered; everything was assigned. See `examples/compose/attachments/docker-compose.multi-host.yml`.
 
 ## Encryption at rest
 

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-06-18
+
+### Added
+
+- **Deterministic iroh identity for static peering + offline `peat-node derive-id`** — a node's `EndpointId` is seeded from `HKDF-SHA256(shared_key, "iroh:" + node_id)` (the same derivation Kubernetes discovery uses, now shared through `crypto::derive_iroh_node_key` so the two can't drift), making it stable across restarts and computable offline by any holder of the shared key. The new `derive-id --shared-key --node-id` subcommand prints a peer's id for `PEAT_NODE_PEERS` with no boot, no network, and no access to the peer — enabling multi-machine static peering where mDNS is unavailable. Adds `examples/compose/attachments/docker-compose.multi-host.yml` and a "Deterministic identity" section in `docs/CONFIGURATION.md`. ([#162](https://github.com/defenseunicorns/peat-node/pull/162))
+
+### Fixed
+
+- **Chart version drift** — `Chart.yaml` `version`/`appVersion` (was 0.3.7) and the default image `tag` in `values.yaml` (was v0.3.3) now track the release. ([#162](https://github.com/defenseunicorns/peat-node/pull/162))
+
 ## [0.4.2] - 2026-06-18
 
 ### Added
