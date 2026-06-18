@@ -27,7 +27,7 @@ Consumers in other languages talk to the sidecar directly over the Connect-RPC w
 - Editing `proto/sidecar.proto` — **the wire contract**; changes ripple to the Rust server code and any external consumer that generates from it
 - Editing `chart/peat-node/` (Helm chart) or `zarf.yaml` (Zarf packaging)
 - Editing `test/cross-cluster-sync.sh` or the in-tree Rust integration tests
-- Bumping the pinned `peat-mesh` version (currently `=0.9.0-rc.7`)
+- Bumping the pinned `peat-mesh` version (currently `=0.9.0-rc.40`)
 
 ## Scope
 
@@ -88,7 +88,7 @@ The hook runs `cargo fmt --check` and `cargo clippy --workspace --all-targets --
 | "I'll fix the clippy warning later." | The CI gate is `-D warnings`. There is no later. |
 | "I'll add this new endpoint as a Rust-only handler — easier than touching proto." | Proto-first. New endpoints go in `sidecar.proto` first; the Rust server follows. Consumers can't talk to a Rust-only endpoint. |
 | "I'll skip the cross-cluster sync test — `cargo test` passes." | DDIL fleet sync is the product. Cross-cluster test catches network-partition / re-convergence bugs unit tests don't. |
-| "I'll bump `peat-mesh` to the latest RC." | The pin (`=0.9.0-rc.7`) is intentional. Bumps need full integration validation and possibly chart/Zarf updates. |
+| "I'll bump `peat-mesh` to the latest RC." | The pin (`=0.9.0-rc.40`) is intentional. Bumps need full integration validation and possibly chart/Zarf updates. |
 | "I'll inline the encryption-at-rest call without zeroization — it's only briefly in memory." | `aes-gcm` material lives in security-sensitive paths. Use the established zeroization patterns; don't introduce un-zeroized handling. |
 | "I'll add a Go/TS/Python SDK directly to this repo for a quick consumer integration." | No SDKs live in this repo. Typed clients generate from `proto/sidecar.proto` in the consumer's own repo, or front the sidecar with `peat-gateway` per ADR-043. |
 

@@ -34,7 +34,7 @@ services:
     # SubscribeAttachmentBundle one frame short of terminal. For
     # testing local changes, comment out `image:` and uncomment the
     # `build:` block.
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.1
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-a
@@ -57,7 +57,7 @@ services:
       - ./outbox-a:/var/lib/peat/outbox:ro
 
   peat-node-b:
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.1
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-b

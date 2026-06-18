@@ -97,7 +97,7 @@ ls inbox-b/                                # files appear here per distribution_
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
-(Pulls `ghcr.io/defenseunicorns/peat-node:v0.3.1`. For testing local
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.1`. For testing local
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 
@@ -122,3 +122,35 @@ When `send.sh` is pointed at A, B's inbox accumulates
 `inbox-b/{distribution_id}/{filename}` for each successful delivery.
 Apps watching the inbox can correlate a `distribution_id` back to the
 sender via `GetAttachmentDistribution`.
+
+## Multi-host delivery (separate machines, no mDNS)
+
+The two-node setup above puts both nodes on one Docker network and peers them
+with `peer.sh` (a runtime `ConnectPeer` that reads each node's `endpoint_id`
+from `GetStatus`). That doesn't work when the nodes are on **different
+machines** and you can't reach the remote one to read its output, or when mDNS
+is unavailable across subnets.
+
+[`docker-compose.multi-host.yml`](./docker-compose.multi-host.yml) solves this
+with **deterministic identity**: a node's iroh `endpoint_id` is
+`HKDF-SHA256(shared_key, "iroh:" + node_id)`, so you compute *both* nodes' ids
+offline, on one machine, before anything boots — then bake them into each
+machine's `PEAT_NODE_PEERS`:
+
+```bash
+K="<base64 32-byte shared key>"
+A_ID=$(peat-node derive-id --shared-key "$K" --node-id node-a)
+B_ID=$(peat-node derive-id --shared-key "$K" --node-id node-b)
+# Put $B_ID in machine A's PEAT_NODE_PEERS, $A_ID in machine B's. Done.
+```
+
+Each machine runs one node with its own `.env` (node id, shared key, iroh UDP
+port, and the peer's derived id @ its IP:port). No `peer.sh`, no `GetStatus`
+round-trip, no mDNS. See the header of `docker-compose.multi-host.yml` for the
+full per-machine `.env` and the firewall/UDP-publish note, and
+[`docs/CONFIGURATION.md` → Deterministic identity](../../../docs/CONFIGURATION.md#deterministic-identity--offline-peer-id-derivation)
+for the full reference.
+
+> Deterministic identity + `derive-id` ship in the release **after v0.4.1**.
+> Pin that image tag in `docker-compose.multi-host.yml` once it's published;
+> until then, use the commented `build:` block to build from the repo root.
