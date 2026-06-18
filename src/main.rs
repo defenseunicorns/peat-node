@@ -269,6 +269,44 @@ struct Args {
         default_value_t = peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS
     )]
     attachment_inbox_poll_secs: u32,
+
+    // --- Kubernetes peer discovery (peat-node#63) ---
+    /// Enable Kubernetes EndpointSlice-based peer discovery for in-cluster
+    /// deployments. Requires the `POD_NAME` env var (set via Kubernetes
+    /// downward API) and a non-empty `--shared-key`. Disable mDNS with
+    /// `--disable-mdns` in the same deployment. Default: false (off).
+    #[arg(
+        long,
+        env = "PEAT_NODE_ENABLE_KUBERNETES_DISCOVERY",
+        default_value = "false"
+    )]
+    enable_kubernetes_discovery: bool,
+
+    /// Kubernetes namespace to watch for EndpointSlice resources. Default:
+    /// reads from the service-account namespace mount, falls back to `default`.
+    #[arg(long, env = "PEAT_NODE_DISCOVERY_NAMESPACE")]
+    discovery_namespace: Option<String>,
+
+    /// Label selector for EndpointSlice resources. Default: `app=peat-node`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_DISCOVERY_LABEL_SELECTOR",
+        default_value = "app=peat-node"
+    )]
+    discovery_label_selector: String,
+
+    /// Annotation prefix for peer metadata in EndpointSlice annotations.
+    /// Default: `peat.`.
+    #[arg(
+        long,
+        env = "PEAT_NODE_DISCOVERY_ANNOTATION_PREFIX",
+        default_value = "peat."
+    )]
+    discovery_annotation_prefix: String,
+
+    /// EndpointSlice re-list interval in seconds. Default: 30.
+    #[arg(long, env = "PEAT_NODE_DISCOVERY_INTERVAL_SECS", default_value = "30")]
+    discovery_interval_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -395,6 +433,11 @@ async fn main() -> anyhow::Result<()> {
         gc_interval_secs: args.gc_interval_secs,
         gc_batch_size: args.gc_batch_size,
         attachment_config,
+        enable_kubernetes_discovery: args.enable_kubernetes_discovery,
+        kubernetes_discovery_namespace: args.discovery_namespace,
+        kubernetes_discovery_label_selector: args.discovery_label_selector,
+        kubernetes_discovery_annotation_prefix: args.discovery_annotation_prefix,
+        kubernetes_discovery_interval_secs: args.discovery_interval_secs,
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);

@@ -32,6 +32,7 @@ async fn fresh_service() -> (Arc<SidecarNode>, PeatSidecarService) {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .expect("boot node"),
@@ -190,6 +191,7 @@ async fn set_collection_config_persists_to_disk() {
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .expect("boot node"),

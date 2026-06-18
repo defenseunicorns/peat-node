@@ -14,8 +14,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
-use peat_mesh::discovery::{DiscoveryEvent, DiscoveryStrategy, MdnsDiscovery, PeerInfo};
+use base64::Engine as _;
+use peat_mesh::discovery::{
+    DiscoveryEvent, DiscoveryStrategy, KubernetesDiscovery, KubernetesDiscoveryConfig,
+    MdnsDiscovery, PeerInfo,
+};
 use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
@@ -74,6 +79,48 @@ pub struct SidecarConfig {
     /// unavailable or undesired (Kubernetes, air-gapped networks). Mirrors
     /// `PeatCredentials::disable_mdns` in `peat-cli`.
     pub disable_mdns: bool,
+    // --- Kubernetes peer discovery (peat-node#63) ---
+    /// Enable EndpointSlice-based peer discovery for in-cluster deployments.
+    /// When `true`, a `KubernetesDiscovery` watcher is started. Requires
+    /// `POD_NAME` env var (Kubernetes downward API) and a non-empty `shared_key`
+    /// for deterministic iroh keypair derivation; if either is absent, K8s
+    /// discovery is skipped with a warn log.
+    pub enable_kubernetes_discovery: bool,
+    /// Kubernetes namespace to watch. `None` → reads from the service-account
+    /// mount (`/var/run/secrets/kubernetes.io/serviceaccount/namespace`), falls
+    /// back to `"default"`.
+    pub kubernetes_discovery_namespace: Option<String>,
+    /// Label selector for EndpointSlice resources. Defaults to `"app=peat-node"`.
+    pub kubernetes_discovery_label_selector: String,
+    /// Annotation prefix for extracting peer metadata. Defaults to `"peat."`.
+    pub kubernetes_discovery_annotation_prefix: String,
+    /// EndpointSlice re-list interval in seconds. Defaults to 30.
+    pub kubernetes_discovery_interval_secs: u64,
+}
+
+impl Default for SidecarConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            app_id: String::new(),
+            shared_key: String::new(),
+            data_dir: PathBuf::new(),
+            peers: Vec::new(),
+            encryption_key: None,
+            iroh_udp_port: None,
+            blob_stall_timeout: None,
+            tombstone_ttl_hours: None,
+            gc_interval_secs: None,
+            gc_batch_size: None,
+            attachment_config: AttachmentConfig::default(),
+            disable_mdns: false,
+            enable_kubernetes_discovery: false,
+            kubernetes_discovery_namespace: None,
+            kubernetes_discovery_label_selector: "app=peat-node".to_string(),
+            kubernetes_discovery_annotation_prefix: "peat.".to_string(),
+            kubernetes_discovery_interval_secs: 30,
+        }
+    }
 }
 
 /// Manages the full Peat mesh stack and exposes operations for the gRPC service.
@@ -118,6 +165,10 @@ pub struct SidecarNode {
     /// Kept alive so mDNS advertisement and browsing continue for the
     /// node lifetime. `None` when mDNS is disabled or failed to init.
     _mdns: Option<MdnsDiscovery>,
+    /// Kept alive so K8s EndpointSlice watching continues for the node
+    /// lifetime. `None` when `--enable-kubernetes-discovery` is false or
+    /// discovery failed to start.
+    _k8s_discovery: Option<KubernetesDiscovery>,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -252,6 +303,45 @@ impl SidecarNode {
         // peers; `None` → iroh's random per-process identity. See
         // [`crate::identity`].
         backend_cfg.iroh_secret_key = config.iroh_secret_key;
+
+        // peat-node#63 — deterministic iroh keypair for K8s peer discovery.
+        // All pods in the same formation derive their iroh SecretKey from
+        // HKDF-SHA256(ikm=shared_key, info="iroh:"+pod_name) so any peer can
+        // compute any other pod's EndpointId from its pod name alone.
+        // Requires POD_NAME env var (Kubernetes downward API) and a non-empty
+        // shared_key. Absent either, we skip derivation and let iroh generate
+        // a random key — K8s discovery will still start but won't be able to
+        // dial discovered pods (connect_peer will fail to parse the pod name
+        // as an iroh EndpointId and skip them), so a warn is logged.
+        let pod_name: Option<String> = std::env::var("POD_NAME").ok().filter(|s| !s.is_empty());
+        if config.enable_kubernetes_discovery {
+            // Decision extracted into `resolve_k8s_identity` (pure, tested) so
+            // the (POD_NAME, shared_key) matrix is covered without a cluster.
+            match resolve_k8s_identity(pod_name.as_deref(), &config.shared_key) {
+                K8sIdentity::Derived(seed) => {
+                    backend_cfg.iroh_secret_key = Some(seed);
+                    info!(
+                        pod_name = pod_name.as_deref().unwrap_or_default(),
+                        "K8s discovery: deterministic iroh keypair derived"
+                    );
+                }
+                K8sIdentity::MissingPodName => {
+                    warn!(
+                        "K8s discovery enabled but POD_NAME env var is not set — \
+                         iroh keypair will be random; peer discovery will not work"
+                    );
+                }
+                K8sIdentity::EmptySharedKey => {
+                    warn!(
+                        "K8s discovery enabled but shared_key is empty — \
+                         iroh keypair will be random; peer discovery will not work"
+                    );
+                }
+                K8sIdentity::InvalidSharedKey => {
+                    return Err(anyhow::anyhow!("shared_key base64 decode failed"));
+                }
+            }
+        }
 
         let backend = AutomergeBackend::with_iroh(backend_cfg).await?;
 
@@ -569,6 +659,57 @@ impl SidecarNode {
             }
         };
 
+        // ── Kubernetes EndpointSlice peer discovery ──────────────────────────
+        // peat-node#63. Only active when --enable-kubernetes-discovery is set.
+        // Uses HKDF-SHA256-derived iroh keys so pods can dial each other by
+        // pod name; see the deterministic keypair derivation above.
+        let k8s_discovery = if config.enable_kubernetes_discovery {
+            let k8s_cfg = KubernetesDiscoveryConfig {
+                namespace: config.kubernetes_discovery_namespace.clone(),
+                label_selector: config.kubernetes_discovery_label_selector.clone(),
+                annotation_prefix: config.kubernetes_discovery_annotation_prefix.clone(),
+                poll_interval: Duration::from_secs(config.kubernetes_discovery_interval_secs),
+            };
+            let mut discovery = KubernetesDiscovery::new(k8s_cfg);
+            match discovery.start().await {
+                Err(e) => {
+                    warn!(
+                        "K8s discovery start failed (running outside a cluster?): {e}; \
+                         continuing without K8s peer discovery"
+                    );
+                    None
+                }
+                Ok(()) => {
+                    if let Ok(rx) = discovery.event_stream() {
+                        let backend_arc = Arc::clone(&backend);
+                        let shared_key_bytes = if config.shared_key.is_empty() {
+                            Vec::new()
+                        } else {
+                            // Non-empty shared_key was already validated as
+                            // base64 during backend construction
+                            // (`FormationKey::from_base64`), so this cannot
+                            // fail here. `.expect` (not `.unwrap_or_default`)
+                            // so a future regression in that upstream
+                            // validation panics loudly rather than silently
+                            // deriving empty-IKM seeds that fail every dial.
+                            base64::engine::general_purpose::STANDARD
+                                .decode(&config.shared_key)
+                                .expect("shared_key base64 validated during backend construction")
+                        };
+                        let our_pod = pod_name.clone();
+                        tokio::spawn(async move {
+                            Self::k8s_discovery_watcher(backend_arc, rx, shared_key_bytes, our_pod)
+                                .await;
+                        });
+                    }
+                    info!("K8s peer discovery started");
+                    Some(discovery)
+                }
+            }
+        } else {
+            None
+        };
+
         // Load per-collection lifecycle configs (peat-node#55).
         let collection_configs_path = config.data_dir.join("collection_configs.json");
         let collection_configs: HashMap<String, CollectionConfigEntry> =
@@ -605,6 +746,7 @@ impl SidecarNode {
             collection_configs: Arc::new(RwLock::new(collection_configs)),
             collection_configs_path,
             _mdns: mdns,
+            _k8s_discovery: k8s_discovery,
         })
     }
 
@@ -674,6 +816,69 @@ impl SidecarNode {
                             auth_failed.insert(peer.node_id.clone());
                         }
                         warn!(peer = %peer.node_id, %addr, "mDNS: connect failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Background task: connect to K8s-discovered pods as they appear in
+    /// EndpointSlices (peat-node#63).
+    ///
+    /// Each pod's iroh `EndpointId` is derived deterministically from
+    /// `HKDF-SHA256(shared_key_bytes, "iroh:" + pod_name)` — the same formula
+    /// used to set `AutomergeBackendConfig::iroh_secret_key` at startup, so the
+    /// derived endpoint ID matches the peer's actual endpoint ID.
+    async fn k8s_discovery_watcher(
+        backend: Arc<AutomergeBackend>,
+        mut rx: tokio::sync::mpsc::Receiver<DiscoveryEvent>,
+        shared_key_bytes: Vec<u8>,
+        our_pod_name: Option<String>,
+    ) {
+        while let Some(event) = rx.recv().await {
+            let peer = match event {
+                DiscoveryEvent::PeerFound(p) | DiscoveryEvent::PeerUpdated(p) => p,
+                DiscoveryEvent::PeerLost(_) => continue,
+            };
+            // Decision extracted into `k8s_dial_decision` (pure, tested): skip
+            // self, skip no-addresses, skip already-connected, else dial.
+            let connected = backend.transport().connected_peers();
+            let peer_id = match k8s_dial_decision(
+                &peer,
+                our_pod_name.as_deref(),
+                &shared_key_bytes,
+                &connected,
+            ) {
+                K8sDialDecision::SkipSelf | K8sDialDecision::SkipAlreadyConnected => continue,
+                K8sDialDecision::SkipNoAddresses => {
+                    debug!(pod = %peer.node_id, "K8s discovery: no addresses, skipping");
+                    continue;
+                }
+                K8sDialDecision::Dial(peer_id) => peer_id,
+            };
+            for addr in &peer.addresses {
+                let registration = PeerRegistration {
+                    addresses: vec![addr.to_string()],
+                    relay_url: String::new(),
+                    next_attempt: std::time::Instant::now(),
+                    backoff: RECONNECT_BACKOFF_MIN,
+                };
+                match Self::dial_and_attach(&backend, peer_id, &registration).await {
+                    Ok(()) => {
+                        info!(
+                            pod = %peer.node_id,
+                            %addr,
+                            endpoint_id = %peer_id.fmt_short(),
+                            "K8s discovery: connected to peer"
+                        );
+                        let _ = backend
+                            .coordinator()
+                            .sync_all_documents_with_peer(peer_id)
+                            .await;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(pod = %peer.node_id, %addr, "K8s discovery: connect failed: {e}");
                     }
                 }
             }
@@ -1323,4 +1528,176 @@ pub struct PeerInfoInternal {
     pub endpoint_id: String,
     pub addresses: Vec<String>,
     pub connected: bool,
+}
+
+// ── Kubernetes-discovery decision helpers ───────────────────────────────────
+//
+// Pure functions extracted from `SidecarNode::new` and `k8s_discovery_watcher`
+// so the highest-risk discovery logic — the (POD_NAME, shared_key) startup
+// matrix and the per-peer dial decision — is hermetically testable without a
+// kube-apiserver (peat-node#63 QA follow-up).
+
+/// Outcome of resolving the deterministic iroh-identity inputs for K8s
+/// discovery from the `(POD_NAME, shared_key)` pair.
+#[derive(Debug, PartialEq, Eq)]
+enum K8sIdentity {
+    /// Both inputs present and valid — the derived 32-byte iroh secret seed.
+    Derived([u8; 32]),
+    /// `POD_NAME` env var absent or empty.
+    MissingPodName,
+    /// `shared_key` empty.
+    EmptySharedKey,
+    /// `shared_key` present but not valid base64.
+    InvalidSharedKey,
+}
+
+/// Resolve the deterministic iroh seed. Precedence matches the original
+/// inline matrix: derive only when both a non-empty pod name and a non-empty
+/// shared key are present; otherwise classify the missing/invalid input.
+fn resolve_k8s_identity(pod_name: Option<&str>, shared_key: &str) -> K8sIdentity {
+    match (pod_name, shared_key) {
+        (Some(pn), sk) if !pn.is_empty() && !sk.is_empty() => {
+            match base64::engine::general_purpose::STANDARD.decode(sk) {
+                Ok(bytes) => K8sIdentity::Derived(derive_iroh_node_key(&bytes, pn)),
+                Err(_) => K8sIdentity::InvalidSharedKey,
+            }
+        }
+        (None, _) | (Some(""), _) => K8sIdentity::MissingPodName,
+        _ => K8sIdentity::EmptySharedKey,
+    }
+}
+
+/// Dial decision for a single discovered K8s peer.
+#[derive(Debug, PartialEq, Eq)]
+enum K8sDialDecision {
+    /// The peer is this node — don't dial ourselves.
+    SkipSelf,
+    /// EndpointSlice carried no addresses yet.
+    SkipNoAddresses,
+    /// Already connected to this peer.
+    SkipAlreadyConnected,
+    /// Dial the peer at its (deterministically derived) endpoint id.
+    Dial(iroh::EndpointId),
+}
+
+/// Decide whether/whom to dial for a discovered peer. The peer's endpoint id is
+/// derived from `(shared_key_bytes, peer.node_id)` — the same derivation every
+/// node uses for its own identity, so the derived id matches the peer's actual
+/// wire identity.
+fn k8s_dial_decision(
+    peer: &PeerInfo,
+    our_pod_name: Option<&str>,
+    shared_key_bytes: &[u8],
+    connected: &[iroh::EndpointId],
+) -> K8sDialDecision {
+    if our_pod_name == Some(peer.node_id.as_str()) {
+        return K8sDialDecision::SkipSelf;
+    }
+    if peer.addresses.is_empty() {
+        return K8sDialDecision::SkipNoAddresses;
+    }
+    let peer_id =
+        iroh::SecretKey::from_bytes(&derive_iroh_node_key(shared_key_bytes, &peer.node_id))
+            .public();
+    if connected.contains(&peer_id) {
+        return K8sDialDecision::SkipAlreadyConnected;
+    }
+    K8sDialDecision::Dial(peer_id)
+}
+
+#[cfg(test)]
+mod k8s_discovery_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    // base64 of 32 bytes of 0x2a — a valid full-length formation secret.
+    const KEY_B64: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+    fn key_bytes() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(KEY_B64)
+            .unwrap()
+    }
+    fn peer(node_id: &str, addrs: &[&str]) -> PeerInfo {
+        PeerInfo::new(
+            node_id.to_string(),
+            addrs
+                .iter()
+                .map(|a| a.parse::<SocketAddr>().unwrap())
+                .collect(),
+        )
+    }
+    fn endpoint_for(node_id: &str) -> iroh::EndpointId {
+        iroh::SecretKey::from_bytes(&derive_iroh_node_key(&key_bytes(), node_id)).public()
+    }
+
+    // ── startup (POD_NAME, shared_key) matrix ──
+    #[test]
+    fn resolve_identity_derives_with_both_inputs() {
+        match resolve_k8s_identity(Some("pod-a"), KEY_B64) {
+            K8sIdentity::Derived(seed) => {
+                assert_eq!(seed, derive_iroh_node_key(&key_bytes(), "pod-a"))
+            }
+            other => panic!("expected Derived, got {other:?}"),
+        }
+    }
+    #[test]
+    fn resolve_identity_missing_pod_name() {
+        assert_eq!(
+            resolve_k8s_identity(None, KEY_B64),
+            K8sIdentity::MissingPodName
+        );
+        assert_eq!(
+            resolve_k8s_identity(Some(""), KEY_B64),
+            K8sIdentity::MissingPodName
+        );
+    }
+    #[test]
+    fn resolve_identity_empty_shared_key() {
+        assert_eq!(
+            resolve_k8s_identity(Some("pod-a"), ""),
+            K8sIdentity::EmptySharedKey
+        );
+    }
+    #[test]
+    fn resolve_identity_invalid_base64() {
+        assert_eq!(
+            resolve_k8s_identity(Some("pod-a"), "not!valid!base64!"),
+            K8sIdentity::InvalidSharedKey
+        );
+    }
+
+    // ── per-peer dial decision ──
+    #[test]
+    fn dial_skips_self() {
+        let p = peer("me", &["127.0.0.1:5000"]);
+        assert_eq!(
+            k8s_dial_decision(&p, Some("me"), &key_bytes(), &[]),
+            K8sDialDecision::SkipSelf
+        );
+    }
+    #[test]
+    fn dial_skips_no_addresses() {
+        let p = peer("other", &[]);
+        assert_eq!(
+            k8s_dial_decision(&p, Some("me"), &key_bytes(), &[]),
+            K8sDialDecision::SkipNoAddresses
+        );
+    }
+    #[test]
+    fn dial_skips_already_connected() {
+        let p = peer("other", &["127.0.0.1:5000"]);
+        let connected = vec![endpoint_for("other")];
+        assert_eq!(
+            k8s_dial_decision(&p, Some("me"), &key_bytes(), &connected),
+            K8sDialDecision::SkipAlreadyConnected
+        );
+    }
+    #[test]
+    fn dial_targets_new_peer_with_derived_id() {
+        let p = peer("other", &["127.0.0.1:5000"]);
+        assert_eq!(
+            k8s_dial_decision(&p, Some("me"), &key_bytes(), &[]),
+            K8sDialDecision::Dial(endpoint_for("other"))
+        );
+    }
 }

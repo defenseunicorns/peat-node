@@ -116,7 +116,10 @@ path = "src/main.rs"
 #   Unhealthy before a blackout re-enters at Neutral on reconnect.
 #   30s cooldown matches the watchdog reconnect cycle; explicit reconnect
 #   via `reset_peer_health` supersedes it anyway.
-peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend"] }
+#
+# The `kubernetes` feature gates this PR's `KubernetesDiscovery` wiring
+# (EndpointSlice watch); it's additive on top of rc.40's surface.
+peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
@@ -162,6 +165,12 @@ hex = "0.4"
 # Hashing (PRD-006 attachment ingest streams sha256 alongside blob ingest;
 # also exercised by validate.rs unit tests for hash equality).
 sha2 = "0.10"
+# HKDF-SHA256 for K8s peer discovery deterministic iroh keypair derivation
+# (peat-node#63). FIPS-approved per ADR-049.
+hkdf = "0.12"
+# Required by peat-mesh's `kubernetes` feature (k8s-openapi mandates that the
+# binary crate enables a v1_X feature to select the K8s API version).
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # Deterministic iroh identity (peat-node#63 gap-4d): the endpoint keypair is
 # seeded from HKDF-SHA256(formation_secret, "iroh:" + node_id) so every node's
@@ -205,3 +214,4 @@ rcgen = "0.13"
 # relevant tests pins them to one-at-a-time execution within their
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
+

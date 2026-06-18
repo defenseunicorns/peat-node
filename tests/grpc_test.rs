@@ -31,6 +31,7 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
