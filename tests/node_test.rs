@@ -378,16 +378,9 @@ async fn deterministic_identity_matches_offline_derivation() {
         app_id: "test".to_string(),
         shared_key: KEY.to_string(),
         data_dir: dir.path().to_path_buf(),
-        peers: vec![],
-        encryption_key: None,
-        iroh_udp_port: None,
         iroh_secret_key: Some(seed),
-        blob_stall_timeout: None,
-        tombstone_ttl_hours: None,
-        gc_interval_secs: None,
-        gc_batch_size: None,
-        attachment_config: Default::default(),
         disable_mdns: true,
+        ..Default::default()
     })
     .await
     .expect("node boot");

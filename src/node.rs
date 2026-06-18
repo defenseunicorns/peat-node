@@ -108,6 +108,7 @@ impl Default for SidecarConfig {
             peers: Vec::new(),
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             blob_stall_timeout: None,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,

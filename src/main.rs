@@ -376,7 +376,10 @@ async fn main() -> anyhow::Result<()> {
     // computable offline by peers. Empty shared key → None → iroh's random
     // per-process identity (pre-feature behaviour).
     let iroh_secret_key = identity::derive_iroh_secret_seed(&args.shared_key, &node_id)?;
-    if iroh_secret_key.is_some() && !node_id_explicit {
+    // In Kubernetes-discovery mode the deterministic identity is (re)derived
+    // inside SidecarNode::new from POD_NAME, so a missing PEAT_NODE_NODE_ID is
+    // not a problem there — only warn for the static-peering path.
+    if iroh_secret_key.is_some() && !node_id_explicit && !args.enable_kubernetes_discovery {
         warn!(
             node_id = %node_id,
             "PEAT_NODE_NODE_ID is not set — using a random per-boot node id, so this \

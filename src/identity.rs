@@ -28,11 +28,17 @@
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use hkdf::Hkdf;
-use sha2::Sha256;
+
+use crate::crypto::derive_iroh_node_key;
 
 /// Derive the 32-byte iroh secret-key seed for `node_id` under
 /// `base64_shared_key`.
+///
+/// This is the base64-aware front door for the **static-peering** path; it
+/// decodes the shared key and delegates the actual HKDF to
+/// [`crate::crypto::derive_iroh_node_key`] — the single derivation shared with
+/// the Kubernetes-discovery path, so the two cannot drift (the recipe is pinned
+/// by `crypto`'s known-answer test).
 ///
 /// Returns `Ok(None)` when `base64_shared_key` is empty: with no formation
 /// secret there is nothing to key the identity from, so the caller falls back
@@ -48,11 +54,7 @@ pub fn derive_iroh_secret_seed(base64_shared_key: &str, node_id: &str) -> Result
     let secret = base64::engine::general_purpose::STANDARD
         .decode(trimmed)
         .context("PEAT_NODE_SHARED_KEY is not valid base64")?;
-    let hk = Hkdf::<Sha256>::new(None, &secret);
-    let mut seed = [0u8; 32];
-    hk.expand(format!("iroh:{node_id}").as_bytes(), &mut seed)
-        .expect("HKDF expand with a 32-byte output length never fails");
-    Ok(Some(seed))
+    Ok(Some(derive_iroh_node_key(&secret, node_id)))
 }
 
 /// Derive the iroh `EndpointId` string for `node_id` under `base64_shared_key`,
@@ -122,18 +124,17 @@ mod tests {
         assert!(derive_iroh_secret_seed("not!valid!base64!", "node-a").is_err());
     }
 
-    /// Locks the derivation to the documented recipe. If anyone changes the
-    /// salt, the `"iroh:"` context prefix, or the IKM (e.g. swaps in the
-    /// FormationKey), this fails — which is exactly when a derived peer id
-    /// would stop matching peat-mesh's `PeerConnector`.
+    /// Verifies the static front door delegates to the single shared
+    /// derivation (`crypto::derive_iroh_node_key`) over the base64-decoded key,
+    /// rather than carrying its own HKDF. The recipe itself (salt / `"iroh:"`
+    /// context / IKM) is pinned by `crypto`'s `derive_iroh_node_key_matches_documented_recipe`
+    /// known-answer test, so the two paths cannot drift.
     #[test]
-    fn derives_same_id_as_documented_recipe() {
+    fn delegates_to_shared_crypto_derivation() {
         let secret = base64::engine::general_purpose::STANDARD
             .decode(TEST_KEY)
             .unwrap();
-        let hk = Hkdf::<Sha256>::new(None, &secret);
-        let mut expected = [0u8; 32];
-        hk.expand(b"iroh:node-a", &mut expected).unwrap();
+        let expected = crate::crypto::derive_iroh_node_key(&secret, "node-a");
 
         let got = derive_iroh_secret_seed(TEST_KEY, "node-a")
             .unwrap()

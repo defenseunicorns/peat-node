@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -165,19 +165,13 @@ hex = "0.4"
 # Hashing (PRD-006 attachment ingest streams sha256 alongside blob ingest;
 # also exercised by validate.rs unit tests for hash equality).
 sha2 = "0.10"
-# HKDF-SHA256 for K8s peer discovery deterministic iroh keypair derivation
-# (peat-node#63). FIPS-approved per ADR-049.
+# HKDF-SHA256 for deterministic iroh keypair derivation (peat-node#63):
+# K8s peer discovery (crypto::derive_iroh_node_key) AND the static-peering
+# identity + `derive-id` (identity module). FIPS-approved per ADR-049.
 hkdf = "0.12"
 # Required by peat-mesh's `kubernetes` feature (k8s-openapi mandates that the
 # binary crate enables a v1_X feature to select the K8s API version).
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
-
-# Deterministic iroh identity (peat-node#63 gap-4d): the endpoint keypair is
-# seeded from HKDF-SHA256(formation_secret, "iroh:" + node_id) so every node's
-# EndpointId is stable across restarts and computable offline from
-# (shared_key, node_id). MUST match peat-mesh's PeerConnector derivation
-# (salt=None, IKM=base64-decoded shared key, info="iroh:"+name) byte-for-byte.
-hkdf = "0.12"
 
 # O_NOFOLLOW for the attachment-ingest open path (PRD-006 §Validation Rule 5
 # TOCTOU mitigation). libc is already transitively pulled by iroh / tokio —

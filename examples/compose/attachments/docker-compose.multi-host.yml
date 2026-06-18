@@ -69,10 +69,10 @@
 
 services:
   peat-node:
-    # Deterministic identity + `derive-id` require peat-node v0.4.2+. To run
+    # Deterministic identity + `derive-id` require peat-node v0.4.3+. To run
     # local changes ahead of a release, comment out `image:` and uncomment
     # `build:`.
-    image: ghcr.io/defenseunicorns/peat-node:v0.4.2
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.3
     # build:
     #   context: ../../..
     container_name: peat-node-${NODE_ID}
