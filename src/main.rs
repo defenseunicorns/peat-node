@@ -329,6 +329,19 @@ enum Command {
     },
 }
 
+/// Keys among `vars` that match `prefix` and have an empty value — the set to
+/// treat as unset. Pure so the empty-env normalization is unit-testable without
+/// touching the process environment.
+fn empty_prefixed_env_keys<I>(vars: I, prefix: &str) -> Vec<String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    vars.into_iter()
+        .filter(|(k, v)| k.starts_with(prefix) && v.is_empty())
+        .map(|(k, _)| k)
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -337,6 +350,19 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "peat_node=info,peat_mesh=info".into()),
         )
         .init();
+
+    // Treat any empty `PEAT_NODE_*` env var as unset before clap parses.
+    // Compose/Helm routinely inject empty-string env vars for "disabled"
+    // optional settings (e.g. `PEAT_NODE_ATTACHMENT_INBOX=""`); clap otherwise
+    // rejects those with "a value is required for '--…' but none was supplied"
+    // and the node crash-loops on startup. Empty is never a meaningful value
+    // for any of our vars, so dropping them lets the Option/default args
+    // resolve normally.
+    for key in empty_prefixed_env_keys(std::env::vars(), "PEAT_NODE_") {
+        // SAFETY (2021 edition: this call is safe): runs at the very top of
+        // main before any spawned task reads the environment.
+        std::env::remove_var(&key);
+    }
 
     let args = Args::parse();
 
@@ -543,4 +569,35 @@ async fn main() -> anyhow::Result<()> {
 
     info!("peat-node stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_prefixed_env_keys;
+
+    #[test]
+    fn empty_prefixed_env_keys_selects_only_empty_matching_prefix() {
+        let vars = vec![
+            ("PEAT_NODE_ATTACHMENT_INBOX".to_string(), "".to_string()), // empty + prefix -> drop
+            ("PEAT_NODE_SHARED_KEY".to_string(), "abc".to_string()),    // non-empty -> keep
+            ("PEAT_NODE_AGENT_ADDR".to_string(), "".to_string()),       // empty + prefix -> drop
+            ("OTHER_VAR".to_string(), "".to_string()), // empty but wrong prefix -> keep
+            ("PATH".to_string(), "/usr/bin".to_string()), // unrelated -> keep
+        ];
+        let mut got = empty_prefixed_env_keys(vars, "PEAT_NODE_");
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["PEAT_NODE_AGENT_ADDR", "PEAT_NODE_ATTACHMENT_INBOX"]
+        );
+    }
+
+    #[test]
+    fn empty_prefixed_env_keys_empty_when_none_match() {
+        let vars = vec![(
+            "PEAT_NODE_LISTEN".to_string(),
+            "tcp://0.0.0.0:50051".to_string(),
+        )];
+        assert!(empty_prefixed_env_keys(vars, "PEAT_NODE_").is_empty());
+    }
 }

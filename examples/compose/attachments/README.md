@@ -154,3 +154,26 @@ for the full reference.
 > Deterministic identity + `derive-id` require **peat-node v0.4.3+**. To run
 > local changes ahead of a release, use the commented `build:` block in
 > `docker-compose.multi-host.yml` to build from the repo root.
+
+### Attachment delivery across hosts
+
+The multi-host nodes above sync CRDT documents. To also deliver **files**
+(PRD-006), give the **sender** an outbox and the **receiver** an inbox — the
+matching opt-in lines are stubbed in `docker-compose.multi-host.yml`:
+
+- Sender: set `PEAT_NODE_ATTACHMENT_ROOT=outbox=/var/lib/peat/outbox` and mount
+  a host dir read-only at `/var/lib/peat/outbox`.
+- Receiver: set `PEAT_NODE_ATTACHMENT_INBOX=/var/lib/peat/inbox` and mount a
+  writable host dir at `/var/lib/peat/inbox`.
+
+Send with `SendAttachments` (scope `allNodes`); the receiver's inbox watcher
+fetches the blob over iroh and writes it to
+`{inbox}/{distribution_id}/{filename}`, byte-identical to the source.
+
+> ⚠️ A `COMPLETED` status with **no connected peers** is the *vacuous*
+> zero-target case — nothing was transferred. Confirm
+> `GetStatus.connectedPeers >= 1` before trusting delivery.
+
+This exact flow (outbox → inbox, sha256-validated on the receive side) runs in
+CI via [`test/attachment-delivery-compose.sh`](../../../test/attachment-delivery-compose.sh)
+— the regression guard for "passes tests but delivers nothing."

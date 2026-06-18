@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Empty `PEAT_NODE_*` env vars no longer crash startup.** An empty
+  `PEAT_NODE_ATTACHMENT_INBOX=""` (and any empty optional `PEAT_NODE_*` var, as
+  Compose/Helm commonly inject for a "disabled" setting) triggered clap's "a
+  value is required for '--…'" and crash-looped the node. Empty `PEAT_NODE_*`
+  vars are now normalized to unset before argument parsing.
+
+### Added
+
+- **`test/attachment-delivery-compose.sh` + CI job (Attachment delivery).** A
+  functional test that sends a file from a sender's `--attachment-root` outbox
+  and asserts the **byte-identical** file lands in a receiver's
+  `--attachment-inbox` over a real two-node iroh transfer — after verifying
+  `connectedPeers >= 1` so it can't pass on the vacuous zero-peer `COMPLETED`
+  short-circuit. Guards against the PRD-006 v1 failure mode (surface passed
+  every unit test, delivered no files).
+
 ## [0.4.3] - 2026-06-18
 
 ### Added
