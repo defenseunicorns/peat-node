@@ -105,7 +105,25 @@ pub fn is_encrypted(value: &str) -> bool {
 ///
 /// This is FIPS-approved: HKDF-SHA256 per ADR-049. The output bytes are passed
 /// to `AutomergeBackendConfig::iroh_secret_key` at node startup.
+///
+/// # Panics (debug builds)
+///
+/// `formation_secret` is the input keying material and MUST be the
+/// full-entropy formation secret (the 32-byte base64-decoded shared key).
+/// Deriving an identity from a short/empty IKM yields a "deterministic" key
+/// from cryptographically weak input — a silent security downgrade. A
+/// `debug_assert!` enforces a 16-byte floor so a future caller that passes a
+/// truncated or empty slice trips in tests/dev rather than shipping a weak
+/// identity. Release builds skip the check (callers validate upstream), so the
+/// contract is documented here rather than returned as an error.
 pub fn derive_iroh_node_key(formation_secret: &[u8], pod_name: &str) -> [u8; 32] {
+    debug_assert!(
+        formation_secret.len() >= 16,
+        "derive_iroh_node_key: formation_secret is {} bytes; expected the \
+         32-byte formation secret. Deriving from weak IKM is a silent security \
+         downgrade.",
+        formation_secret.len()
+    );
     let hk = Hkdf::<Sha256>::new(None, formation_secret);
     let mut okm = [0u8; 32];
     hk.expand(format!("iroh:{pod_name}").as_bytes(), &mut okm)
@@ -187,5 +205,27 @@ mod tests {
         let k1 = derive_iroh_node_key(s1, "peat-node-0");
         let k2 = derive_iroh_node_key(s2, "peat-node-0");
         assert_ne!(k1, k2);
+    }
+
+    /// Pins the exact derivation recipe so it cannot silently drift from
+    /// peat-mesh's `PeerConnector` (which uses the identical
+    /// `HKDF-SHA256(salt=None, ikm=secret, info="iroh:"+pod)`). If anyone
+    /// changes the salt, the `"iroh:"` info prefix, or the hash here, this
+    /// fails — surfacing the drift that would otherwise break every K8s peer
+    /// connection with no obvious symptom (the IDIOM finding on #151).
+    #[test]
+    fn derive_iroh_node_key_matches_documented_recipe() {
+        let secret = b"test-formation-secret-32-bytes!!";
+        let hk = Hkdf::<Sha256>::new(None, secret);
+        let mut expected = [0u8; 32];
+        hk.expand(b"iroh:peat-node-0", &mut expected).unwrap();
+        assert_eq!(derive_iroh_node_key(secret, "peat-node-0"), expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "formation_secret")]
+    fn derive_iroh_node_key_rejects_weak_ikm_in_debug() {
+        // A 4-byte IKM is far below the 16-byte floor; debug builds must trip.
+        let _ = derive_iroh_node_key(b"weak", "peat-node-0");
     }
 }
