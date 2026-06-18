@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-16
+
+### Added
+
+- **`peat attach` subcommand** (`send` / `watch` / `status`) — distribute and receive binary files directly from the operator CLI over the Iroh blob store without a running `peat-node`. Supports `--scope` (`all` / `nodes:id1,id2` / `formation:id`), `--priority` (`critical` / `high` / `normal` / `low`), `--wait` (block until all targets confirm receipt), and `--dist-id` exit-on-delivery for `watch`. Updated README and QUICKSTART with command reference and two-terminal walkthrough. ([#155](https://github.com/defenseunicorns/peat-node/pull/155))
+
+### Fixed
+
+- **Peer health reset on reconnect** — peers that were marked `Unhealthy` before a QUIC idle-timeout blackout now re-enter `fetch_blob` ordering at `Neutral` after `dial_and_attach`, rather than carrying their pre-outage verdict forward. `BlobPeerIndex` and `known_peers` are preserved — only the health verdict is cleared. Bumps peat-mesh to `rc.40`, which also drops the `peer_health_cooldown` default from 120 s to 30 s (matching the watchdog reconnect cycle). ([#156](https://github.com/defenseunicorns/peat-node/pull/156))
+
+### Changed
+
+- **Reconnect watchdog — double-lock eliminated** — the watchdog error path no longer re-acquires `registered_peers` to read back the backoff it just wrote; the value is captured as a local before the write lock drops. ([#157](https://github.com/defenseunicorns/peat-node/pull/157))
+- **`peat attach watch --dist-id` — filesystem polling eliminated** — replaced 500 ms directory-scan polling with a `tokio::sync::Notify` fired by `InboxSink::deliver()` on the target distribution's atomic rename; the CLI wakes within one async tick of delivery. ([#157](https://github.com/defenseunicorns/peat-node/pull/157))
+
+### Fixed
+
+- **Inbox-only nodes now get time-based bundle eviction** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). The `PEAT_NODE_ATTACHMENT_HANDLE_RETENTION_SECS` knob and the background eviction ticker now cover receive-only nodes (inbox configured, no roots) as well as send-side nodes. Previously the ticker was gated on `has_roots()` only, so a receive-only node accumulated terminal bundle handles indefinitely until LRU pressure removed them — time-based eviction was silently inert.
+- **Chart: inbox without volume mount now fails at `helm install` time** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). Setting `attachment.inbox` without a corresponding `attachment.extraVolumeMounts` entry now produces a clear `helm install`/`helm upgrade` error rather than silently writing received blobs to ephemeral container storage (lost on pod restart).
+- **Binary warns on `PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS=0`** (closes [peat-node#149](https://github.com/defenseunicorns/peat-node/issues/149)). A poll interval of 0 is clamped to 1 s at startup and now emits a `WARN`-level log message so operators can distinguish "accepted" from "silently corrected".
+
+### Changed
+
+- **Chart: `disableMdns` defaults to `true` — bare-metal Helm users must opt in** (from [#148](https://github.com/defenseunicorns/peat-node/pull/148)). The peat-node binary defaults mDNS peer discovery to **on**; the Helm chart now defaults `disableMdns: true` (injecting `PEAT_NODE_DISABLE_MDNS=true`) because multicast is unavailable in Kubernetes and containers. **Bare-metal operators deploying via the chart** who relied on mDNS for same-host peer discovery must add `disableMdns: false` to their values override after a `helm upgrade`. No action is needed for Kubernetes deployments — mDNS was always a no-op there.
+
 ## [0.4.0] - 2026-06-10
 
 ### Added

@@ -418,7 +418,10 @@ impl SidecarNode {
         // tick interval scales with retention so tests that set short
         // retention windows observe eviction promptly, while the default
         // 24h retention only sweeps once a minute.
-        if config.attachment_config.has_roots()
+        // Guard covers both send-side (roots) and receive-side (inbox):
+        // receive-only nodes also accumulate terminal bundle handles and
+        // need time-based eviction just as senders do.
+        if (config.attachment_config.has_roots() || config.attachment_config.inbox_path.is_some())
             && config.attachment_config.handle_retention_secs > 0
         {
             let registry = Arc::clone(&bundle_registry);
@@ -447,15 +450,20 @@ impl SidecarNode {
             let sink = std::sync::Arc::new(crate::attachments::inbox::FilesystemInboxSink::new(
                 inbox_path.clone(),
             ));
+            let raw_poll_secs = config.attachment_config.inbox_poll_secs;
+            if raw_poll_secs == 0 {
+                warn!(
+                    "PEAT_NODE_ATTACHMENT_INBOX_POLL_SECS=0 is not supported; \
+                     clamped to 1 — set a value ≥1 to suppress this warning"
+                );
+            }
             file_distribution
                 .as_ref()
                 .expect("file_distribution is Some when inbox_path is configured")
                 .start_receive_watcher(
                     endpoint_short,
                     sink,
-                    std::time::Duration::from_secs(
-                        config.attachment_config.inbox_poll_secs.max(1) as u64
-                    ),
+                    std::time::Duration::from_secs(raw_poll_secs.max(1) as u64),
                 );
         }
 
@@ -544,32 +552,35 @@ impl SidecarNode {
                         // schedule the next attempt accordingly. If the
                         // operator explicitly disconnected during the dial,
                         // the entry will be missing — skip silently.
-                        let mut registered_guard =
-                            registered.write().unwrap_or_else(|e| e.into_inner());
-                        if let Some(entry) = registered_guard.get_mut(&peer_id) {
-                            match &dial_result {
-                                Ok(()) => {
-                                    entry.backoff = RECONNECT_BACKOFF_MIN;
-                                    entry.next_attempt = now;
+                        // Capture the updated backoff inside the write lock
+                        // so the error-path log doesn't need a second
+                        // lock acquisition.
+                        let next_backoff = {
+                            let mut guard = registered.write().unwrap_or_else(|e| e.into_inner());
+                            if let Some(entry) = guard.get_mut(&peer_id) {
+                                match &dial_result {
+                                    Ok(()) => {
+                                        entry.backoff = RECONNECT_BACKOFF_MIN;
+                                        entry.next_attempt = now;
+                                        None
+                                    }
+                                    Err(_) => {
+                                        entry.backoff =
+                                            (entry.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                                        entry.next_attempt = now + entry.backoff;
+                                        Some(entry.backoff)
+                                    }
                                 }
-                                Err(_) => {
-                                    entry.backoff = (entry.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                                    entry.next_attempt = now + entry.backoff;
-                                }
+                            } else {
+                                None
                             }
-                        }
-                        drop(registered_guard);
+                        };
                         match dial_result {
                             Ok(()) => info!(peer = %peer_id, "auto-reconnect succeeded"),
                             Err(e) => warn!(
                                 peer = %peer_id,
                                 "auto-reconnect failed (next attempt in {:?}): {e}",
-                                registered
-                                    .read()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get(&peer_id)
-                                    .map(|r| r.backoff)
-                                    .unwrap_or(RECONNECT_BACKOFF_MIN)
+                                next_backoff.unwrap_or(RECONNECT_BACKOFF_MIN)
                             ),
                         }
                     }
@@ -603,15 +614,21 @@ impl SidecarNode {
                             .map(|s| s.port())
                             .unwrap_or(0);
                         if port > 0 {
-                            let loopback = std::net::SocketAddr::new(
-                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                                port,
-                            );
+                            // Advertise our REAL LAN interface addresses so peers on
+                            // OTHER hosts can discover and dial us. peat-mesh's
+                            // `advertise` enables mdns-sd address auto-detection, which
+                            // publishes every non-loopback interface address (and keeps
+                            // them current). The previous `advertise_with_addr(127.0.0.1)`
+                            // only ever reached nodes on the same host. `port` is still
+                            // carried in the TXT record as a fallback for resolvers that
+                            // yield no A records.
                             let mut meta = std::collections::HashMap::new();
                             meta.insert("port".to_string(), port.to_string());
                             meta.insert("formation_id".to_string(), config.app_id.clone());
-                            match m.advertise_with_addr(&eid, loopback, Some(meta)) {
-                                Ok(()) => info!("mDNS: advertising on 127.0.0.1:{port}"),
+                            match m.advertise(&eid, port, Some(meta)) {
+                                Ok(()) => {
+                                    info!("mDNS: advertising endpoint {eid} on LAN (port {port})")
+                                }
                                 Err(e) => warn!("mDNS advertise failed: {e}"),
                             }
                         }
@@ -1247,6 +1264,11 @@ impl SidecarNode {
         // (target_nodes resolved to `[]` for AllNodes distributions
         // unless the operator called add_peer through a private API).
         backend.blob_store().add_peer(peer_id).await;
+        // Clear any stale health record from a prior session so this peer
+        // starts at Neutral rather than inheriting a pre-blackout Unhealthy
+        // rank. Known-peers and BlobPeerIndex entries are preserved — only
+        // the health verdict is reset.
+        backend.blob_store().reset_peer_health(&peer_id).await;
 
         Ok(())
     }

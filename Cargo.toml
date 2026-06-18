@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -103,14 +103,30 @@ path = "src/main.rs"
 #   `pub use Connection`. peat-protocol's formation_handshake uses the
 #   trait; peat-node's `peat_mesh::storage::*` / `peat_mesh::sync::*`
 #   surface is untouched by the narrowing.
-peat-mesh = { version = "0.9.0-rc.39", features = ["automerge-backend", "kubernetes"] }
+#
+# rc.39 (peat-mesh#254): deterministic iroh endpoint identity for K8s /
+#   containerised deployments — `NetworkConfig::node_secret_key` lets an
+#   operator supply a fixed Ed25519 key so the node ID survives pod
+#   restarts. No API change for nodes that don't set the key.
+#
+# rc.40 (peat-mesh#255): `NetworkedIrohBlobStore::reset_peer_health` +
+#   `peer_health_cooldown` default 120s→30s. `reset_peer_health` clears
+#   a peer's health verdict without touching `known_peers` or
+#   `BlobPeerIndex` — called from `dial_and_attach` so a peer that was
+#   Unhealthy before a blackout re-enters at Neutral on reconnect.
+#   30s cooldown matches the watchdog reconnect cycle; explicit reconnect
+#   via `reset_peer_health` supersedes it anyway.
+#
+# The `kubernetes` feature gates this PR's `KubernetesDiscovery` wiring
+# (EndpointSlice watch); it's additive on top of rc.40's surface.
+peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
 # peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
 # → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.24, <0.9.1", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.25, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's exact iroh pin
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh

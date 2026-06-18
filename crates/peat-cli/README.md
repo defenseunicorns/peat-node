@@ -1,6 +1,6 @@
 # `peat` — operator CLI as a Peat node
 
-Per [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md). `peat` is the operator CLI for a Peat mesh deployment. It joins the mesh as a real Peat node (no admin sidecar API), runs a CRUD-shaped command, and exits.
+Per [peat-node ADR-001](../../docs/peat-node-adr-001-peat-cli.md). `peat` is the operator CLI for a Peat mesh deployment. It joins the mesh as a real Peat node (no admin sidecar API), runs a command, and exits. Supports CRUD document operations (`query`, `create`, `update`, `delete`, `observe`) and binary file distribution (`attach send`, `attach watch`, `attach status`).
 
 ## Install
 
@@ -135,6 +135,39 @@ peat delete <COLLECTION>/<DOC_ID> [--wait-for-sync]
 
 `--wait-for-sync` works with both explicit peers and mDNS-discovered peers.
 
+### File attachments
+
+```sh
+# Distribute a file to connected peers.
+# Prints distribution_id and blob_hash, then exits.
+peat attach send <FILE> [--scope all|nodes:id1,id2|formation:id] \
+                        [--priority critical|high|normal|low] [--wait]
+
+# Block until every target peer confirms receipt (or --timeout expires).
+peat attach send <FILE> --wait
+
+# Check transfer status for a distribution.
+peat attach status <DIST-ID>
+
+# Watch for incoming distributions and write them to an inbox directory.
+# Runs until SIGINT unless --dist-id is given, in which case it exits on delivery.
+peat attach watch [--inbox <PATH>] [--dist-id <DIST-ID>]
+```
+
+`--scope` controls which peers receive the file:
+
+| Value | Targets |
+|---|---|
+| `all` **(default)** | every peer currently connected at send time |
+| `nodes:id1,id2` | specific peers by their Iroh endpoint short-id |
+| `formation:id` | peers belonging to a named formation |
+
+`--priority` is advisory (`critical` → `high` → `normal` → `low`; default `normal`).
+
+`send` exits immediately after writing the distribution document. Pass `--wait` to block until all target peers confirm receipt (or `--timeout` expires). Without `--wait`, poll with `peat attach status <DIST-ID>` to check progress.
+
+`watch --inbox` defaults to `./inbox`; the directory is created if it does not exist. Delivered files land at `<inbox>/<dist-id>/<original-filename>`. With `--dist-id`, `watch` exits 0 once that specific distribution has been written to disk; without it, watch runs until `Ctrl-C` (exit 130).
+
 ### Schema discovery
 
 ```sh
@@ -204,6 +237,27 @@ peat update contacts/c-1234 --set rank=2 --wait-for-sync
 
 # Tombstone.
 peat delete contacts/c-1234
+```
+
+### File attachments
+
+```sh
+# Send a file to all connected peers; block until everyone confirms receipt.
+peat attach send report.pdf --wait
+
+# Send fire-and-forget; check status later.
+dist_id=$(peat attach send payload.bin | jq -r .distribution_id)
+peat attach status "$dist_id"
+
+# Receive attachments; exit once the named distribution lands.
+peat attach watch --inbox ./inbox --dist-id "$dist_id"
+
+# Persistent receive daemon (Ctrl-C to stop).
+peat attach watch --inbox ./inbox
+
+# Narrow the target set.
+peat attach send firmware.bin --scope nodes:abc123,def456 --priority high
+peat attach send update.bin   --scope formation:alpha-cell --priority critical
 ```
 
 ### Round-trip edit
