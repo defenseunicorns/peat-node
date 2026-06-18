@@ -198,6 +198,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Cache cargo registry + target/ per target so each release doesn't
+      # rebuild peat-cli's full dependency tree from scratch. Keyed per matrix
+      # target (distinct OS/arch) so the 4 platforms don't collide.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target.label }}
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
