@@ -1,84 +1,111 @@
-# Multi-HOST attachment delivery — two nodes on TWO DIFFERENT MACHINES.
+# Multi-HOST peering — two peat-node instances on TWO DIFFERENT MACHINES.
 #
 # Unlike docker-compose.two-node.yml (both nodes on one Docker network, peered
-# via service DNS names), this file runs ONE node per machine and peers them by
-# real IP, with NO mDNS and NO need to ever read the remote node's output.
+# via service DNS + ./peer.sh), this runs ONE node per machine and peers them by
+# real IP — with NO mDNS and NO need to ever read the remote node's output.
 #
-# The trick: iroh endpoint identity is deterministic —
+# It works because iroh endpoint identity is deterministic:
 #   endpoint_id = HKDF-SHA256(shared_key, "iroh:" + node_id)
-# so you compute BOTH nodes' ids offline, on one machine, before anything boots.
+# so you compute BOTH nodes' ids offline, on one machine, before anything boots,
+# and bake each node's id into the OTHER node's PEAT_NODE_PEERS.
 #
-# ── 1. Compute both endpoint ids offline (any machine with the shared key) ──
+# ─────────────────────────────────────────────────────────────────────────────
+# VARIABLES — set per machine in a `.env` file next to this one. Compose
+# substitutes ${VAR} below. The first three are self-explanatory; PEER_ID and
+# PEER_ADDR are the ones to get right.
 #
-#   K="<your base64 32-byte PEAT_NODE_SHARED_KEY>"
-#   A_ID=$(peat-node derive-id --shared-key "$K" --node-id node-a)
-#   B_ID=$(peat-node derive-id --shared-key "$K" --node-id node-b)
+#   NODE_ID        This node's logical name. NOT just a label: it is the HKDF
+#                  context for this node's identity, so it MUST be stable across
+#                  restarts (a changing name = a changing endpoint_id). Unique
+#                  per node. e.g. node-a
 #
-# ── 2. On machine A (e.g. 10.0.0.10), create a .env next to this file ───────
+#   SHARED_KEY     Base64-encoded 32-byte formation secret. Identical on every
+#                  node in the formation. Also the HKDF input key for identity,
+#                  which is what lets anyone holding it derive any node's id.
+#                  Generate once: head -c 32 /dev/urandom | base64
 #
-#   NODE_ID=node-a
-#   SHARED_KEY=<K>
-#   IROH_UDP_PORT=51071
-#   PEER_ID=<B_ID>           # node-b's derived id
-#   PEER_ADDR=10.0.0.20:51072
-#   ATTACHMENT_ENV=PEAT_NODE_ATTACHMENT_ROOT=outbox=/var/lib/peat/outbox
+#   IROH_UDP_PORT  UDP port this node's iroh/QUIC endpoint binds AND publishes
+#                  to the host. The peer dials this port; pin it so PEER_ADDR is
+#                  stable. e.g. 51071
 #
-# ── 3. On machine B (e.g. 10.0.0.20), create its own .env ───────────────────
+#   PEER_ID        The OTHER node's endpoint_id — DERIVED, not invented. Get it
+#                  offline with `derive-id` (below). This is the public key the
+#                  QUIC handshake authenticates the peer against; a wrong value
+#                  means the connection is refused, not silently mis-dialed.
 #
-#   NODE_ID=node-b
-#   SHARED_KEY=<K>
-#   IROH_UDP_PORT=51072
-#   PEER_ID=<A_ID>           # node-a's derived id
-#   PEER_ADDR=10.0.0.10:51071
-#   ATTACHMENT_ENV=PEAT_NODE_ATTACHMENT_INBOX=/var/lib/peat/inbox
+#   PEER_ADDR      The OTHER node's reachable address as host:udp-port, where
+#                  udp-port is that node's IROH_UDP_PORT. e.g. 10.0.0.20:51072
 #
-# ── 4. On EACH machine ──────────────────────────────────────────────────────
+#   # Optional — attachment delivery (off by default). Uncomment the matching
+#   # `environment:`/`volumes:` lines below to enable, and create the host dir.
+#   ATTACHMENT_ROOT    Readable outbox root, name=path. e.g. outbox=/var/lib/peat/outbox
+#   ATTACHMENT_INBOX   Receive-side inbox path.        e.g. /var/lib/peat/inbox
 #
+# ─────────────────────────────────────────────────────────────────────────────
+# QUICKSTART
+#
+#   # 1. Derive both ids offline (any machine that has the shared key):
+#   K="<base64 32-byte shared key>"
+#   peat-node derive-id --shared-key "$K" --node-id node-a   # -> A_ID
+#   peat-node derive-id --shared-key "$K" --node-id node-b   # -> B_ID
+#
+#   # 2. machine A (10.0.0.10) .env:        # 3. machine B (10.0.0.20) .env:
+#   #   NODE_ID=node-a                       #   NODE_ID=node-b
+#   #   SHARED_KEY=$K                        #   SHARED_KEY=$K
+#   #   IROH_UDP_PORT=51071                  #   IROH_UDP_PORT=51072
+#   #   PEER_ID=<B_ID>                       #   PEER_ID=<A_ID>
+#   #   PEER_ADDR=10.0.0.20:51072            #   PEER_ADDR=10.0.0.10:51071
+#
+#   # 4. on EACH machine:
 #   docker compose -f docker-compose.multi-host.yml up -d
 #
 # No ./peer.sh, no GetStatus round-trip, no mDNS. Each node derives its OWN
 # identity from (SHARED_KEY, NODE_ID) and already knows the peer's id because
-# you computed it the same way.
+# you derived it the same way.
 #
-# IMPORTANT: the iroh QUIC port is UDP and must cross the host boundary — it is
-# published as `${IROH_UDP_PORT}:${IROH_UDP_PORT}/udp` below, and must be open
-# in each host's firewall. The gRPC TCP port alone is not enough.
+# NETWORKING: iroh/QUIC is UDP and must cross the host boundary. IROH_UDP_PORT
+# is published as `.../udp` below and MUST be open in each host's firewall — the
+# gRPC TCP port (50051) alone is not enough for peers to sync.
 
 services:
   peat-node:
-    # Deterministic identity + `derive-id` ship in the release that follows
-    # v0.4.1 — pin that tag here once it's published (see README). For testing
+    # Deterministic identity + `derive-id` require peat-node v0.4.2+. To run
     # local changes ahead of a release, comment out `image:` and uncomment
     # `build:`.
-    image: ghcr.io/defenseunicorns/peat-node:v0.4.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.2
     # build:
     #   context: ../../..
     container_name: peat-node-${NODE_ID}
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
       PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_APP_ID: mh-demo
+      # Identity inputs — see the VARIABLES block above.
       PEAT_NODE_NODE_ID: ${NODE_ID}
-      PEAT_NODE_APP_ID: attach-demo
       PEAT_NODE_SHARED_KEY: ${SHARED_KEY}
-      PEAT_NODE_AUTO_SYNC: "true"
-      # Pin the iroh UDP port so the peer's PEER_ADDR is stable.
       PEAT_NODE_IROH_UDP_PORT: ${IROH_UDP_PORT}
       # Static peer: <derived endpoint_id>@<host:udp-port>. No discovery.
       PEAT_NODE_PEERS: ${PEER_ID}@${PEER_ADDR}
-      # mDNS is useless across subnets; turn it off so we rely purely on the
-      # static peer above.
+      # mDNS can't cross subnets; rely purely on the static peer above.
       PEAT_NODE_DISABLE_MDNS: "true"
+      PEAT_NODE_AUTO_SYNC: "true"
       RUST_LOG: peat_node=info
+      # Optional attachment delivery — uncomment with the volume(s) below:
+      # PEAT_NODE_ATTACHMENT_ROOT: ${ATTACHMENT_ROOT}
+      # PEAT_NODE_ATTACHMENT_INBOX: ${ATTACHMENT_INBOX}
     ports:
+      # gRPC / Connect API. On separate machines each host owns :50051; when
+      # simulating two nodes on ONE host, give each a distinct host-side port.
       - "50051:50051"
-      # iroh QUIC — MUST be published as UDP and open in the firewall.
+      # iroh/QUIC — MUST be UDP and open in the firewall (see NETWORKING above).
       - "${IROH_UDP_PORT}:${IROH_UDP_PORT}/udp"
     volumes:
       - peat-node-data:/data/peat-node
-      # Mount an outbox (sender) and/or inbox (receiver) as needed; see the
-      # two-node example for the attachment-root / inbox wiring.
-      - ./outbox:/var/lib/peat/outbox:ro
-      - ./inbox-b:/var/lib/peat/inbox
+      # Optional attachment delivery (pairs with the env lines above). Create
+      # the host dir first; see docker-compose.two-node.yml for the full
+      # sender-outbox / receiver-inbox walkthrough.
+      # - ./outbox:/var/lib/peat/outbox:ro
+      # - ./inbox:/var/lib/peat/inbox
 
 volumes:
   peat-node-data: {}

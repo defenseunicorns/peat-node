@@ -97,7 +97,7 @@ ls inbox-b/                                # files appear here per distribution_
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
-(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.1`. For testing local
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.2`. For testing local
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 
@@ -151,6 +151,6 @@ full per-machine `.env` and the firewall/UDP-publish note, and
 [`docs/CONFIGURATION.md` → Deterministic identity](../../../docs/CONFIGURATION.md#deterministic-identity--offline-peer-id-derivation)
 for the full reference.
 
-> Deterministic identity + `derive-id` ship in the release **after v0.4.1**.
-> Pin that image tag in `docker-compose.multi-host.yml` once it's published;
-> until then, use the commented `build:` block to build from the repo root.
+> Deterministic identity + `derive-id` require **peat-node v0.4.2+**. To run
+> local changes ahead of a release, use the commented `build:` block in
+> `docker-compose.multi-host.yml` to build from the repo root.

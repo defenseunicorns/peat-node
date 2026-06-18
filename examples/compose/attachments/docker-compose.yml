@@ -29,7 +29,7 @@ services:
     # use v0.3.0+ for the delivery demo. For testing changes ahead of
     # a release, comment out the `image:` line and uncomment the
     # `build:` block to build from the repo root.
-    image: ghcr.io/defenseunicorns/peat-node:v0.4.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.2
     # build:
     #   context: ../../..
     container_name: peat-node-attachments
