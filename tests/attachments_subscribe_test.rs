@@ -43,6 +43,8 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+        false,
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 

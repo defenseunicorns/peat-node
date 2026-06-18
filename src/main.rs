@@ -270,6 +270,24 @@ struct Args {
     )]
     attachment_inbox_poll_secs: u32,
 
+    /// Enable the send-side outbox watcher: auto-distribute (AllNodes scope)
+    /// any stable new file dropped into an `--attachment-root`, with no
+    /// `SendAttachments` call. Off by default. Requires at least one root.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_OUTBOX_WATCH",
+        default_value_t = false
+    )]
+    attachment_outbox_watch: bool,
+
+    /// Outbox watcher poll interval in seconds. Default 2s.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ATTACHMENT_OUTBOX_POLL_SECS",
+        default_value_t = peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS
+    )]
+    attachment_outbox_poll_secs: u32,
+
     // --- Kubernetes peer discovery (peat-node#63) ---
     /// Enable Kubernetes EndpointSlice-based peer discovery for in-cluster
     /// deployments. Requires the `POD_NAME` env var (set via Kubernetes
@@ -430,6 +448,8 @@ async fn main() -> anyhow::Result<()> {
         args.attachment_handle_retention_secs,
         args.attachment_max_known_bundles,
         args.attachment_inbox_poll_secs,
+        args.attachment_outbox_watch,
+        args.attachment_outbox_poll_secs,
     )?;
     if attachment_config.has_roots() {
         let names: Vec<&str> = attachment_config.roots.keys().map(String::as_str).collect();
@@ -470,6 +490,29 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let node = Arc::new(SidecarNode::new(config).await?);
+
+    // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
+    // configured roots, the symmetric counterpart to the receive-side inbox
+    // watcher. Spawned here (not in SidecarNode::new) because it drives the
+    // gRPC SendAttachments path, which needs the constructed Arc<SidecarNode>.
+    {
+        let acfg = node.attachment_config();
+        if acfg.outbox_watch {
+            if acfg.has_roots() {
+                let roots = acfg.roots.clone();
+                let poll = std::time::Duration::from_secs(acfg.outbox_poll_secs.max(1) as u64);
+                let watch_node = Arc::clone(&node);
+                tokio::spawn(async move {
+                    peat_node::attachments::outbox::run(watch_node, roots, poll).await;
+                });
+            } else {
+                warn!(
+                    "PEAT_NODE_ATTACHMENT_OUTBOX_WATCH is set but no --attachment-root is \
+                     configured — outbox watcher not started (nothing to watch)"
+                );
+            }
+        }
+    }
 
     // Initial peers in `endpoint_id@host:port` form, one per entry. The
     // outer `,` in `PEAT_NODE_PEERS` separates peers (handled by clap's

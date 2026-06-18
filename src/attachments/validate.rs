@@ -344,6 +344,8 @@ mod tests {
             handle_retention_secs: DEFAULT_HANDLE_RETENTION_SECS,
             max_known_bundles: DEFAULT_MAX_KNOWN_BUNDLES,
             inbox_poll_secs: crate::attachments::config::DEFAULT_INBOX_POLL_SECS,
+            outbox_watch: false,
+            outbox_poll_secs: crate::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
         }
     }
 

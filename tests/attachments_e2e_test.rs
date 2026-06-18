@@ -73,6 +73,8 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
         // Tight poll interval so the test doesn't wait 1s+ for each
         // watcher tick. Real deployments use the default (1s).
         1,
+        false, // outbox_watch
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 

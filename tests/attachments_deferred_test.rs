@@ -67,6 +67,8 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         1,
+        false, // outbox_watch
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
     let node = Arc::new(
@@ -513,6 +515,8 @@ async fn unknown_node_id_marked_failed_after_grace() {
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+        false,
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 

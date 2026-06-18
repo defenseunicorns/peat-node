@@ -63,6 +63,8 @@ async fn boot(grpc_port: u16, iroh_port: u16) -> BootedNode {
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+        false,
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 
