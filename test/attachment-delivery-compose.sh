@@ -29,7 +29,12 @@ fail() {
 }
 cleanup() {
     (cd "$WORK" && docker compose -p "$PROJECT" down -v >/dev/null 2>&1) || true
-    rm -rf "$WORK"
+    # Inbox files are written by the receiver container as root, so the calling
+    # user can't always delete them (e.g. Linux CI runners). First try to remove
+    # the bind-mounted tree from inside a container (where we are root), then
+    # best-effort `rm` — cleanup must never override the test's own exit code.
+    docker run --rm -v "$WORK":/w alpine sh -c 'rm -rf /w/* /w/.* 2>/dev/null' >/dev/null 2>&1 || true
+    rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
 
