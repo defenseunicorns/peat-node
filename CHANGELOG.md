@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-18
+
+### Added
+
+- **Kubernetes headless-service peer discovery** (`discovery.enabled=true`) — peat-node pods find and dial each other by watching `EndpointSlice` resources, with no static `--peer` / `PEAT_NODE_PEERS` wiring. Each pod's iroh `EndpointId` is derived deterministically from `HKDF-SHA256(shared_key, "iroh:" + POD_NAME)`, so any pod can compute any peer's id from its pod name alone. Adds the `PEAT_NODE_DISCOVERY_*` env vars / `--discovery-*` flags, the `kubernetes` feature on peat-mesh, and Helm `ServiceAccount` / `Role` / `RoleBinding` + headless `Service` templates gated on `discovery.enabled`. ([#151](https://github.com/defenseunicorns/peat-node/pull/151))
+
+### Fixed
+
+- **De-flaked the subprocess sync test** — `sync_subprocess_test` now allocates per-run ephemeral ports and polls for gRPC readiness instead of using fixed ports plus a bare sleep, eliminating the cross-test / cross-run port collisions that caused intermittent CI failures. ([#151](https://github.com/defenseunicorns/peat-node/pull/151))
+
 ## [0.4.1] - 2026-06-16
 
 ### Added
