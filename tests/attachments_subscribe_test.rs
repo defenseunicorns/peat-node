@@ -56,6 +56,7 @@ async fn boot_with_attachments() -> (Arc<SidecarNode>, std::path::PathBuf, tempf
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             attachment_config,
             disable_mdns: true,
             tombstone_ttl_hours: None,

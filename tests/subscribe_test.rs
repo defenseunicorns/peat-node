@@ -20,6 +20,7 @@ async fn fresh_node() -> SidecarNode {
         peers: vec![],
         encryption_key: None,
         iroh_udp_port: None,
+        iroh_secret_key: None,
         attachment_config: Default::default(),
         disable_mdns: true,
         tombstone_ttl_hours: None,

@@ -19,6 +19,7 @@ async fn test_node_with_encryption(
         peers: vec![],
         encryption_key,
         iroh_udp_port: None,
+        iroh_secret_key: None,
         attachment_config: Default::default(),
         disable_mdns: true,
         tombstone_ttl_hours: None,
@@ -353,5 +354,47 @@ async fn wrong_encryption_key_fails_to_decrypt() {
     assert!(
         cipher2.decrypt(&encrypted).is_err(),
         "should fail to decrypt with wrong key"
+    );
+}
+
+/// The whole point of deterministic identity (peat-node#63 gap-4d): the
+/// `EndpointId` a node actually presents on the wire must equal what any holder
+/// of the shared key computes offline from `(shared_key, node_id)` via
+/// `derive-id`. If these ever diverge, a peer that pre-fills `PEAT_NODE_PEERS`
+/// with the derived id would fail to authenticate the QUIC handshake.
+#[tokio::test]
+async fn deterministic_identity_matches_offline_derivation() {
+    // Base64 of 32 bytes of 0x2a — same shape as the compose examples' key.
+    const KEY: &str = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+
+    let seed = peat_node::identity::derive_iroh_secret_seed(KEY, "node-a")
+        .expect("valid base64 key")
+        .expect("non-empty key yields a seed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let node = SidecarNode::new(SidecarConfig {
+        node_id: "node-a".to_string(),
+        app_id: "test".to_string(),
+        shared_key: KEY.to_string(),
+        data_dir: dir.path().to_path_buf(),
+        peers: vec![],
+        encryption_key: None,
+        iroh_udp_port: None,
+        iroh_secret_key: Some(seed),
+        blob_stall_timeout: None,
+        tombstone_ttl_hours: None,
+        gc_interval_secs: None,
+        gc_batch_size: None,
+        attachment_config: Default::default(),
+        disable_mdns: true,
+    })
+    .await
+    .expect("node boot");
+
+    let expected = peat_node::identity::derive_endpoint_id(KEY, "node-a").unwrap();
+    assert_eq!(
+        node.endpoint_addr(),
+        expected,
+        "the booted node's wire identity must match the offline-derived id"
     );
 }

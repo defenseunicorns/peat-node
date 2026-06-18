@@ -44,6 +44,13 @@ pub struct SidecarConfig {
     /// Pin this for deployments where peers need a stable address (e.g. Docker Compose
     /// or any case relying on direct peer-to-peer reachability instead of a relay).
     pub iroh_udp_port: Option<u16>,
+    /// Deterministic iroh identity seed (peat-node#63 gap-4d). When `Some`, the
+    /// iroh endpoint binds this fixed 32-byte secret key so the node's
+    /// `EndpointId` is stable across restarts and computable offline by any
+    /// holder of the shared key (see [`crate::identity`]). When `None`, iroh
+    /// mints a random per-process identity. Derived in `main` from
+    /// `(shared_key, node_id)`.
+    pub iroh_secret_key: Option<[u8; 32]>,
     /// Blob-download stall threshold. `None` uses peat-mesh's default (30s).
     /// Lower it (e.g. 3-5s) for redundant-peer deployments where an
     /// unreachable preferred peer otherwise costs the full stall on the
@@ -239,6 +246,12 @@ impl SidecarNode {
         backend_cfg.cipher = None;
         backend_cfg.ttl_config = ttl_config;
         backend_cfg.gc_config = gc_config;
+        // Deterministic iroh identity (peat-node#63 gap-4d). `Some` → the
+        // endpoint binds a fixed keypair seeded from (shared_key, node_id) so
+        // the EndpointId is stable across restarts and computable offline by
+        // peers; `None` → iroh's random per-process identity. See
+        // [`crate::identity`].
+        backend_cfg.iroh_secret_key = config.iroh_secret_key;
 
         let backend = AutomergeBackend::with_iroh(backend_cfg).await?;
 
@@ -537,7 +550,9 @@ impl SidecarNode {
                             meta.insert("port".to_string(), port.to_string());
                             meta.insert("formation_id".to_string(), config.app_id.clone());
                             match m.advertise(&eid, port, Some(meta)) {
-                                Ok(()) => info!("mDNS: advertising endpoint {eid} on LAN (port {port})"),
+                                Ok(()) => {
+                                    info!("mDNS: advertising endpoint {eid} on LAN (port {port})")
+                                }
                                 Err(e) => warn!("mDNS advertise failed: {e}"),
                             }
                         }

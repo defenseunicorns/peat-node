@@ -3581,6 +3581,7 @@ dependencies = [
  "connectrpc-build",
  "futures",
  "hex",
+ "hkdf",
  "http-body",
  "hyper",
  "hyper-util",

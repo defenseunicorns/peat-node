@@ -35,6 +35,7 @@ async fn boot_mdns_node(
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: Some(iroh_udp_port),
+            iroh_secret_key: None,
             disable_mdns: false,
             blob_stall_timeout: None,
             tombstone_ttl_hours: None,

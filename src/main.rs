@@ -11,11 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use connectrpc::Router;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
+use peat_node::identity;
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -24,6 +25,10 @@ use peat_node::watcher;
 #[derive(Parser, Debug)]
 #[command(name = "peat-node", about = "Peat CRDT mesh node with Connect RPC API")]
 struct Args {
+    /// Optional subcommand. With none, peat-node runs the mesh node (default).
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Listen address. Use "unix:///path/to/sock" for Unix socket or
     /// "tcp://0.0.0.0:50051" for TCP. Default: tcp://0.0.0.0:50051
     #[arg(long, env = "PEAT_NODE_LISTEN", default_value = "tcp://0.0.0.0:50051")]
@@ -266,6 +271,26 @@ struct Args {
     attachment_inbox_poll_secs: u32,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print the deterministic iroh `EndpointId` for a `(shared-key, node-id)`
+    /// pair, offline — no node boot, no network, no access to the peer.
+    ///
+    /// A node's identity is `HKDF-SHA256(shared_key, "iroh:" + node_id)`, so any
+    /// holder of the shared key can compute any node's `EndpointId` from its
+    /// `node_id` alone. Use this to fill in `PEAT_NODE_PEERS` entries
+    /// (`<endpoint_id>@host:port`) for peers you can't reach to query.
+    DeriveId {
+        /// Base64-encoded shared key (same value as the peer's
+        /// `PEAT_NODE_SHARED_KEY`).
+        #[arg(long, env = "PEAT_NODE_SHARED_KEY")]
+        shared_key: String,
+        /// The peer's node id (its `PEAT_NODE_NODE_ID`).
+        #[arg(long, env = "PEAT_NODE_NODE_ID")]
+        node_id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -276,8 +301,26 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Offline subcommands short-circuit before any mesh bootstrap.
+    if let Some(Command::DeriveId {
+        shared_key,
+        node_id,
+    }) = &args.command
+    {
+        let endpoint_id = identity::derive_endpoint_id(shared_key, node_id)?;
+        // Print only the id to stdout so it's pipe/`$(...)`-friendly.
+        println!("{endpoint_id}");
+        return Ok(());
+    }
+
+    // `node_id` is explicit only when the operator set it; otherwise it's a
+    // fresh random UUID, which makes deterministic identity impossible (a new
+    // id every boot). Track that so we can warn below.
+    let node_id_explicit = args.node_id.is_some();
     let node_id = args
         .node_id
+        .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     info!(
@@ -289,6 +332,20 @@ async fn main() -> anyhow::Result<()> {
     );
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
+
+    // Deterministic iroh identity (peat-node#63 gap-4d): seed the keypair from
+    // (shared_key, node_id) so the EndpointId is stable across restarts and
+    // computable offline by peers. Empty shared key → None → iroh's random
+    // per-process identity (pre-feature behaviour).
+    let iroh_secret_key = identity::derive_iroh_secret_seed(&args.shared_key, &node_id)?;
+    if iroh_secret_key.is_some() && !node_id_explicit {
+        warn!(
+            node_id = %node_id,
+            "PEAT_NODE_NODE_ID is not set — using a random per-boot node id, so this \
+             node's iroh EndpointId will change on every restart and peers cannot \
+             pre-compute it. Set a stable PEAT_NODE_NODE_ID for deterministic peering."
+        );
+    }
 
     // Build the attachment configuration. Canonicalises every --attachment-root
     // and fails fast on bad inputs (missing dir, duplicate name, malformed name).
@@ -331,6 +388,7 @@ async fn main() -> anyhow::Result<()> {
         peers: args.peer.clone(),
         encryption_key: args.encryption_key,
         iroh_udp_port: args.iroh_udp_port,
+        iroh_secret_key,
         disable_mdns: args.disable_mdns,
         blob_stall_timeout: args.blob_stall_timeout_secs.map(Duration::from_secs),
         tombstone_ttl_hours: args.tombstone_ttl_hours,

@@ -70,6 +70,7 @@ async fn boot_server(port: u16, cfg_override: impl FnOnce(&mut AttachmentConfig)
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             attachment_config,
             disable_mdns: true,
             tombstone_ttl_hours: None,

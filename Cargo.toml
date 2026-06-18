@@ -163,6 +163,13 @@ hex = "0.4"
 # also exercised by validate.rs unit tests for hash equality).
 sha2 = "0.10"
 
+# Deterministic iroh identity (peat-node#63 gap-4d): the endpoint keypair is
+# seeded from HKDF-SHA256(formation_secret, "iroh:" + node_id) so every node's
+# EndpointId is stable across restarts and computable offline from
+# (shared_key, node_id). MUST match peat-mesh's PeerConnector derivation
+# (salt=None, IKM=base64-decoded shared key, info="iroh:"+name) byte-for-byte.
+hkdf = "0.12"
+
 # O_NOFOLLOW for the attachment-ingest open path (PRD-006 §Validation Rule 5
 # TOCTOU mitigation). libc is already transitively pulled by iroh / tokio —
 # making it a direct dep just gives us the constant without surprise.

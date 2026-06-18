@@ -31,6 +31,7 @@ async fn boot_server(grpc_port: u16, iroh_udp_port: u16) -> (reqwest::Client, St
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: Some(iroh_udp_port),
+            iroh_secret_key: None,
             attachment_config: Default::default(),
             disable_mdns: true,
             tombstone_ttl_hours: None,
