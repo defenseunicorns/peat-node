@@ -51,6 +51,15 @@ pub(crate) fn outbox_decision(
     }
 }
 
+/// Drop tracking entries whose path was not observed this poll, so the
+/// watcher's state maps don't grow unbounded as files leave the outbox.
+fn prune_to_observed(
+    map: &mut HashMap<PathBuf, (u64, SystemTime)>,
+    observed: &std::collections::HashSet<PathBuf>,
+) {
+    map.retain(|p, _| observed.contains(p));
+}
+
 /// A regular file discovered under a root: `relative_path` (forward-slashed,
 /// relative to the root) plus its absolute path and current size/mtime.
 struct Found {
@@ -156,8 +165,13 @@ pub async fn run(node: Arc<SidecarNode>, roots: HashMap<String, PathBuf>, poll: 
     let mut last_sent: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
 
     loop {
+        // Paths observed this cycle, so we can drop state for files that have
+        // since left the outbox (drop→distribute→delete is the common synced-
+        // folder pattern). Without this, `last_seen`/`last_sent` grow unbounded.
+        let mut observed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for (root_name, root_path) in &roots {
             for f in walk_files(root_path) {
+                observed.insert(f.full_path.clone());
                 let current = (f.size, f.mtime);
                 let decision = outbox_decision(
                     current,
@@ -197,6 +211,9 @@ pub async fn run(node: Arc<SidecarNode>, roots: HashMap<String, PathBuf>, poll: 
                 last_sent.insert(f.full_path.clone(), current);
             }
         }
+        // Prune state for files no longer present, bounding map growth.
+        prune_to_observed(&mut last_seen, &observed);
+        prune_to_observed(&mut last_sent, &observed);
         tokio::time::sleep(poll).await;
     }
 }
@@ -248,6 +265,18 @@ mod tests {
             outbox_decision((20, t(2)), Some((20, t(2))), Some((10, t(1)))),
             OutboxDecision::Send
         );
+    }
+
+    #[test]
+    fn prune_drops_vanished_files() {
+        let mut map: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
+        map.insert(PathBuf::from("/o/keep.bin"), (1, t(1)));
+        map.insert(PathBuf::from("/o/gone.bin"), (2, t(2)));
+        let mut observed = std::collections::HashSet::new();
+        observed.insert(PathBuf::from("/o/keep.bin"));
+        prune_to_observed(&mut map, &observed);
+        assert!(map.contains_key(&PathBuf::from("/o/keep.bin")));
+        assert!(!map.contains_key(&PathBuf::from("/o/gone.bin")));
     }
 
     #[test]
