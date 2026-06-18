@@ -1,0 +1,46 @@
+name: Attachment delivery (compose)
+
+# Functional test for PRD-006 attachment delivery over Docker Compose. The
+# script in `test/attachment-delivery-compose.sh` sends a file from a sender's
+# `--attachment-root` outbox and asserts the *byte-identical* file lands in a
+# receiver's `--attachment-inbox` directory via a real two-node iroh transfer.
+# It refuses to pass on the vacuous zero-peer COMPLETED short-circuit by
+# checking connectedPeers >= 1 first.
+#
+# This guards against the PRD-006 v1 failure mode: a surface that passed every
+# unit test and delivered no files.
+#
+# Triggers: every push to main and every PR (catches receive-side regressions
+# at PR time). Runtime ~3-5 min (mostly the local image build).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: attachment-delivery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  delivery:
+    name: Attachment delivery (outbox -> inbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Confirm docker + compose are present
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Install jq + openssl
+        run: sudo apt-get update && sudo apt-get install -y jq openssl
+
+      - name: Run attachment-delivery-compose.sh
+        run: ./test/attachment-delivery-compose.sh
