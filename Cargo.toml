@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -119,14 +119,14 @@ path = "src/main.rs"
 #
 # The `kubernetes` feature gates this PR's `KubernetesDiscovery` wiring
 # (EndpointSlice watch); it's additive on top of rc.40's surface.
-peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend", "kubernetes"] }
+peat-mesh = { version = "=0.9.0-rc.43", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
 # peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
 # → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.25, <0.9.1", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.26, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's exact iroh pin
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh

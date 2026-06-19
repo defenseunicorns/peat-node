@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.6] - 2026-06-19
+## [0.4.7] - 2026-06-19
+
+### Changed
+
+- **Bumped to peat-mesh 0.9.0-rc.43 + peat-protocol 0.9.0-rc.26**, bringing the
+  attachment-delivery robustness work into a runnable node:
+  - **Inbound-accepted peers register into `known_peers`** (peat-mesh#261) — a
+    single dial now suffices between two directly-connected peers; a
+    one-directional `PEAT_NODE_PEERS` no longer silently drops attachments.
+  - **Provider gossip** (`peat/blob-announce/1`, peat-mesh#262) — "who holds
+    blob X" propagates across the mesh, so a node can fetch a blob from a
+    holder it discovered rather than only the original sender.
+  - **Distribution/file-transfer implementation relocated to peat-mesh**
+    (peat#992) and the **ADR-071 interest-driven convergence seam** (peat#991,
+    opt-in; default behavior unchanged). No peat-node source change — the
+    distribution API is consumed through peat-protocol's re-export.
 
 ### Added
 
