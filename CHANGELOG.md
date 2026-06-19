@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Attachment transaction logging now describes the file, both sides.**
+  - Receive side: the inbox sink logs at info with the `filename`, `bytes`,
+    `blob_hash`, and target path — not just the distribution id — and performs
+    a **post-write size validation** (the on-disk copy must match the declared
+    `blob_size` before the tmp→target rename is published). On mismatch it drops
+    the partial and returns an error so the receive watcher retries, rather than
+    publishing a short file. (Content integrity is already guaranteed upstream
+    by iroh's content-addressed fetch; this is the local-write completeness
+    check.)
+  - Send side: the outbox watcher's auto-distribute log now includes `bytes`
+    and the `sha256` alongside the filename and distribution id.
+
 ## [0.4.7] - 2026-06-19
 
 ### Changed

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use peat_mesh::storage::blob_traits::BlobMetadata;
 use peat_protocol::storage::{DistributionDocument, ReceiveSink};
-use tracing::debug;
+use tracing::info;
 
 // Re-export the test fault seam from its new home in peat-protocol so
 // existing integration tests (`peat_node::attachments::inbox::{...}`)
@@ -106,11 +106,32 @@ impl ReceiveSink for FilesystemInboxSink {
         // tokio::fs::copy reads + writes asynchronously; for v1 sizes
         // (256 MiB cap on max_file_bytes) the buffered copy is fine.
         tokio::fs::copy(blob_path, &tmp).await?;
+
+        // Post-write validation: the on-disk copy must match the distribution's
+        // declared size before we publish it (the tmp→target rename). Content
+        // integrity is already guaranteed upstream — iroh verifies the blob
+        // against its content hash on fetch — so a size match confirms the
+        // local write is complete and untruncated. On mismatch, drop the tmp
+        // and return Err so the receive watcher retries on the next sweep
+        // rather than publishing a short file.
+        let written = tokio::fs::metadata(&tmp).await?.len();
+        if written != doc.blob_size {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            anyhow::bail!(
+                "inbox write size mismatch for {filename} (dist {}): wrote {written} bytes, \
+                 expected {} — leaving for retry",
+                doc.distribution_id,
+                doc.blob_size
+            );
+        }
         tokio::fs::rename(&tmp, &target).await?;
-        debug!(
+        info!(
             distribution_id = %doc.distribution_id,
+            filename = %filename,
+            bytes = written,
+            blob_hash = %doc.blob_hash,
             target = %target.display(),
-            "attachment written to inbox"
+            "attachment received, validated, and written to inbox"
         );
         Ok(())
     }
