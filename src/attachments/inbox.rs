@@ -159,6 +159,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             status: "distributing".to_string(),
             cancelled_at: None,
+            collection: None,
             node_statuses: HashMap::new(),
         }
     }
