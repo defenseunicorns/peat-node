@@ -193,8 +193,12 @@ jobs:
         run: brew install protobuf
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: choco install protoc -y --no-progress
+        # Pull protoc from GitHub releases via the maintained action rather
+        # than the community Chocolatey feed, which intermittently 504s and
+        # fails the build with "Could not find protoc".
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # macOS builds the whole workspace; Windows builds peat-cli only.
       # The peat-node root crate uses Unix-only crates (e.g. iroh's
       # underlying transport pulls in libc) that the Windows port hasn't
