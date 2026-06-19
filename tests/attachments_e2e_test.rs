@@ -73,6 +73,8 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
         // Tight poll interval so the test doesn't wait 1s+ for each
         // watcher tick. Real deployments use the default (1s).
         1,
+        false, // outbox_watch
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 
@@ -158,10 +160,12 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 /// Poll the inbox until a file with `expected` bytes appears under
-/// `{inbox}/{distribution_id}/...`. Returns the path. Times out after
-/// 30 seconds to bound failure-mode flakiness — successful delivery
-/// usually lands in under 3 seconds (iroh handshake + one watcher
-/// tick).
+/// `{inbox}/{distribution_id}/...`. Returns the path. Callers pass a 60s
+/// deadline: successful delivery lands in under 3 seconds (iroh handshake + one
+/// watcher tick), but a CPU-contended CI runner spinning up multiple two-node
+/// iroh meshes needs generous headroom (a 30s budget flaked — peat-node SKILL
+/// gotcha on the `iroh_two_node` serial tests). A timeout here is a real
+/// delivery failure, not slowness.
 async fn await_inbox_file(
     inbox: &std::path::Path,
     distribution_id: &str,
@@ -317,7 +321,7 @@ async fn end_to_end_attachment_delivery_two_nodes() {
         &b.inbox_path,
         &distribution_id,
         &payload,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -459,7 +463,7 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
         &b.inbox_path,
         &distribution_id,
         &payload,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
     let b_bytes = tokio::fs::read(&b_path).await.unwrap();
@@ -619,7 +623,7 @@ async fn receiver_writes_node_status_into_distribution_doc() {
         &b.inbox_path,
         &distribution_id,
         &payload,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -771,7 +775,7 @@ async fn sender_get_attachment_distribution_reaches_completed_two_nodes() {
         &b.inbox_path,
         &distribution_id,
         &payload,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 

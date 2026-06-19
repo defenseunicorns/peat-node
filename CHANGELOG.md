@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Send-side outbox watcher** (`PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`, opt-in)
+  — the symmetric counterpart to the receive-side inbox watcher. Polls the
+  configured `--attachment-root` dir(s) and auto-distributes any stable new file
+  (`AllNodes` scope, default priority) by driving the same `SendAttachments`
+  path — **no gRPC call**. Drop a file in the outbox and it lands byte-identical
+  in every peer's inbox: a synced-folder model across the mesh. Off by default
+  (the explicit RPC stays the safe default); `PEAT_NODE_ATTACHMENT_OUTBOX_POLL_SECS`
+  tunes the interval (default 2s). Covered by a new compose functest
+  (`test/attachment-outbox-watch-compose.sh`) that drops a file and asserts it
+  arrives in the peer inbox with no `SendAttachments`.
+
 ## [0.4.4] - 2026-06-18
 
 ### Fixed

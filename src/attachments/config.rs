@@ -116,6 +116,13 @@ pub struct AttachmentConfig {
     /// Inbox watcher poll interval (seconds). Smaller = faster delivery
     /// but more `file_distributions` scans. Default 1s.
     pub inbox_poll_secs: u32,
+    /// Enable the send-side outbox watcher: poll the configured roots and
+    /// auto-distribute (AllNodes scope, `default_priority`) any stable new file,
+    /// with no `SendAttachments` call. Off by default — the explicit RPC stays
+    /// the safe default. Requires at least one root.
+    pub outbox_watch: bool,
+    /// Outbox watcher poll interval (seconds). Default 2s.
+    pub outbox_poll_secs: u32,
 }
 
 impl Default for AttachmentConfig {
@@ -135,12 +142,17 @@ impl Default for AttachmentConfig {
             handle_retention_secs: DEFAULT_HANDLE_RETENTION_SECS,
             max_known_bundles: DEFAULT_MAX_KNOWN_BUNDLES,
             inbox_poll_secs: DEFAULT_INBOX_POLL_SECS,
+            outbox_watch: false,
+            outbox_poll_secs: DEFAULT_OUTBOX_POLL_SECS,
         }
     }
 }
 
 /// Default inbox watcher poll interval (seconds).
 pub const DEFAULT_INBOX_POLL_SECS: u32 = 1;
+
+/// Default outbox watcher poll interval (seconds).
+pub const DEFAULT_OUTBOX_POLL_SECS: u32 = 2;
 
 #[allow(clippy::too_many_arguments)]
 impl AttachmentConfig {
@@ -160,6 +172,8 @@ impl AttachmentConfig {
         handle_retention_secs: u32,
         max_known_bundles: u32,
         inbox_poll_secs: u32,
+        outbox_watch: bool,
+        outbox_poll_secs: u32,
     ) -> Result<Self, ConfigError> {
         let mut roots = HashMap::new();
         for spec in raw_roots {
@@ -198,6 +212,8 @@ impl AttachmentConfig {
             handle_retention_secs,
             max_known_bundles,
             inbox_poll_secs,
+            outbox_watch,
+            outbox_poll_secs,
         })
     }
 
@@ -298,6 +314,8 @@ mod tests {
             DEFAULT_HANDLE_RETENTION_SECS,
             DEFAULT_MAX_KNOWN_BUNDLES,
             DEFAULT_INBOX_POLL_SECS,
+            false,
+            DEFAULT_OUTBOX_POLL_SECS,
         )
     }
 

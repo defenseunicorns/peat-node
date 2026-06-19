@@ -53,6 +53,8 @@ async fn boot_server_with_attachments(port: u16) -> BootedServer {
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+        false,
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .expect("attachment_config must construct against a real tempdir root");
 
