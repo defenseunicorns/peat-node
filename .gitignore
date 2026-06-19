@@ -1,2 +1,5 @@
 /target
 .DS_Store
+
+# Per-session runtime lockfile from local scheduling tooling — never source-controlled.
+.claude/scheduled_tasks.lock
