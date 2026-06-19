@@ -36,6 +36,17 @@
 #   PEER_ADDR      The OTHER node's reachable address as host:udp-port, where
 #                  udp-port is that node's IROH_UDP_PORT. e.g. 10.0.0.20:51072
 #
+# ⚠ BOTH MACHINES MUST SET PEER_ID/PEER_ADDR pointing at each other — this is a
+#   TWO-WAY dial, not a convenience. A node's `known_peers` is populated ONLY
+#   when IT dials out (the PEAT_NODE_PEERS entry); accepting an inbound
+#   connection does NOT register the peer. Attachment delivery reads `known_peers`
+#   on both ends: the SENDER's set decides who a distribution targets, and the
+#   RECEIVER's set is where it looks to fetch the blob. If only one side lists the
+#   other, the distribution *document* still syncs but the file is never
+#   delivered — the classic "synced but nothing written" symptom. (One iroh QUIC
+#   connection still carries the bytes both ways; the requirement is two dials,
+#   not two connections. Tracked upstream: peat-node#170.)
+#
 #   # Optional — attachment delivery (off by default). Uncomment the matching
 #   # `environment:`/`volumes:` lines below to enable, and create the host dir.
 #   ATTACHMENT_ROOT    Readable outbox root, name=path. e.g. outbox=/var/lib/peat/outbox
@@ -89,7 +100,13 @@ services:
       # mDNS can't cross subnets; rely purely on the static peer above.
       PEAT_NODE_DISABLE_MDNS: "true"
       PEAT_NODE_AUTO_SYNC: "true"
-      RUST_LOG: peat_node=info
+      # Log the whole sync stack, not just peat-node. `peat_protocol` carries the
+      # attachment targeting + blob-fetch logs and `peat_mesh` the peer-status
+      # heartbeat (connected_peers vs known_peers) — exactly what you need to see
+      # whether a peer is actually peered. `iroh=warn` surfaces QUIC dial
+      # failures. (peat-node v0.4.6+ uses this as the built-in default; setting
+      # it explicitly here makes the example self-contained on older images too.)
+      RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
       # Optional attachment delivery — uncomment with the volume(s) below:
       # PEAT_NODE_ATTACHMENT_ROOT: ${ATTACHMENT_ROOT}
       # PEAT_NODE_ATTACHMENT_INBOX: ${ATTACHMENT_INBOX}

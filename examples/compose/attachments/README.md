@@ -146,7 +146,23 @@ B_ID=$(peat-node derive-id --shared-key "$K" --node-id node-b)
 
 Each machine runs one node with its own `.env` (node id, shared key, iroh UDP
 port, and the peer's derived id @ its IP:port). No `peer.sh`, no `GetStatus`
-round-trip, no mDNS. See the header of `docker-compose.multi-host.yml` for the
+round-trip, no mDNS.
+
+> **Both machines must list each other** (`A_ID` in B's `PEAT_NODE_PEERS`, `B_ID`
+> in A's) — and this is mandatory, not symmetry for its own sake. A node's
+> `known_peers` is populated *only when it dials out*; accepting an inbound
+> connection doesn't register the peer. Attachment delivery reads `known_peers`
+> on both ends — the **sender's** set decides who a distribution targets, the
+> **receiver's** set is where it fetches the blob. List only one side and the
+> distribution *document* still syncs (CRDT gossip is transitive) but the file
+> is never written: the "synced but nothing delivered" symptom. One iroh QUIC
+> connection carries the bytes either way, so this is two *dials*, not two
+> connections. The `peer status` log line (`connected_peers` vs `known_peers`,
+> every 30s) shows whether each side actually dialed the other. The requirement
+> for adjacent peers is tracked for removal upstream in
+> [peat-node#170](https://github.com/defenseunicorns/peat-node/issues/170).
+
+See the header of `docker-compose.multi-host.yml` for the
 full per-machine `.env` and the firewall/UDP-publish note, and
 [`docs/CONFIGURATION.md` → Deterministic identity](../../../docs/CONFIGURATION.md#deterministic-identity--offline-peer-id-derivation)
 for the full reference.

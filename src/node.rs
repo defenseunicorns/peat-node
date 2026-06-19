@@ -202,6 +202,12 @@ struct PeerRegistration {
 /// scenario surfaces a different sweet spot.
 const RECONNECT_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Interval for the periodic peer-status heartbeat log. Coarse on purpose:
+/// it's an operator-facing "who am I connected to / who can I target"
+/// breadcrumb, not a fast control loop, so it shouldn't compete with the
+/// watchdog's 5 s cadence or spam the log.
+const PEER_STATUS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Initial backoff for a freshly-registered peer or a peer whose last
 /// dial succeeded. Equal to the watchdog interval so the first retry
 /// fires on the very next tick after a transient drop.
@@ -599,6 +605,55 @@ impl SidecarNode {
                             ),
                         }
                     }
+                }
+            });
+        }
+
+        // Periodic peer-status heartbeat. Operators diagnosing sync or
+        // attachment problems need a single line answering "who is this node
+        // actually connected to, and which peers can it target?". Two sets
+        // matter and they can legitimately differ:
+        //   * `connected_peers()` (transport) — live CRDT-sync connections.
+        //   * `known_peers()` (blob store) — peers THIS node dialed. This is
+        //     the exact set `resolve_targets` uses for distribution targeting
+        //     and `fetch_blob` uses to locate blob providers, so it's the set
+        //     that governs whether an attachment can be delivered.
+        // A peer in `known` but not `connected` means a dial is failing; a
+        // receiver missing from a sender's `known` set is why a synced
+        // distribution doc never turns into a delivered file. Logged at info
+        // so it shows under the default filter. Holds a `Weak` ref so it exits
+        // cleanly when the node is dropped (mirrors the reconnect watchdog).
+        {
+            let backend_weak = Arc::downgrade(&backend);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(PEER_STATUS_LOG_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    let Some(backend) = backend_weak.upgrade() else {
+                        debug!("peer-status logger: backend dropped, exiting");
+                        break;
+                    };
+                    let connected: Vec<String> = backend
+                        .transport()
+                        .connected_peers()
+                        .into_iter()
+                        .map(|id| id.fmt_short().to_string())
+                        .collect();
+                    let known: Vec<String> = backend
+                        .blob_store()
+                        .known_peers()
+                        .await
+                        .into_iter()
+                        .map(|id| id.fmt_short().to_string())
+                        .collect();
+                    info!(
+                        connected_count = connected.len(),
+                        known_count = known.len(),
+                        connected_peers = ?connected,
+                        known_peers = ?known,
+                        "peer status"
+                    );
                 }
             });
         }
