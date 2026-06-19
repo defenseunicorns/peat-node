@@ -22,9 +22,13 @@ use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
 use peat_node::watcher;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "peat-node", about = "Peat CRDT mesh node with Connect RPC API")]
 struct Args {
+    /// Log the full resolved configuration at startup (secrets redacted).
+    #[arg(long, env = "PEAT_NODE_PRINT_CONFIG", default_value = "false")]
+    print_config: bool,
+
     /// Optional subcommand. With none, peat-node runs the mesh node (default).
     #[command(subcommand)]
     command: Option<Command>,
@@ -327,7 +331,7 @@ struct Args {
     discovery_interval_secs: u64,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Clone)]
 enum Command {
     /// Print the deterministic iroh `EndpointId` for a `(shared-key, node-id)`
     /// pair, offline — no node boot, no network, no access to the peer.
@@ -378,6 +382,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Version banner at the top of the logs: peat-node's own version plus the
+    // resolved versions of the core dependency stack (captured from Cargo.lock
+    // by build.rs). Lets an operator confirm exactly which build + mesh/protocol
+    // RC a container is running from the first log line.
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        peat_mesh = env!("PEAT_MESH_VERSION"),
+        peat_protocol = env!("PEAT_PROTOCOL_VERSION"),
+        peat_schema = env!("PEAT_SCHEMA_VERSION"),
+        "peat-node version + dependency stack"
+    );
+
     // Treat any empty `PEAT_NODE_*` env var as unset before clap parses.
     // Compose/Helm routinely inject empty-string env vars for "disabled"
     // optional settings (e.g. `PEAT_NODE_ATTACHMENT_INBOX=""`); clap otherwise
@@ -421,6 +437,17 @@ async fn main() -> anyhow::Result<()> {
         agent_addr = ?args.agent_addr,
         "starting peat-node"
     );
+
+    // Full resolved-configuration dump (opt-in via --print-config /
+    // PEAT_NODE_PRINT_CONFIG). Secrets are redacted before logging.
+    if args.print_config {
+        let mut redacted = args.clone();
+        redacted.shared_key = "<redacted>".to_string();
+        if redacted.encryption_key.is_some() {
+            redacted.encryption_key = Some("<redacted>".to_string());
+        }
+        info!("resolved configuration (PEAT_NODE_PRINT_CONFIG):\n{redacted:#?}");
+    }
 
     tokio::fs::create_dir_all(&args.data_dir).await?;
 

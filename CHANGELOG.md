@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Startup version banner.** The first log line now reports peat-node's own
+  version plus the resolved versions of the core dependency stack —
+  `peat-mesh`, `peat-protocol`, `peat-schema` (captured from `Cargo.lock` at
+  build time). Lets an operator confirm exactly which build + mesh/protocol RC
+  a container is running from the top of the logs.
+- **`--print-config` / `PEAT_NODE_PRINT_CONFIG`.** Opt-in flag that logs the
+  full resolved configuration at startup (shared key + encryption key redacted)
+  — for diagnosing env/flag/Compose wiring.
+
 ### Changed
 
 - **Attachment transaction logging now describes the file, both sides.**
