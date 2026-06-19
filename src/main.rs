@@ -365,7 +365,16 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "peat_node=info,peat_mesh=info".into()),
+                // Include the whole sync stack at info by default, not just
+                // peat-node itself. `peat_protocol` carries the attachment
+                // send/receive watcher logs (targeting + blob fetch) — without
+                // it a failed delivery is invisible. `iroh=warn` surfaces QUIC
+                // dial / connection failures (the usual reason a peer never
+                // enters `known_peers`) without the info-level packet spam.
+                // Override the whole thing with `RUST_LOG`.
+                .unwrap_or_else(|_| {
+                    "peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn".into()
+                }),
         )
         .init();
 

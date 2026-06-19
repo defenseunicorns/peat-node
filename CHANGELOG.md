@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Periodic peer-status log line.** Every 30s the node logs a single
+  `peer status` line with `connected_count` / `known_count` and the short
+  endpoint ids of both sets: `connected_peers` (live CRDT-sync connections,
+  from the transport) and `known_peers` (peers this node dialed — the exact
+  set used for distribution targeting and blob-provider lookup). A receiver
+  missing from a sender's `known_peers` is precisely why a synced attachment
+  document never becomes a delivered file; this makes that visible at a
+  glance. Fires immediately at startup, then on the interval.
+
+### Changed
+
+- **Default log filter now covers the whole sync stack.** Was
+  `peat_node=info,peat_mesh=info`; now also includes `peat_protocol=info`
+  (the crate that owns the attachment send/receive watchers — targeting and
+  blob fetch — so a failed delivery is no longer silent) and `iroh=warn`
+  (surfaces QUIC dial / connection failures without info-level packet spam).
+  `RUST_LOG` still overrides the entire default.
+
 ## [0.4.5] - 2026-06-19
 
 ### Added
