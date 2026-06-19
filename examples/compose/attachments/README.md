@@ -97,7 +97,7 @@ ls inbox-b/                                # files appear here per distribution_
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
-(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.4`. For testing local
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.5`. For testing local
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-19
+
 ### Added
 
 - **Send-side outbox watcher** (`PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`, opt-in)
