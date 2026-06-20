@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-06-20
+
+### Fixed
+
+- **Received attachments keep their original name and folder layout.** Files
+  were landing at `inbox/<distribution_id>/<basename>` — the original filename
+  buried under a UUID directory and any subdirectories flattened. The inbox now
+  mirrors the sender's outbox layout: a file dropped at `outbox/sub/report.pdf`
+  lands at `inbox/sub/report.pdf`, and re-delivery of the same path overwrites
+  (latest-wins). Sender-controlled names are re-sanitised on arrival (only
+  `Normal` path components accepted), so an absolute path or one containing `..`
+  can never escape the inbox — such a name falls back to a flat
+  `<distribution_id>.bin` at the inbox root. (#173)
+
 ### Added
 
 - **Startup version banner.** The first log line now reports peat-node's own
