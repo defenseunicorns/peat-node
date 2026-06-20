@@ -125,8 +125,11 @@ DIST="$(echo "$RESP" | jq -r '.handles[0].distributionId // empty')"
 log "distribution_id=$DIST"
 
 # ---- The assertion that matters: byte-identical file on the receiver --------
+# The inbox mirrors the sender's outbox layout: a file sent with
+# relativePath="payload.bin" lands at inbox/payload.bin (original name, no
+# distribution_id wrapper dir).
 log "Polling receiver inbox for delivered bytes (up to 40s)"
-RECV="$WORK/inbox/$DIST/payload.bin"
+RECV="$WORK/inbox/payload.bin"
 for i in $(seq 1 40); do
     if [ -f "$RECV" ]; then
         RSHA="$(openssl dgst -sha256 -binary "$RECV" | base64)"
