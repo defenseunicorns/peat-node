@@ -189,6 +189,7 @@ pub async fn run(node: Arc<SidecarNode>, roots: HashMap<String, PathBuf>, poll: 
                         continue;
                     }
                 };
+                let sha_hex = hex::encode(&sha256);
                 let req = build_request(root_name, &f.relative_path, f.size, sha256);
                 match super::handlers::send_attachments(&node, req).await {
                     Ok(resp) => {
@@ -197,7 +198,13 @@ pub async fn run(node: Arc<SidecarNode>, roots: HashMap<String, PathBuf>, poll: 
                             .first()
                             .map(|h| h.distribution_id.as_str())
                             .unwrap_or("");
-                        info!(file = %f.relative_path, distribution_id = %dist, "outbox: auto-distributed");
+                        info!(
+                            file = %f.relative_path,
+                            bytes = f.size,
+                            sha256 = %sha_hex,
+                            distribution_id = %dist,
+                            "outbox: auto-distributed attachment"
+                        );
                     }
                     Err(e) => {
                         // Mark sent regardless so we don't re-attempt the same

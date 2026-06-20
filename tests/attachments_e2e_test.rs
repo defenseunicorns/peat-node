@@ -159,52 +159,61 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Poll the inbox until a file with `expected` bytes appears under
-/// `{inbox}/{distribution_id}/...`. Returns the path. Callers pass a 60s
-/// deadline: successful delivery lands in under 3 seconds (iroh handshake + one
-/// watcher tick), but a CPU-contended CI runner spinning up multiple two-node
-/// iroh meshes needs generous headroom (a 30s budget flaked — peat-node SKILL
-/// gotcha on the `iroh_two_node` serial tests). A timeout here is a real
-/// delivery failure, not slowness.
-async fn await_inbox_file(
-    inbox: &std::path::Path,
-    distribution_id: &str,
-    expected: &[u8],
-    deadline: Duration,
-) -> PathBuf {
+/// Poll the inbox tree until a file with `expected` bytes appears anywhere under
+/// `inbox`. The inbox mirrors the sender's outbox layout (`inbox/<relative_path>`,
+/// e.g. `inbox/delivery.bin` or `inbox/sub/x.bin`) — no distribution_id wrapper
+/// dir — so we search recursively rather than keying on the distribution_id.
+/// Returns the path. Callers pass a 60s deadline: successful delivery lands in
+/// under 3 seconds (iroh handshake + one watcher tick), but a CPU-contended CI
+/// runner spinning up multiple two-node iroh meshes needs generous headroom (a
+/// 30s budget flaked — peat-node SKILL gotcha on the `iroh_two_node` serial
+/// tests). A timeout here is a real delivery failure, not slowness.
+async fn await_inbox_file(inbox: &std::path::Path, expected: &[u8], deadline: Duration) -> PathBuf {
     let deadline_at = Instant::now() + deadline;
-    let dist_dir = inbox.join(distribution_id);
     while Instant::now() < deadline_at {
-        if dist_dir.is_dir() {
-            // Look for any file in the distribution-id subdirectory.
-            if let Ok(mut iter) = tokio::fs::read_dir(&dist_dir).await {
-                while let Ok(Some(entry)) = iter.next_entry().await {
-                    let path = entry.path();
-                    // Skip our own in-flight tmp marker
-                    if path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|s| s.starts_with('.'))
-                    {
-                        continue;
-                    }
-                    if path.is_file() {
-                        if let Ok(actual) = tokio::fs::read(&path).await {
-                            if actual == expected {
-                                return path;
-                            }
-                        }
-                    }
-                }
-            }
+        if let Some(found) = find_matching_file(inbox, expected) {
+            return found;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!(
-        "no file with the expected content appeared in {} within {:?}",
-        dist_dir.display(),
+        "no file with the expected content appeared under {} within {:?}",
+        inbox.display(),
         deadline
     );
+}
+
+/// Recursively search `root` for a regular file whose bytes equal `expected`,
+/// skipping in-flight `.partial` tmp markers (dotfiles). Synchronous `std::fs`
+/// is fine in this test helper.
+fn find_matching_file(root: &std::path::Path, expected: &[u8]) -> Option<PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with('.'))
+            {
+                continue; // in-flight tmp marker
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                if let Ok(actual) = std::fs::read(&path) {
+                    if actual == expected {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Boot A + B, peer them, send a real file from A, assert the *same
@@ -317,13 +326,7 @@ async fn end_to_end_attachment_delivery_two_nodes() {
     // The assertion that matters: B's filesystem inbox eventually
     // contains a file with the same bytes. 30-second timeout gives
     // iroh + watcher headroom but successful runs land in <3 seconds.
-    let received_path = await_inbox_file(
-        &b.inbox_path,
-        &distribution_id,
-        &payload,
-        Duration::from_secs(60),
-    )
-    .await;
+    let received_path = await_inbox_file(&b.inbox_path, &payload, Duration::from_secs(60)).await;
 
     // Per-byte and sha256 cross-check on the received file.
     let received = tokio::fs::read(&received_path).await.unwrap();
@@ -453,19 +456,14 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
         }),
     )
     .await;
-    let distribution_id = resp["handles"][0]["distributionId"]
+    // Assert the RPC returned a distribution_id; the inbox no longer namespaces
+    // by it, so we don't need the value itself for the on-disk assertions.
+    resp["handles"][0]["distributionId"]
         .as_str()
-        .expect("SendAttachments must return a distribution_id")
-        .to_string();
+        .expect("SendAttachments must return a distribution_id");
 
     // B receives.
-    let b_path = await_inbox_file(
-        &b.inbox_path,
-        &distribution_id,
-        &payload,
-        Duration::from_secs(60),
-    )
-    .await;
+    let b_path = await_inbox_file(&b.inbox_path, &payload, Duration::from_secs(60)).await;
     let b_bytes = tokio::fs::read(&b_path).await.unwrap();
     assert_eq!(
         sha256_of(&b_bytes),
@@ -478,35 +476,11 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
     // on the synced doc if it were going to.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // C does NOT receive.
-    let c_dist_dir = c.inbox_path.join(&distribution_id);
-    let c_has_payload = if c_dist_dir.is_dir() {
-        // Allow the directory to exist but assert no non-hidden file of
-        // the payload's size lives there. The watcher's `already_delivered`
-        // gate uses size-matching, and a sender-controlled empty dir
-        // wouldn't be a delivery anyway. Inspecting size is more direct
-        // than relying on the absence of the dir itself.
-        let mut iter = tokio::fs::read_dir(&c_dist_dir).await.unwrap();
-        let mut found_payload = false;
-        while let Ok(Some(entry)) = iter.next_entry().await {
-            let p = entry.path();
-            if p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|s| s.starts_with('.'))
-            {
-                continue;
-            }
-            if let Ok(md) = entry.metadata().await {
-                if md.is_file() && md.len() == payload.len() as u64 {
-                    found_payload = true;
-                    break;
-                }
-            }
-        }
-        found_payload
-    } else {
-        false
-    };
+    // C does NOT receive. Scan C's entire inbox tree (the inbox mirrors the
+    // sender's relative path, so there's no distribution_id dir to look under)
+    // for the exact payload bytes — `find_matching_file` skips in-flight tmp
+    // markers, and a byte-exact match is a stronger signal than size alone.
+    let c_has_payload = find_matching_file(&c.inbox_path, &payload).is_some();
     assert!(
         !c_has_payload,
         "C must NOT receive the file — NodeListScope was [{b_short}] only. \
@@ -619,13 +593,7 @@ async fn receiver_writes_node_status_into_distribution_doc() {
 
     // First, wait for byte-on-disk delivery — that's the sync point
     // after which both node-status writes must have run.
-    let _ = await_inbox_file(
-        &b.inbox_path,
-        &distribution_id,
-        &payload,
-        Duration::from_secs(60),
-    )
-    .await;
+    let _ = await_inbox_file(&b.inbox_path, &payload, Duration::from_secs(60)).await;
 
     // Poll the receiver's local distribution doc until `node_statuses`
     // for this node reaches `Completed`, with a 15-second timeout. The
@@ -771,13 +739,7 @@ async fn sender_get_attachment_distribution_reaches_completed_two_nodes() {
 
     // Sync point: bytes land on B's inbox, after which B's
     // Completed node-status write propagates back to A.
-    let _ = await_inbox_file(
-        &b.inbox_path,
-        &distribution_id,
-        &payload,
-        Duration::from_secs(60),
-    )
-    .await;
+    let _ = await_inbox_file(&b.inbox_path, &payload, Duration::from_secs(60)).await;
 
     // Poll A's unary GetAttachmentDistribution until it reports
     // COMPLETED. 30s ceiling: byte delivery already happened, so this
