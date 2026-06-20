@@ -180,14 +180,14 @@ async fn ingest_file<B: BlobStore + ?Sized>(
 }
 
 fn build_blob_metadata(file: &ValidatedFile) -> BlobMetadata {
+    // Carry the FULL relative path (forward-slashed), not just the basename, so
+    // the receiver can mirror the sender's layout (inbox/<relative_path>)
+    // instead of flattening every file to its basename. The receiver
+    // re-sanitises this against path traversal before use. `display_name` still
+    // overrides when a caller set one explicitly.
     let name = file
         .display_name
         .clone()
-        .or_else(|| {
-            Path::new(&file.relative_path)
-                .file_name()
-                .and_then(|n| n.to_str().map(String::from))
-        })
         .or_else(|| Some(file.relative_path.clone()));
 
     BlobMetadata {

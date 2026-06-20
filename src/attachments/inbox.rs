@@ -14,14 +14,19 @@
 //!
 //! # Inbox layout
 //!
-//! `{inbox_root}/{distribution_id}/{filename}` where `filename` comes
-//! from `BlobMetadata.name` (set by the sender's `build_blob_metadata`
-//! from `display_name` or the basename of `relative_path`), sanitized
-//! to remove path separators. Distribution-ID namespacing avoids
-//! collisions when two different distributions target the same logical
-//! filename. Applications watching the inbox can correlate the
-//! distribution_id back to the sender via
-//! `GetAttachmentDistribution(distribution_id)`.
+//! `{inbox_root}/{relative_path}` — the inbox mirrors the sender's outbox
+//! layout, so a file dropped at `outbox/sub/report.pdf` lands at
+//! `inbox/sub/report.pdf` with its original name and subdirectories intact.
+//! The relative path comes from `BlobMetadata.name` (set by the sender's
+//! `build_blob_metadata` from `display_name` or the full `relative_path`).
+//! Re-delivery of the same path overwrites (latest-wins).
+//!
+//! Because the sender controls `BlobMetadata.name`, it is re-sanitised on
+//! arrival ([`inbox_relpath`]): only `Normal` path components are accepted, so
+//! an absolute path or one containing `..` can never escape the inbox — such a
+//! name falls back to a flat `{distribution_id}.bin` at the inbox root.
+//! Applications watching the inbox can still correlate a delivery back to the
+//! sender via `GetAttachmentDistribution(distribution_id)`.
 
 #![allow(clippy::result_large_err)]
 
@@ -55,53 +60,46 @@ impl FilesystemInboxSink {
 
 #[async_trait::async_trait]
 impl ReceiveSink for FilesystemInboxSink {
-    /// Filesystem-based "already delivered" gate. The
-    /// distribution-id-namespaced directory is the durable source of
-    /// truth: a long-running receiver that restarts doesn't re-fetch
-    /// and re-write every historical delivery. The "matching-size +
-    /// non-hidden" rule treats the existence of any regular file with
-    /// the declared blob_size in `{inbox}/{distribution_id}/` as proof
-    /// of prior delivery. Returns false on any I/O error so the caller
-    /// falls through to the fetch path and retries — better to
-    /// re-deliver than to silently skip a file that ought to land.
+    /// Filesystem-based "already delivered" gate, keyed on the file's mirrored
+    /// path (`{inbox}/{relative_path}`). Restart idempotency: a long-running
+    /// receiver that restarts doesn't re-fetch a delivery whose target already
+    /// holds a regular file of the declared `blob_size`. Size-only — the bytes
+    /// are content-verified by iroh on fetch. Returns false on any I/O error
+    /// (and on the rare same-path/same-size-but-different-content case) so the
+    /// caller re-delivers rather than silently skipping a file that should land.
     async fn already_delivered(&self, doc: &DistributionDocument) -> bool {
-        let dir = self.inbox_root.join(&doc.distribution_id);
-        if !dir.is_dir() {
-            return false;
+        let rel = inbox_relpath(&doc.blob_metadata)
+            .unwrap_or_else(|| PathBuf::from(format!("{}.bin", doc.distribution_id)));
+        match tokio::fs::metadata(self.inbox_root.join(rel)).await {
+            Ok(md) => md.is_file() && md.len() == doc.blob_size,
+            Err(_) => false,
         }
-        let mut iter = match tokio::fs::read_dir(&dir).await {
-            Ok(i) => i,
-            Err(_) => return false,
-        };
-        while let Ok(Some(entry)) = iter.next_entry().await {
-            let path = entry.path();
-            // Skip our own in-flight `.{name}.partial` markers.
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|s| s.starts_with('.'))
-            {
-                continue;
-            }
-            if let Ok(md) = entry.metadata().await {
-                if md.is_file() && md.len() == doc.blob_size {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
-    /// Copy the blob bytes into `{inbox}/{distribution_id}/{filename}`
-    /// via a tmp-file + rename pair so readers never see a partial
-    /// file.
+    /// Write the blob to `{inbox}/{relative_path}`, mirroring the sender's
+    /// layout (so `outbox/sub/demo.txt` lands at `inbox/sub/demo.txt`), via a
+    /// tmp-file + rename so readers never see a partial file. Re-delivery of the
+    /// same path overwrites (latest-wins). The relative path is re-sanitised
+    /// here ([`inbox_relpath`]) — the sender controls `blob_metadata.name`, so a
+    /// name that is absolute or contains `..` is rejected and the file lands at
+    /// a flat `<distribution_id>.bin` at the inbox root instead of escaping it.
     async fn deliver(&self, doc: &DistributionDocument, blob_path: &Path) -> anyhow::Result<()> {
-        let dir = self.inbox_root.join(&doc.distribution_id);
-        tokio::fs::create_dir_all(&dir).await?;
+        let rel = inbox_relpath(&doc.blob_metadata)
+            .unwrap_or_else(|| PathBuf::from(format!("{}.bin", doc.distribution_id)));
+        let target = self.inbox_root.join(&rel);
 
-        let filename = inbox_filename(&doc.blob_metadata, &doc.distribution_id);
-        let target = dir.join(&filename);
-        let tmp = dir.join(format!(".{filename}.partial"));
+        // Create the (possibly nested) parent dir, and stage the tmp file in it
+        // so the publishing rename is atomic on the same filesystem.
+        let parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.inbox_root.clone());
+        tokio::fs::create_dir_all(&parent).await?;
+        let fname = target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("blob");
+        let tmp = parent.join(format!(".{fname}.partial"));
 
         // tokio::fs::copy reads + writes asynchronously; for v1 sizes
         // (256 MiB cap on max_file_bytes) the buffered copy is fine.
@@ -118,8 +116,9 @@ impl ReceiveSink for FilesystemInboxSink {
         if written != doc.blob_size {
             let _ = tokio::fs::remove_file(&tmp).await;
             anyhow::bail!(
-                "inbox write size mismatch for {filename} (dist {}): wrote {written} bytes, \
+                "inbox write size mismatch for {} (dist {}): wrote {written} bytes, \
                  expected {} — leaving for retry",
+                rel.display(),
                 doc.distribution_id,
                 doc.blob_size
             );
@@ -127,7 +126,7 @@ impl ReceiveSink for FilesystemInboxSink {
         tokio::fs::rename(&tmp, &target).await?;
         info!(
             distribution_id = %doc.distribution_id,
-            filename = %filename,
+            filename = %rel.display(),
             bytes = written,
             blob_hash = %doc.blob_hash,
             target = %target.display(),
@@ -137,24 +136,38 @@ impl ReceiveSink for FilesystemInboxSink {
     }
 }
 
-/// Derive a safe inbox filename from the blob metadata. Strips path
-/// separators; falls back to `<distribution_id>.bin` if metadata has
-/// no name or the name sanitises to empty.
-fn inbox_filename(metadata: &BlobMetadata, distribution_id: &str) -> String {
-    if let Some(raw) = metadata.name.as_ref() {
-        // Take only the last path component; strip leading dots so
-        // a malicious sender can't smuggle hidden files past an
-        // operator scanning ls -l on the inbox.
-        let last = std::path::Path::new(raw)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim_start_matches('.'))
-            .filter(|s| !s.is_empty());
-        if let Some(name) = last {
-            return name.to_string();
+/// Resolve the sender-provided `blob_metadata.name` into a safe path **relative
+/// to the inbox root**, preserving subdirectories so the inbox mirrors the
+/// sender's layout (`outbox/sub/demo.txt` → `inbox/sub/demo.txt`).
+///
+/// Path-traversal guard: the sender controls `name`, so only `Normal` path
+/// components are accepted. Any absolute path, `..`, root, or drive-prefix
+/// component makes this return `None`, and the caller falls back to a flat
+/// `<distribution_id>.bin` at the inbox root — a malicious or malformed name
+/// can never write outside the inbox. Returns `None` for a missing/empty name
+/// or one that sanitises to nothing.
+fn inbox_relpath(metadata: &BlobMetadata) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let raw = metadata.name.as_deref()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut safe = PathBuf::new();
+    for comp in std::path::Path::new(raw).components() {
+        match comp {
+            Component::Normal(c) => safe.push(c),
+            Component::CurDir => {} // "." — ignore
+            // ".." (ParentDir), "/" (RootDir), or a Windows prefix — reject the
+            // whole name rather than try to repair it.
+            _ => return None,
         }
     }
-    format!("{distribution_id}.bin")
+    if safe.as_os_str().is_empty() {
+        None
+    } else {
+        Some(safe)
+    }
 }
 
 #[cfg(test)]
@@ -164,16 +177,20 @@ mod tests {
     use peat_protocol::storage::{DistributionScope, TransferPriority};
     use std::collections::HashMap;
 
+    fn meta(name: Option<&str>) -> BlobMetadata {
+        BlobMetadata {
+            name: name.map(String::from),
+            content_type: None,
+            custom: HashMap::new(),
+        }
+    }
+
     fn doc_with(distribution_id: &str, blob_size: u64, name: Option<&str>) -> DistributionDocument {
         DistributionDocument {
             distribution_id: distribution_id.to_string(),
             blob_hash: "deadbeef".to_string(),
             blob_size,
-            blob_metadata: BlobMetadata {
-                name: name.map(|s| s.to_string()),
-                content_type: None,
-                custom: HashMap::new(),
-            },
+            blob_metadata: meta(name),
             scope: DistributionScope::AllNodes,
             priority: TransferPriority::Normal,
             target_nodes: vec![],
@@ -186,142 +203,120 @@ mod tests {
     }
 
     #[test]
-    fn inbox_filename_uses_metadata_name() {
-        let m = BlobMetadata {
-            name: Some("report.pdf".into()),
-            content_type: None,
-            custom: HashMap::new(),
-        };
-        assert_eq!(inbox_filename(&m, "dist-X"), "report.pdf");
+    fn relpath_preserves_subdirs() {
+        assert_eq!(
+            inbox_relpath(&meta(Some("report.pdf"))),
+            Some(PathBuf::from("report.pdf"))
+        );
+        assert_eq!(
+            inbox_relpath(&meta(Some("sub/dir/report.pdf"))),
+            Some(PathBuf::from("sub/dir/report.pdf"))
+        );
     }
 
     #[test]
-    fn inbox_filename_strips_path_components() {
-        let m = BlobMetadata {
-            name: Some("/etc/passwd".into()),
-            content_type: None,
-            custom: HashMap::new(),
-        };
-        // Path::file_name on "/etc/passwd" returns "passwd" — the leading
-        // segments are stripped so a sender cannot use the metadata name
-        // to redirect writes outside the inbox subdirectory.
-        assert_eq!(inbox_filename(&m, "dist-X"), "passwd");
+    fn relpath_rejects_traversal_and_absolute() {
+        // The sender controls `name`; these must never resolve to a path that
+        // could escape the inbox — reject them so the caller uses the fallback.
+        assert_eq!(inbox_relpath(&meta(Some("../../etc/passwd"))), None);
+        assert_eq!(inbox_relpath(&meta(Some("/etc/passwd"))), None);
+        assert_eq!(inbox_relpath(&meta(Some("a/../../b"))), None);
     }
 
     #[test]
-    fn inbox_filename_strips_leading_dot() {
-        let m = BlobMetadata {
-            name: Some(".bashrc".into()),
-            content_type: None,
-            custom: HashMap::new(),
-        };
-        assert_eq!(inbox_filename(&m, "dist-X"), "bashrc");
-    }
-
-    #[test]
-    fn inbox_filename_falls_back_on_empty_metadata() {
-        let m = BlobMetadata {
-            name: None,
-            content_type: None,
-            custom: HashMap::new(),
-        };
-        assert_eq!(inbox_filename(&m, "dist-X"), "dist-X.bin");
-    }
-
-    #[test]
-    fn inbox_filename_falls_back_on_dotfile_that_strips_to_empty() {
-        let m = BlobMetadata {
-            name: Some("...".into()),
-            content_type: None,
-            custom: HashMap::new(),
-        };
-        // "..." has file_name "..." → strip leading dots → empty →
-        // fallback to distribution_id-based name.
-        assert_eq!(inbox_filename(&m, "dist-X"), "dist-X.bin");
+    fn relpath_none_for_missing_or_empty() {
+        assert_eq!(inbox_relpath(&meta(None)), None);
+        assert_eq!(inbox_relpath(&meta(Some(""))), None);
+        assert_eq!(inbox_relpath(&meta(Some("./"))), None);
     }
 
     #[tokio::test]
-    async fn already_delivered_false_when_dir_absent() {
+    async fn already_delivered_false_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
         assert!(
             !sink
-                .already_delivered(&doc_with("never-delivered", 100, None))
+                .already_delivered(&doc_with("d", 100, Some("a.txt")))
                 .await
         );
     }
 
     #[tokio::test]
-    async fn already_delivered_true_when_matching_size_present() {
+    async fn already_delivered_true_when_matching_size() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("dist-X");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let payload = vec![0u8; 1024];
-        tokio::fs::write(dir.join("got.bin"), &payload)
+        tokio::fs::write(tmp.path().join("a.txt"), vec![0u8; 1024])
             .await
             .unwrap();
         let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
         assert!(
-            sink.already_delivered(&doc_with("dist-X", 1024, None))
+            sink.already_delivered(&doc_with("d", 1024, Some("a.txt")))
                 .await
         );
     }
 
     #[tokio::test]
     async fn already_delivered_false_when_size_differs() {
-        // PRD §Validation Rule 9 guarantees content+size match before
-        // ingest; this is the conservative case where the previous
-        // delivery exists but was for a different blob (e.g.
-        // distribution_id collision across formations or a manual
-        // file drop). Re-fetching with the new size is the safe move.
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("dist-X");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("got.bin"), b"shorter")
+        tokio::fs::write(tmp.path().join("a.txt"), b"short")
             .await
             .unwrap();
         let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
         assert!(
             !sink
-                .already_delivered(&doc_with("dist-X", 1024, None))
+                .already_delivered(&doc_with("d", 1024, Some("a.txt")))
                 .await
         );
     }
 
     #[tokio::test]
-    async fn already_delivered_ignores_partial_marker() {
-        // `.{filename}.partial` is the in-flight tmp file the sink
-        // writes before atomic rename. If a crash leaves one behind
-        // it must NOT count as a successful delivery.
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("dist-X");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join(".got.bin.partial"), vec![0u8; 1024])
-            .await
-            .unwrap();
-        let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
-        assert!(
-            !sink
-                .already_delivered(&doc_with("dist-X", 1024, None))
-                .await
-        );
-    }
-
-    #[tokio::test]
-    async fn deliver_writes_file_and_is_idempotent() {
+    async fn deliver_mirrors_relative_path_and_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(src.path(), b"hello world").unwrap();
         let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
-        let doc = doc_with("dist-Y", 11, Some("greeting.txt"));
+        let doc = doc_with("dist-Y", 11, Some("sub/dir/greeting.txt"));
 
         sink.deliver(&doc, src.path()).await.unwrap();
-        let landed = tmp.path().join("dist-Y").join("greeting.txt");
+        // Mirrors the sender's relative path — NOT a {distribution_id} dir.
+        let landed = tmp.path().join("sub").join("dir").join("greeting.txt");
         assert_eq!(std::fs::read(&landed).unwrap(), b"hello world");
         assert!(sink.already_delivered(&doc).await);
 
-        // Re-deliver: atomic rename overwrites, no partial left behind.
+        // Re-deliver overwrites (latest-wins); no partial left behind.
         sink.deliver(&doc, src.path()).await.unwrap();
         assert_eq!(std::fs::read(&landed).unwrap(), b"hello world");
+        assert!(!tmp
+            .path()
+            .join("sub")
+            .join("dir")
+            .join(".greeting.txt.partial")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn deliver_traversal_name_stays_inside_inbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(src.path(), b"x").unwrap();
+        let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
+        // A hostile name resolves to the flat fallback inside the inbox, never
+        // outside it.
+        let doc = doc_with("dist-evil", 1, Some("../../../../tmp/pwned"));
+        sink.deliver(&doc, src.path()).await.unwrap();
+        assert!(tmp.path().join("dist-evil.bin").is_file());
+    }
+
+    #[tokio::test]
+    async fn deliver_size_mismatch_bails_without_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(src.path(), b"hello world").unwrap(); // 11 bytes
+        let sink = FilesystemInboxSink::new(tmp.path().to_path_buf());
+        let doc = doc_with("dist-Z", 99, Some("x.txt")); // declares 99
+        assert!(sink.deliver(&doc, src.path()).await.is_err());
+        assert!(
+            !tmp.path().join("x.txt").exists(),
+            "a short file must not be published"
+        );
     }
 }
