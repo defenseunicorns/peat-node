@@ -66,3 +66,6 @@ serial_test = "3"
 # Unique per-run formation id in the mDNS e2e test so concurrent runs on
 # the shared self-hosted runner can't discover each other over loopback.
 uuid = { version = "1", features = ["v4"] }
+# Builds a DistributionDocument fixture (`started_at: DateTime<Utc>`) for the
+# InboxSink layout regression test. Matches the version peat-mesh resolves.
+chrono = "0.4"
