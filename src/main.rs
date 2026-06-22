@@ -258,7 +258,9 @@ struct Args {
     /// spawns a background watcher that polls the synced
     /// `file_distributions` collection, fetches any blob whose
     /// distribution doc targets this node's iroh endpoint, and writes
-    /// the bytes to `{inbox}/{distribution_id}/{filename}`. Unset
+    /// the bytes to `{inbox}/{relative_path}`, mirroring the sender's
+    /// outbox layout (a sender-supplied name that is absolute or contains
+    /// `..` falls back to `{inbox}/{distribution_id}.bin`). Unset
     /// (default) disables receive-side delivery — peers still see the
     /// sender's distribution doc via Automerge sync but no auto-pull
     /// happens. Created if missing.

@@ -3893,6 +3893,7 @@ dependencies = [
  "async-trait",
  "automerge",
  "base64",
+ "chrono",
  "clap",
  "dirs",
  "iroh",

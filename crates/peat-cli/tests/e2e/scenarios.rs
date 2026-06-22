@@ -1190,24 +1190,22 @@ async fn attach_send_delivers_file_to_peer_inbox() {
     );
     assert_eq!(v["completed"], 1, "expected 1 completed target: {stdout}");
 
-    // The receive watcher delivers to {inbox}/{dist_id}/{filename}.
-    let dist_dir = attach_peer.inbox_dir.path().join(&dist_id);
+    // The receive watcher mirrors the sender's outbox layout: a file sent as
+    // `payload.txt` lands at {inbox}/payload.txt — NOT {inbox}/{dist_id}/...
+    let landed = attach_peer.inbox_dir.path().join("payload.txt");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if dist_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&dist_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| !e.file_name().to_str().unwrap_or("").starts_with('.'))
-                .collect();
-            if let Some(entry) = entries.first() {
-                let content = std::fs::read(entry.path()).unwrap();
-                assert_eq!(
-                    content, b"attach e2e test payload",
-                    "delivered file content mismatch"
-                );
-                break;
-            }
+        if landed.is_file() {
+            let content = std::fs::read(&landed).unwrap();
+            assert_eq!(
+                content, b"attach e2e test payload",
+                "delivered file content mismatch"
+            );
+            assert!(
+                !attach_peer.inbox_dir.path().join(&dist_id).exists(),
+                "delivery must not nest under a distribution_id directory; dist_id={dist_id}"
+            );
+            break;
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -1286,19 +1284,18 @@ async fn attach_watch_receives_file_from_peer() {
     let (_token, handle) = attach_peer.distribute_file(&src, "from_peer.bin").await;
     let dist_id = handle.distribution_id.clone();
 
-    // Poll CLI's inbox until the file appears.
-    let inbox_dist_dir = inbox_dir.path().join(&dist_id);
+    // Poll CLI's inbox until the file appears. The CLI sink mirrors the
+    // sender's layout: `from_peer.bin` lands at {inbox}/from_peer.bin — NOT
+    // nested under {inbox}/{dist_id}/.
+    let landed = inbox_dir.path().join("from_peer.bin");
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let content = loop {
-        if inbox_dist_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&inbox_dist_dir)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| !e.file_name().to_str().unwrap_or("").starts_with('.'))
-                .collect();
-            if let Some(entry) = entries.first() {
-                break std::fs::read(entry.path()).unwrap();
-            }
+        if landed.is_file() {
+            assert!(
+                !inbox_dir.path().join(&dist_id).exists(),
+                "delivery must not nest under a distribution_id directory; dist_id={dist_id}"
+            );
+            break std::fs::read(&landed).unwrap();
         }
         assert!(
             std::time::Instant::now() < deadline,

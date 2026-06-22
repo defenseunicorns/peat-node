@@ -13,18 +13,20 @@ The single-node setup below is the per-size benchmark for sender-side
 ingest. **For the real delivery demo, jump to "Two-node delivery"
 below.**
 
-> **Uses published `v0.3.1` image by default.** The PRD-006 attachment
-> surface first shipped in `v0.2.0`, but `v0.2.x` carries the peat#864
-> substrate bug: the sender's `SubscribeAttachmentBundle` stream stalls
-> one frame short of terminal on a real cross-peer transfer. `v0.3.0`
-> closes that end-to-end (and `v0.3.1` relocates the receive lifecycle
-> into peat-protocol with no behavior change), so the two-node delivery
-> demo needs `v0.3.0+`.
-> Earlier `v0.1.x` images predate PRD-006 entirely and fail with
-> `unimplemented: method not found`. To test local changes ahead of a
-> release, comment out the `image:` line and uncomment the `build:`
-> block in `docker-compose.yml` (or `docker-compose.two-node.yml` for
-> the cross-peer demo) to build from the repo root.
+> **All compose files here pin `v0.4.8`** (the latest release), which satisfies
+> every attachment feature in the table below. To test local changes ahead of a
+> release, comment out the `image:` line and uncomment the `build:` block in any
+> of the compose files to build from the repo root.
+
+### Attachment feature version minimums
+
+| Capability | Min version | Notes |
+|---|---|---|
+| PRD-006 attachment RPCs (`SendAttachments`, status lookup) | `v0.2.0` | `v0.1.x` predates PRD-006 and fails with `unimplemented: method not found`. |
+| Reliable cross-peer delivery | `v0.3.0` | `v0.2.x` carries the peat#864 substrate bug — the sender's `SubscribeAttachmentBundle` stream stalls one frame short of terminal on a real transfer. `v0.3.1` relocated the receive lifecycle into peat-protocol (no behavior change). |
+| Deterministic identity + `derive-id` (multi-host peering) | `v0.4.4` | Offline peer-id derivation; see [Multi-host delivery](#multi-host-delivery-separate-machines-no-mdns) below. |
+| Hands-off outbox watcher (`PEAT_NODE_ATTACHMENT_OUTBOX_WATCH`) | `v0.4.5` | Auto-distributes any stable new file dropped in an outbox root — no `SendAttachments` call. |
+| Inbox mirrors the sender's outbox layout | `v0.4.8` | [#173](https://github.com/defenseunicorns/peat-node/issues/173); earlier images nested every delivery under `inbox/{distribution_id}/{filename}`. |
 
 The two-node CRDT sync demo lives one directory up at
 [`../docker-compose.yml`](../docker-compose.yml); this one is the
@@ -93,11 +95,11 @@ landing).
 docker compose -f docker-compose.two-node.yml up -d
 ./peer.sh                                  # bidirectional ConnectPeer
 ENDPOINT=http://127.0.0.1:50061 OUTBOX_DIR=outbox-a ./send.sh
-ls inbox-b/                                # files appear here per distribution_id
+ls inbox-b/                                # delivered files mirror the sender's outbox layout
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
-(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.5`. For testing local
+(Pulls `ghcr.io/defenseunicorns/peat-node:v0.4.8`. For testing local
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 
@@ -118,10 +120,19 @@ only by `ConnectPeer` *into* A. Without A → B as well, A's
 distribution doc carries an empty `target_nodes` and B correctly
 concludes "not for me."
 
-When `send.sh` is pointed at A, B's inbox accumulates
-`inbox-b/{distribution_id}/{filename}` for each successful delivery.
-Apps watching the inbox can correlate a `distribution_id` back to the
-sender via `GetAttachmentDistribution`.
+When `send.sh` is pointed at A, each delivered file lands in B's inbox
+**mirroring the sender's outbox layout**: `outbox-a/hello.txt` arrives at
+`inbox-b/hello.txt` (and a file under `outbox-a/sub/` at `inbox-b/sub/`),
+byte-identical, latest-wins on re-delivery. Apps watching the inbox can still
+correlate a delivery back to the sender via `GetAttachmentDistribution` — the
+`distribution_id` travels in the synced `file_distributions` doc and the
+receive-side log line, not in the on-disk path.
+
+> **Inbox layout changed in v0.4.8 ([#173](https://github.com/defenseunicorns/peat-node/issues/173)).**
+> Earlier images nested every delivery under `inbox-b/{distribution_id}/{filename}`;
+> v0.4.8+ mirrors the sender's outbox path instead. A sender-supplied name that
+> can't be safely resolved (absolute, or containing `..`) falls back to a flat
+> `{distribution_id}.bin` at the inbox root.
 
 ## Multi-host delivery (separate machines, no mDNS)
 
@@ -183,8 +194,9 @@ matching opt-in lines are stubbed in `docker-compose.multi-host.yml`:
   writable host dir at `/var/lib/peat/inbox`.
 
 Send with `SendAttachments` (scope `allNodes`); the receiver's inbox watcher
-fetches the blob over iroh and writes it to
-`{inbox}/{distribution_id}/{filename}`, byte-identical to the source.
+fetches the blob over iroh and writes it to `{inbox}/{relative_path}` —
+mirroring the sender's outbox layout (v0.4.8+; see the [#173](https://github.com/defenseunicorns/peat-node/issues/173)
+note under "Two-node delivery" above) — byte-identical to the source.
 
 **Hands-off (synced-folder) mode.** Set `PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`
 on the sender (requires v0.4.5+) and you don't call `SendAttachments` at all:
