@@ -23,8 +23,8 @@ ls node-b/inbox/          # appears here within seconds
 
 Teardown:
 ```bash
-docker compose -C node-a down -v
-docker compose -C node-b down -v
+(cd node-a && docker compose down -v)
+(cd node-b && docker compose down -v)
 ```
 
 No `peer.sh`. No `send.sh`. Peering is pre-configured via `PEAT_NODE_PEERS`
