@@ -1,0 +1,56 @@
+# Node A — SENDER (outbox watcher). Runs alongside ../node-b.
+#
+# Peers over host.docker.internal so both compose projects stay
+# isolated on their own Docker networks. Each node publishes its
+# iroh UDP port to the host so the other can dial it by name.
+#
+# Quick start (run from this directory):
+#
+#   mkdir -p outbox
+#   docker compose up -d
+#   # (also start ../node-b)
+#   cp myfile.txt outbox/         # auto-distributes to node-b's inbox
+#
+# Teardown:
+#   docker compose down -v
+#
+# SHARED KEY (demo only — zero bytes, base64):
+#   AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+#
+# DERIVED ENDPOINT IDs (offline, from shared key + node IDs):
+#   attach-a: 035254fa2cdf94cdd5fbf7ef7fe27efd26e1490d7db3b03b1bf30859be447634
+#   attach-b: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9
+#   Reproduced with: peat-node derive-id --shared-key "AAAA...A=" --node-id <name>
+
+services:
+  peat-node-a:
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.8
+    # build:
+    #   context: ../../../..
+    container_name: peat-attach-a
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Linux compat; no-op on macOS Docker Desktop
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_APP_ID: attach-demo
+      PEAT_NODE_NODE_ID: attach-a
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_IROH_UDP_PORT: "51071"
+      # Peer = attach-b's derived endpoint ID @ the host port node-b publishes for iroh.
+      PEAT_NODE_PEERS: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9@host.docker.internal:51072
+      PEAT_NODE_DISABLE_MDNS: "true"
+      PEAT_NODE_AUTO_SYNC: "true"
+      # SENDER: auto-distribute any stable file dropped in ./outbox/ (no gRPC call needed).
+      PEAT_NODE_ATTACHMENT_ROOT: outbox=/var/lib/peat/outbox
+      PEAT_NODE_ATTACHMENT_OUTBOX_WATCH: "true"
+      RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
+    ports:
+      - "50051:50051"        # gRPC / Connect API
+      - "51071:51071/udp"    # iroh QUIC — must be UDP, must match PEAT_NODE_IROH_UDP_PORT
+    volumes:
+      - peat-node-a-data:/data/peat-node
+      - ./outbox:/var/lib/peat/outbox:ro
+
+volumes:
+  peat-node-a-data: {}

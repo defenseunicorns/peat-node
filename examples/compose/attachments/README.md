@@ -1,5 +1,41 @@
 # Attachment distribution quickstart (PRD-006)
 
+## Two-minute quick start
+
+Each node runs from its own directory. Open two terminals:
+
+```bash
+# Terminal 1 — sender (node A)
+cd node-a && mkdir -p outbox
+docker compose up -d
+
+# Terminal 2 — receiver (node B)
+cd node-b && mkdir -p inbox
+docker compose up -d
+```
+
+Then drop a file — it auto-delivers:
+
+```bash
+cp myfile.txt node-a/outbox/
+ls node-b/inbox/          # appears here within seconds
+```
+
+Teardown:
+```bash
+docker compose -C node-a down -v
+docker compose -C node-b down -v
+```
+
+No `peer.sh`. No `send.sh`. Peering is pre-configured via `PEAT_NODE_PEERS`
+(deterministic endpoint IDs derived from the shared key + node IDs). The outbox
+watcher auto-distributes any file dropped in `node-a/outbox/`.
+
+**Alternative (both nodes in one compose project):** `docker-compose.two-node.yml`
+— same zero-friction approach but both nodes share a single Docker network.
+
+---
+
 Two compose files live here:
 
 - **`docker-compose.yml`** — single node. Demonstrates sender-side
@@ -92,10 +128,10 @@ Real cross-peer file delivery (PRD-006 v1.1, post the inbox-watcher
 landing).
 
 ```bash
+mkdir -p outbox-a inbox-b
 docker compose -f docker-compose.two-node.yml up -d
-./peer.sh                                  # bidirectional ConnectPeer
-ENDPOINT=http://127.0.0.1:50061 OUTBOX_DIR=outbox-a ./send.sh
-ls inbox-b/                                # delivered files mirror the sender's outbox layout
+cp myfile.txt outbox-a/   # PEAT_NODE_ATTACHMENT_OUTBOX_WATCH auto-distributes
+ls inbox-b/               # files mirror the sender's outbox layout
 docker compose -f docker-compose.two-node.yml down -v
 ```
 
@@ -103,30 +139,33 @@ docker compose -f docker-compose.two-node.yml down -v
 changes, swap the `image:` line for the commented `build:` block in
 both services.)
 
+Peering is pre-configured via `PEAT_NODE_PEERS` using deterministic endpoint
+IDs (derived offline from the shared key + node IDs — same mechanism as
+[multi-host delivery](#multi-host-delivery-separate-machines-no-mdns)). No
+`peer.sh` step, no `GetStatus` round-trip. `PEAT_NODE_ATTACHMENT_OUTBOX_WATCH`
+eliminates `send.sh` — any stable file written to the outbox triggers an
+automatic `AllNodes` distribution.
+
 What the two-node setup wires:
 
 - `peat-node-a` (`127.0.0.1:50061`) — sender. `./outbox-a` bind-mounted
-  read-only at `/var/lib/peat/outbox`. `--attachment-root outbox=...`
-  set; no inbox.
+  read-only at `/var/lib/peat/outbox`. `PEAT_NODE_ATTACHMENT_ROOT outbox=...`
+  set; `PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`; no inbox.
 - `peat-node-b` (`127.0.0.1:50062`) — receiver. `./inbox-b`
-  bind-mounted read-write at `/var/lib/peat/inbox`. `--attachment-inbox`
+  bind-mounted read-write at `/var/lib/peat/inbox`. `PEAT_NODE_ATTACHMENT_INBOX`
   set; the receive-side watcher polls the synced `file_distributions`
   collection every 1s and fetches anything targeting B's iroh endpoint.
 
-`peer.sh` issues `ConnectPeer` in both directions, which is required
-for `AllNodes`-scoped distributions: A's `resolve_targets` builds
-`target_nodes` from `A.blob_store.known_peers()`, which is populated
-only by `ConnectPeer` *into* A. Without A → B as well, A's
-distribution doc carries an empty `target_nodes` and B correctly
-concludes "not for me."
-
-When `send.sh` is pointed at A, each delivered file lands in B's inbox
-**mirroring the sender's outbox layout**: `outbox-a/hello.txt` arrives at
-`inbox-b/hello.txt` (and a file under `outbox-a/sub/` at `inbox-b/sub/`),
-byte-identical, latest-wins on re-delivery. Apps watching the inbox can still
-correlate a delivery back to the sender via `GetAttachmentDistribution` — the
+Each delivered file lands in B's inbox **mirroring the sender's outbox
+layout**: `outbox-a/hello.txt` arrives at `inbox-b/hello.txt`, byte-identical,
+latest-wins on re-delivery. Apps watching the inbox can still correlate a
+delivery back to the sender via `GetAttachmentDistribution` — the
 `distribution_id` travels in the synced `file_distributions` doc and the
 receive-side log line, not in the on-disk path.
+
+`peer.sh` is still present for manual-peering workflows (e.g. ad-hoc
+`ConnectPeer` calls, scripted testing against arbitrary nodes). It is not
+needed for the two-node compose above.
 
 > **Inbox layout changed in v0.4.8 ([#173](https://github.com/defenseunicorns/peat-node/issues/173)).**
 > Earlier images nested every delivery under `inbox-b/{distribution_id}/{filename}`;

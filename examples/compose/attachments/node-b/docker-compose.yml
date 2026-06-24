@@ -1,0 +1,50 @@
+# Node B — RECEIVER (inbox watcher). Runs alongside ../node-a.
+#
+# Peers over host.docker.internal so both compose projects stay
+# isolated on their own Docker networks. Each node publishes its
+# iroh UDP port to the host so the other can dial it by name.
+#
+# Quick start (run from this directory):
+#
+#   mkdir -p inbox
+#   docker compose up -d
+#   # (also start ../node-a)
+#   ls inbox/                     # files from node-a appear here
+#
+# Teardown:
+#   docker compose down -v
+#
+# See ../node-a/docker-compose.yml for the full quick-start sequence
+# and endpoint ID derivation details.
+
+services:
+  peat-node-b:
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.8
+    # build:
+    #   context: ../../../..
+    container_name: peat-attach-b
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Linux compat; no-op on macOS Docker Desktop
+    environment:
+      PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+      PEAT_NODE_DATA_DIR: /data/peat-node
+      PEAT_NODE_APP_ID: attach-demo
+      PEAT_NODE_NODE_ID: attach-b
+      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_IROH_UDP_PORT: "51072"
+      # Peer = attach-a's derived endpoint ID @ the host port node-a publishes for iroh.
+      PEAT_NODE_PEERS: 035254fa2cdf94cdd5fbf7ef7fe27efd26e1490d7db3b03b1bf30859be447634@host.docker.internal:51071
+      PEAT_NODE_DISABLE_MDNS: "true"
+      PEAT_NODE_AUTO_SYNC: "true"
+      # RECEIVER: inbox watcher auto-fetches + writes delivered blobs.
+      PEAT_NODE_ATTACHMENT_INBOX: /var/lib/peat/inbox
+      RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
+    ports:
+      - "50061:50051"        # gRPC / Connect API (host 50061 → container 50051)
+      - "51072:51072/udp"    # iroh QUIC — must be UDP, must match PEAT_NODE_IROH_UDP_PORT
+    volumes:
+      - peat-node-b-data:/data/peat-node
+      - ./inbox:/var/lib/peat/inbox
+
+volumes:
+  peat-node-b-data: {}
