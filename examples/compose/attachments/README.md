@@ -31,6 +31,13 @@ No `peer.sh`. No `send.sh`. Peering is pre-configured via `PEAT_NODE_PEERS`
 (deterministic endpoint IDs derived from the shared key + node IDs). The outbox
 watcher auto-distributes any file dropped in `node-a/outbox/`.
 
+**Expected startup log noise:** both nodes dial each other simultaneously at
+boot. You may see an `ERROR peat_node: failed to connect to peer … after 3
+attempts` in the first ~15 seconds — this is a red herring. The connection
+succeeds immediately after via the peer's simultaneous inbound dial. Look for
+`INFO peat_node::node: connected to peer` to confirm peering. Once you see
+that, file delivery works normally.
+
 **Alternative (both nodes in one compose project):** `docker-compose.two-node.yml`
 — same zero-friction approach but both nodes share a single Docker network.
 
