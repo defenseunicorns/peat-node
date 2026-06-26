@@ -2,7 +2,20 @@
 
 ## Two-minute quick start
 
-Each node runs from its own directory. Open two terminals:
+`node-a` and `node-b` are **two separate compose projects** simulating two
+devices. Each `docker compose up` would otherwise create its own isolated
+network, so the two containers could never reach each other. They instead join
+a **shared external network** (`peat-mesh`) and dial each other by container
+name — which is why that network must be created **first**, before either node
+boots. (See ["Why a shared external network"](#why-a-shared-external-network)
+below.)
+
+```bash
+# Step 1 — create the shared network both nodes attach to (once)
+docker network create peat-mesh
+```
+
+Then start each node from its own directory. Open two terminals:
 
 ```bash
 # Terminal 1 — sender (node A)
@@ -21,10 +34,11 @@ cp myfile.txt node-a/outbox/
 ls node-b/inbox/          # appears here within seconds
 ```
 
-Teardown:
+Teardown (remove the network last, after both nodes are down):
 ```bash
 (cd node-a && docker compose down -v)
 (cd node-b && docker compose down -v)
+docker network rm peat-mesh
 ```
 
 No `peer.sh`. No `send.sh`. Peering is pre-configured via `PEAT_NODE_PEERS`
@@ -39,7 +53,30 @@ succeeds immediately after via the peer's simultaneous inbound dial. Look for
 that, file delivery works normally.
 
 **Alternative (both nodes in one compose project):** `docker-compose.two-node.yml`
-— same zero-friction approach but both nodes share a single Docker network.
+— same zero-friction approach but both nodes share a single Docker network
+automatically, so there's no separate `docker network create` step.
+
+### Why a shared external network
+
+Each `docker compose up` creates a default network named after its project
+(`node-a_default`, `node-b_default`) — **isolated** bridge networks with no
+route between them and per-network DNS, so `node-a` can't even resolve or reach
+`node-b`. That isolation is the whole point of Compose networks; it's also why
+two independent projects can't talk by default.
+
+A `peat-mesh` network declared `external: true` in both files is the fix: an
+externally-created network that neither project owns, that both attach to. Now
+both containers sit on **one subnet** and route directly to each other (no host
+gateway, no published UDP ports, no NAT) — the faithful "two devices on the same
+LAN" model. Because it's `external`, Compose won't create it, so it must exist
+before either `up` (and you remove it manually after both are down).
+
+> An earlier revision bridged the two isolated networks via
+> `host.docker.internal` + published UDP ports. That fails on Docker Desktop:
+> its userspace proxy doesn't cleanly forward the iroh QUIC/UDP handshake
+> between networks, so the dial reaches a foreign endpoint and the TLS handshake
+> fails with `error 48: invalid peer certificate: UnknownIssuer`. The shared
+> network removes the host hop entirely.
 
 ---
 

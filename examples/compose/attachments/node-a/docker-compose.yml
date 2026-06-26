@@ -1,11 +1,18 @@
 # Node A — SENDER (outbox watcher). Runs alongside ../node-b.
 #
-# Peers over host.docker.internal so both compose projects stay
-# isolated on their own Docker networks. Each node publishes its
-# iroh UDP port to the host so the other can dial it by name.
+# Both nodes are separate compose projects that join a SHARED external
+# Docker network ("peat-mesh") and dial each other by container name.
+# This replaces the earlier host.docker.internal approach: Docker
+# Desktop (macOS/Windows) does not route the iroh QUIC/UDP handshake
+# between two isolated bridge networks via published host ports — the
+# dial reaches a foreign QUIC endpoint and fails the TLS handshake
+# ("error 48: invalid peer certificate: UnknownIssuer"). A shared
+# user-defined network gives both containers a real, mutually routable
+# path and built-in DNS resolution by container_name.
 #
 # Quick start (run from this directory):
 #
+#   docker network create peat-mesh        # once; shared by both nodes
 #   mkdir -p outbox
 #   docker compose up -d
 #   # (also start ../node-b)
@@ -13,14 +20,18 @@
 #
 # Teardown:
 #   docker compose down -v
+#   docker network rm peat-mesh             # after both nodes are down
 #
-# SHARED KEY (demo only — zero bytes, base64):
-#   AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+# SHARED KEY (demo only — unique per-formation, base64):
+#   fPARVR0eqxhTNqqjKIrYrYTD1VBP6PjGKCAAa39+wl8=
+#
+# Generate your own with: `head -c 32 /dev/urandom | base64`. The endpoint
+# IDs below are derived deterministically from (shared_key + node_id).
 #
 # DERIVED ENDPOINT IDs (offline, from shared key + node IDs):
-#   attach-a: 035254fa2cdf94cdd5fbf7ef7fe27efd26e1490d7db3b03b1bf30859be447634
-#   attach-b: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9
-#   Reproduced with: peat-node derive-id --shared-key "AAAA...A=" --node-id <name>
+#   attach-a: fdf9a98cb65237d2f2d70e1af68e7d2f543e14a287775a4e1bf12a35b84bccb6
+#   attach-b: a53fca1d6263555d269d1594b2e5b05e88a0bab126b3885b9ee74259bd6ecd2f
+#   Reproduced with: peat-node derive-id --shared-key "<key>" --node-id <name>
 
 services:
   peat-node-a:
@@ -28,17 +39,17 @@ services:
     # build:
     #   context: ../../../..
     container_name: peat-attach-a
-    extra_hosts:
-      - "host.docker.internal:host-gateway"  # Linux compat; no-op on macOS Docker Desktop
+    networks:
+      - peat-mesh
     environment:
       PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
       PEAT_NODE_DATA_DIR: /data/peat-node
       PEAT_NODE_APP_ID: attach-demo
       PEAT_NODE_NODE_ID: attach-a
-      PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      PEAT_NODE_SHARED_KEY: fPARVR0eqxhTNqqjKIrYrYTD1VBP6PjGKCAAa39+wl8=
       PEAT_NODE_IROH_UDP_PORT: "51071"
-      # Peer = attach-b's derived endpoint ID @ the host port node-b publishes for iroh.
-      PEAT_NODE_PEERS: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9@host.docker.internal:51072
+      # Peer = attach-b's derived endpoint ID @ node-b's container name + iroh port.
+      PEAT_NODE_PEERS: a53fca1d6263555d269d1594b2e5b05e88a0bab126b3885b9ee74259bd6ecd2f@peat-attach-b:51072
       PEAT_NODE_DISABLE_MDNS: "true"
       PEAT_NODE_AUTO_SYNC: "true"
       # SENDER: auto-distribute any stable file dropped in ./outbox/ (no gRPC call needed).
@@ -46,11 +57,14 @@ services:
       PEAT_NODE_ATTACHMENT_OUTBOX_WATCH: "true"
       RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
     ports:
-      - "50051:50051"        # gRPC / Connect API
-      - "51071:51071/udp"    # iroh QUIC — must be UDP, must match PEAT_NODE_IROH_UDP_PORT
+      - "50051:50051"        # gRPC / Connect API (peer traffic goes over the shared network)
     volumes:
       - peat-node-a-data:/data/peat-node
       - ./outbox:/var/lib/peat/outbox:ro
+
+networks:
+  peat-mesh:
+    external: true
 
 volumes:
   peat-node-a-data: {}
