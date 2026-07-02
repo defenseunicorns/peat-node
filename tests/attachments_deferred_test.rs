@@ -67,6 +67,8 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         1,
+        false, // outbox_watch
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
     let node = Arc::new(
@@ -79,11 +81,13 @@ async fn boot(grpc_port: u16, iroh_port: u16, label: &str, enable_inbox: bool) -
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: Some(iroh_port),
+            iroh_secret_key: None,
             attachment_config,
             disable_mdns: true,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -511,6 +515,8 @@ async fn unknown_node_id_marked_failed_after_grace() {
         peat_node::attachments::config::DEFAULT_HANDLE_RETENTION_SECS,
         peat_node::attachments::config::DEFAULT_MAX_KNOWN_BUNDLES,
         peat_node::attachments::config::DEFAULT_INBOX_POLL_SECS,
+        false,
+        peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS,
     )
     .unwrap();
 
@@ -524,11 +530,13 @@ async fn unknown_node_id_marked_failed_after_grace() {
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             attachment_config,
             disable_mdns: true,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),

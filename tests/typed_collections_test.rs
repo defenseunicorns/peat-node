@@ -22,11 +22,13 @@ async fn boot(port: u16) -> (reqwest::Client, String) {
             peers: vec![],
             encryption_key: None,
             iroh_udp_port: None,
+            iroh_secret_key: None,
             attachment_config: Default::default(),
             disable_mdns: true,
             tombstone_ttl_hours: None,
             gc_interval_secs: None,
             gc_batch_size: None,
+            ..Default::default()
         })
         .await
         .unwrap(),
@@ -67,7 +69,7 @@ async fn call(
 
 #[tokio::test]
 async fn cell_round_trip_with_all_fields() {
-    let (client, base) = boot(50121).await;
+    let (client, base) = boot(50201).await;
     call(
         &client,
         &base,
@@ -110,7 +112,7 @@ async fn cell_round_trip_with_all_fields() {
 
 #[tokio::test]
 async fn track_round_trip_with_all_optional_fields() {
-    let (client, base) = boot(50122).await;
+    let (client, base) = boot(50202).await;
     call(
         &client,
         &base,
@@ -155,7 +157,7 @@ async fn track_round_trip_with_all_optional_fields() {
 
 #[tokio::test]
 async fn command_round_trip_with_all_fields() {
-    let (client, base) = boot(50123).await;
+    let (client, base) = boot(50203).await;
     call(
         &client,
         &base,

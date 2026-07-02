@@ -268,9 +268,9 @@ impl TestPeer {
 
 /// Filesystem inbox sink for test use. Mirrors the production
 /// `FilesystemInboxSink` in `peat-node::attachments::inbox`: writes each
-/// delivered blob to `{inbox_root}/{distribution_id}/{filename}` via a
-/// tmp-then-rename pair. `already_delivered` checks for any regular file of
-/// the declared size — same logic as production so restart-idempotency works.
+/// delivered blob to `{inbox_root}/{relative_path}` (mirroring the sender's
+/// outbox layout) via a tmp-then-rename pair. `already_delivered` keys on that
+/// same mirrored path — same logic as production so restart-idempotency works.
 pub struct TestInboxSink {
     inbox_root: PathBuf,
 }
@@ -284,56 +284,58 @@ impl TestInboxSink {
 #[async_trait]
 impl ReceiveSink for TestInboxSink {
     async fn already_delivered(&self, doc: &DistributionDocument) -> bool {
-        let dir = self.inbox_root.join(&doc.distribution_id);
-        if !dir.is_dir() {
-            return false;
+        let rel = test_inbox_relpath(&doc.blob_metadata)
+            .unwrap_or_else(|| PathBuf::from(format!("{}.bin", doc.distribution_id)));
+        match tokio::fs::metadata(self.inbox_root.join(rel)).await {
+            Ok(md) => md.is_file() && md.len() == doc.blob_size,
+            Err(_) => false,
         }
-        let mut iter = match tokio::fs::read_dir(&dir).await {
-            Ok(i) => i,
-            Err(_) => return false,
-        };
-        while let Ok(Some(entry)) = iter.next_entry().await {
-            if entry
-                .path()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|s| s.starts_with('.'))
-            {
-                continue;
-            }
-            if let Ok(md) = entry.metadata().await {
-                if md.is_file() && md.len() == doc.blob_size {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     async fn deliver(&self, doc: &DistributionDocument, blob_path: &Path) -> anyhow::Result<()> {
-        let dir = self.inbox_root.join(&doc.distribution_id);
-        tokio::fs::create_dir_all(&dir).await?;
-        let filename = test_inbox_filename(&doc.blob_metadata, &doc.distribution_id);
-        let target = dir.join(&filename);
-        let tmp = dir.join(format!(".{filename}.partial"));
+        let rel = test_inbox_relpath(&doc.blob_metadata)
+            .unwrap_or_else(|| PathBuf::from(format!("{}.bin", doc.distribution_id)));
+        let target = self.inbox_root.join(&rel);
+        let parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.inbox_root.clone());
+        tokio::fs::create_dir_all(&parent).await?;
+        let fname = target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("blob");
+        let tmp = parent.join(format!(".{fname}.partial"));
         tokio::fs::copy(blob_path, &tmp).await?;
         tokio::fs::rename(&tmp, &target).await?;
         Ok(())
     }
 }
 
-fn test_inbox_filename(metadata: &BlobMetadata, distribution_id: &str) -> String {
-    if let Some(raw) = metadata.name.as_ref() {
-        let last = Path::new(raw)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim_start_matches('.'))
-            .filter(|s| !s.is_empty());
-        if let Some(name) = last {
-            return name.to_string();
+/// Resolve `blob_metadata.name` to a safe inbox-relative path, mirroring
+/// `peat-node::attachments::inbox::inbox_relpath` (and peat-cli's `InboxSink`):
+/// preserve subdirectories, reject any absolute/`..` component (caller falls
+/// back to `<distribution_id>.bin`).
+fn test_inbox_relpath(metadata: &BlobMetadata) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let raw = metadata.name.as_deref()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let mut safe = PathBuf::new();
+    for comp in Path::new(raw).components() {
+        match comp {
+            Component::Normal(c) => safe.push(c),
+            Component::CurDir => {}
+            _ => return None,
         }
     }
-    format!("{distribution_id}.bin")
+    if safe.as_os_str().is_empty() {
+        None
+    } else {
+        Some(safe)
+    }
 }
 
 /// A `TestPeer` with attachment infrastructure wired: an `IrohFileDistribution`
@@ -341,8 +343,8 @@ fn test_inbox_filename(metadata: &BlobMetadata, distribution_id: &str) -> String
 ///
 /// * `file_dist` — call `file_dist.distribute(...)` to push blobs from the
 ///   TestPeer side (used by receive-side scenarios that need TestPeer to send).
-/// * `inbox_dir` — check `inbox_dir.path()/{dist_id}/{filename}` to assert
-///   that a CLI-originated send arrived at the TestPeer.
+/// * `inbox_dir` — check `inbox_dir.path()/{relative_path}` (the mirrored
+///   outbox layout) to assert that a CLI-originated send arrived at the TestPeer.
 pub struct TestAttachPeer {
     pub peer: TestPeer,
     pub file_dist: Arc<IrohFileDistribution>,

@@ -5,24 +5,35 @@
 # only exercises sender-side ingest — useful for the per-size benchmark
 # but doesn't prove cross-peer delivery.
 #
-# Quickstart:
+# Quick start (no peer.sh, no send.sh — just drop a file):
+#
+#   mkdir -p outbox-a inbox-b
 #   docker compose -f docker-compose.two-node.yml up -d
-#   ./peer.sh         # peer the two nodes (B → A and A → B)
-#   ./send.sh         # send hello.txt + the 1/10/100 MiB suite from A
-#   ls ./inbox-b/     # watch files appear on B's filesystem
+#   cp myfile.txt outbox-a/          # auto-distributes to inbox-b
+#   ls inbox-b/                      # appears here within seconds
 #   docker compose -f docker-compose.two-node.yml down -v
+#
+# Peering is pre-configured via PEAT_NODE_PEERS (deterministic endpoint IDs
+# derived from the shared key + node IDs — no peer.sh required, no GetStatus
+# round-trip, no mDNS). PEAT_NODE_ATTACHMENT_OUTBOX_WATCH auto-distributes
+# any stable file dropped in the outbox — no SendAttachments call required.
 #
 # Layout:
 #
 #   ./outbox-a/  → A's --attachment-root "outbox" (read-only into A)
 #   ./inbox-b/   → B's --attachment-inbox          (read-write into B)
 #
-# B writes received files at:
-#   ./inbox-b/{distribution_id}/{filename}
+# Files arrive at inbox-b/ mirroring the sender's outbox path (v0.4.8+).
 #
 # A has no inbox configured (it's the sender). B has no outbox
 # configured (it's the receiver). For a real bidirectional setup
 # operators would mount both on both nodes.
+#
+# DERIVED ENDPOINT IDs (zero demo key + node IDs above):
+#   attach-a: 035254fa2cdf94cdd5fbf7ef7fe27efd26e1490d7db3b03b1bf30859be447634
+#   attach-b: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9
+#
+#   Reproduced with: peat-node derive-id --shared-key "AAAA...A=" --node-id <name>
 
 services:
   peat-node-a:
@@ -34,7 +45,7 @@ services:
     # SubscribeAttachmentBundle one frame short of terminal. For
     # testing local changes, comment out `image:` and uncomment the
     # `build:` block.
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.8
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-a
@@ -45,11 +56,16 @@ services:
       PEAT_NODE_APP_ID: attach-demo
       PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       PEAT_NODE_AUTO_SYNC: "true"
-      # Pin iroh UDP port so peer-b can reach a stable address. The
-      # outbound peer URL in peer.sh hardcodes :51071.
+      # Pin iroh UDP port so the pre-configured peer address is stable.
       PEAT_NODE_IROH_UDP_PORT: "51071"
+      # Pre-configured peer: attach-b's derived endpoint ID @ its service DNS + UDP port.
+      PEAT_NODE_PEERS: 70de0ba0781a5e9698106335b7fa8733813db4063c110a375f0c5ed798f4e6f9@peat-node-b:51072
+      PEAT_NODE_DISABLE_MDNS: "true"
       PEAT_NODE_ATTACHMENT_ROOT: outbox=/var/lib/peat/outbox
-      RUST_LOG: peat_node=info,peat_node::attachments::inbox=warn
+      # Hands-off mode: any stable file dropped in ./outbox-a/ is auto-distributed
+      # to all known peers (no SendAttachments call). Requires v0.4.5+.
+      PEAT_NODE_ATTACHMENT_OUTBOX_WATCH: "true"
+      RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
     ports:
       - "50061:50051"
     volumes:
@@ -57,7 +73,7 @@ services:
       - ./outbox-a:/var/lib/peat/outbox:ro
 
   peat-node-b:
-    image: ghcr.io/defenseunicorns/peat-node:v0.3.1
+    image: ghcr.io/defenseunicorns/peat-node:v0.4.8
     # build:
     #   context: ../../..
     container_name: peat-node-attachments-b
@@ -69,10 +85,13 @@ services:
       PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
       PEAT_NODE_AUTO_SYNC: "true"
       PEAT_NODE_IROH_UDP_PORT: "51072"
+      # Pre-configured peer: attach-a's derived endpoint ID @ its service DNS + UDP port.
+      PEAT_NODE_PEERS: 035254fa2cdf94cdd5fbf7ef7fe27efd26e1490d7db3b03b1bf30859be447634@peat-node-a:51071
+      PEAT_NODE_DISABLE_MDNS: "true"
       # B has no outbox (it's the receiver). Inbox enables the receive-
-      # side watcher.
+      # side watcher: polls synced file_distributions and auto-fetches blobs.
       PEAT_NODE_ATTACHMENT_INBOX: /var/lib/peat/inbox
-      RUST_LOG: peat_node=info,peat_node::attachments::inbox=info
+      RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
     ports:
       - "50062:50051"
     volumes:

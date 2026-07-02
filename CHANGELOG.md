@@ -7,15 +7,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-07-02
-
-### Fixed
-
-- **Blob fetch stall cycle broken** — peers in the cooling-off state are now skipped during `fetch_blob` peer selection rather than being tried and immediately failing the health check. A cooling peer that was the only candidate would previously cause `fetch_blob` to stall for the full stall-timeout duration before falling back; it is now bypassed immediately. Bumps `peat-mesh` to `0.9.0-rc.41`. ([peat-mesh#257](https://github.com/defenseunicorns/peat-mesh/pull/257))
+## [0.4.9] - 2026-07-02
 
 ### Fixed
 
 - **`grpc_test` port collision eliminated** — `boot_server` now binds to `127.0.0.1:0` and reads the OS-assigned port via `BoundServer::local_addr()` rather than using hardcoded ports (50081–50087). Removes the `AddrInUse` flake that appeared when a prior test run left sockets in `TIME_WAIT`.
+
+## [0.4.8] - 2026-06-20
+
+### Fixed
+
+- **Received attachments keep their original name and folder layout.** Files
+  were landing at `inbox/<distribution_id>/<basename>` — the original filename
+  buried under a UUID directory and any subdirectories flattened. The inbox now
+  mirrors the sender's outbox layout: a file dropped at `outbox/sub/report.pdf`
+  lands at `inbox/sub/report.pdf`, and re-delivery of the same path overwrites
+  (latest-wins). Sender-controlled names are re-sanitised on arrival (only
+  `Normal` path components accepted), so an absolute path or one containing `..`
+  can never escape the inbox — such a name falls back to a flat
+  `<distribution_id>.bin` at the inbox root. (#173)
+
+### Added
+
+- **Startup version banner.** The first log line now reports peat-node's own
+  version plus the resolved versions of the core dependency stack —
+  `peat-mesh`, `peat-protocol`, `peat-schema` (captured from `Cargo.lock` at
+  build time). Lets an operator confirm exactly which build + mesh/protocol RC
+  a container is running from the top of the logs.
+- **`--print-config` / `PEAT_NODE_PRINT_CONFIG`.** Opt-in flag that logs the
+  full resolved configuration at startup (shared key + encryption key redacted)
+  — for diagnosing env/flag/Compose wiring.
+
+### Changed
+
+- **Attachment transaction logging now describes the file, both sides.**
+  - Receive side: the inbox sink logs at info with the `filename`, `bytes`,
+    `blob_hash`, and target path — not just the distribution id — and performs
+    a **post-write size validation** (the on-disk copy must match the declared
+    `blob_size` before the tmp→target rename is published). On mismatch it drops
+    the partial and returns an error so the receive watcher retries, rather than
+    publishing a short file. (Content integrity is already guaranteed upstream
+    by iroh's content-addressed fetch; this is the local-write completeness
+    check.)
+  - Send side: the outbox watcher's auto-distribute log now includes `bytes`
+    and the `sha256` alongside the filename and distribution id.
+
+## [0.4.7] - 2026-06-19
+
+### Changed
+
+- **Bumped to peat-mesh 0.9.0-rc.43 + peat-protocol 0.9.0-rc.26**, bringing the
+  attachment-delivery robustness work into a runnable node:
+  - **Inbound-accepted peers register into `known_peers`** (peat-mesh#261) — a
+    single dial now suffices between two directly-connected peers; a
+    one-directional `PEAT_NODE_PEERS` no longer silently drops attachments.
+  - **Provider gossip** (`peat/blob-announce/1`, peat-mesh#262) — "who holds
+    blob X" propagates across the mesh, so a node can fetch a blob from a
+    holder it discovered rather than only the original sender.
+  - **Distribution/file-transfer implementation relocated to peat-mesh**
+    (peat#992) and the **ADR-071 interest-driven convergence seam** (peat#991,
+    opt-in; default behavior unchanged). No peat-node source change — the
+    distribution API is consumed through peat-protocol's re-export.
+
+### Added
+
+- **Periodic peer-status log line.** Every 30s the node logs a single
+  `peer status` line with `connected_count` / `known_count` and the short
+  endpoint ids of both sets: `connected_peers` (live CRDT-sync connections,
+  from the transport) and `known_peers` (peers this node dialed — the exact
+  set used for distribution targeting and blob-provider lookup). A receiver
+  missing from a sender's `known_peers` is precisely why a synced attachment
+  document never becomes a delivered file; this makes that visible at a
+  glance. Fires immediately at startup, then on the interval.
+
+### Changed
+
+- **Default log filter now covers the whole sync stack.** Was
+  `peat_node=info,peat_mesh=info`; now also includes `peat_protocol=info`
+  (the crate that owns the attachment send/receive watchers — targeting and
+  blob fetch — so a failed delivery is no longer silent) and `iroh=warn`
+  (surfaces QUIC dial / connection failures without info-level packet spam).
+  `RUST_LOG` still overrides the entire default.
+
+## [0.4.5] - 2026-06-19
+
+### Added
+
+- **Send-side outbox watcher** (`PEAT_NODE_ATTACHMENT_OUTBOX_WATCH=true`, opt-in)
+  — the symmetric counterpart to the receive-side inbox watcher. Polls the
+  configured `--attachment-root` dir(s) and auto-distributes any stable new file
+  (`AllNodes` scope, default priority) by driving the same `SendAttachments`
+  path — **no gRPC call**. Drop a file in the outbox and it lands byte-identical
+  in every peer's inbox: a synced-folder model across the mesh. Off by default
+  (the explicit RPC stays the safe default); `PEAT_NODE_ATTACHMENT_OUTBOX_POLL_SECS`
+  tunes the interval (default 2s). Covered by a new compose functest
+  (`test/attachment-outbox-watch-compose.sh`) that drops a file and asserts it
+  arrives in the peer inbox with no `SendAttachments`.
+
+## [0.4.4] - 2026-06-18
+
+### Fixed
+
+- **Empty `PEAT_NODE_*` env vars no longer crash startup.** An empty
+  `PEAT_NODE_ATTACHMENT_INBOX=""` (and any empty optional `PEAT_NODE_*` var, as
+  Compose/Helm commonly inject for a "disabled" setting) triggered clap's "a
+  value is required for '--…'" and crash-looped the node. Empty `PEAT_NODE_*`
+  vars are now normalized to unset before argument parsing.
+
+### Added
+
+- **`test/attachment-delivery-compose.sh` + CI job (Attachment delivery).** A
+  functional test that sends a file from a sender's `--attachment-root` outbox
+  and asserts the **byte-identical** file lands in a receiver's
+  `--attachment-inbox` over a real two-node iroh transfer — after verifying
+  `connectedPeers >= 1` so it can't pass on the vacuous zero-peer `COMPLETED`
+  short-circuit. Guards against the PRD-006 v1 failure mode (surface passed
+  every unit test, delivered no files).
+
+## [0.4.3] - 2026-06-18
+
+### Added
+
+- **Deterministic iroh identity for static peering + offline `peat-node derive-id`** — a node's `EndpointId` is seeded from `HKDF-SHA256(shared_key, "iroh:" + node_id)` (the same derivation Kubernetes discovery uses, now shared through `crypto::derive_iroh_node_key` so the two can't drift), making it stable across restarts and computable offline by any holder of the shared key. The new `derive-id --shared-key --node-id` subcommand prints a peer's id for `PEAT_NODE_PEERS` with no boot, no network, and no access to the peer — enabling multi-machine static peering where mDNS is unavailable. Adds `examples/compose/attachments/docker-compose.multi-host.yml` and a "Deterministic identity" section in `docs/CONFIGURATION.md`. ([#162](https://github.com/defenseunicorns/peat-node/pull/162))
+
+### Fixed
+
+- **Chart version drift** — `Chart.yaml` `version`/`appVersion` (was 0.3.7) and the default image `tag` in `values.yaml` (was v0.3.3) now track the release. ([#162](https://github.com/defenseunicorns/peat-node/pull/162))
+
+## [0.4.2] - 2026-06-18
+
+### Added
+
+- **Kubernetes headless-service peer discovery** (`discovery.enabled=true`) — peat-node pods find and dial each other by watching `EndpointSlice` resources, with no static `--peer` / `PEAT_NODE_PEERS` wiring. Each pod's iroh `EndpointId` is derived deterministically from `HKDF-SHA256(shared_key, "iroh:" + POD_NAME)`, so any pod can compute any peer's id from its pod name alone. Adds the `PEAT_NODE_DISCOVERY_*` env vars / `--discovery-*` flags, the `kubernetes` feature on peat-mesh, and Helm `ServiceAccount` / `Role` / `RoleBinding` + headless `Service` templates gated on `discovery.enabled`. ([#151](https://github.com/defenseunicorns/peat-node/pull/151))
+
+### Fixed
+
+- **De-flaked the subprocess sync test** — `sync_subprocess_test` now allocates per-run ephemeral ports and polls for gRPC readiness instead of using fixed ports plus a bare sleep, eliminating the cross-test / cross-run port collisions that caused intermittent CI failures. ([#151](https://github.com/defenseunicorns/peat-node/pull/151))
 
 ## [0.4.1] - 2026-06-16
 

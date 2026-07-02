@@ -15,6 +15,9 @@ spec:
       labels:
         {{- include "peat-node.selectorLabels" . | nindent 8 }}
     spec:
+      {{- if .Values.discovery.enabled }}
+      serviceAccountName: {{ include "peat-node.fullname" . }}
+      {{- end }}
       containers:
         {{- include "peat-node.container" . | nindent 8 }}
       volumes:

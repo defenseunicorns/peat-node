@@ -1,0 +1,29 @@
+{{- if .Values.discovery.enabled }}
+# Headless Service for Kubernetes peer discovery (peat-node#63).
+# clusterIP: None causes K8s to create EndpointSlices for each ready pod,
+# which KubernetesDiscovery in peat-mesh watches to find in-cluster peers.
+# NOTE: set irohUdpPort to a non-zero value so the iroh-quic port appears
+# in EndpointSlice addresses and peers can dial each other directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "peat-node.fullname" . }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "peat-node.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "peat-node.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if hasPrefix "tcp://" .Values.listen }}
+    - name: grpc
+      port: {{ (split ":" .Values.listen)._2 }}
+      protocol: TCP
+    {{- end }}
+    {{- if gt (int .Values.irohUdpPort) 0 }}
+    - name: iroh-quic
+      port: {{ .Values.irohUdpPort }}
+      protocol: UDP
+    {{- end }}
+{{- end }}
