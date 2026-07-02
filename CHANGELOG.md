@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-02
+
+### Fixed
+
+- **Blob fetch stall cycle broken** — peers in the cooling-off state are now skipped during `fetch_blob` peer selection rather than being tried and immediately failing the health check. A cooling peer that was the only candidate would previously cause `fetch_blob` to stall for the full stall-timeout duration before falling back; it is now bypassed immediately. Bumps `peat-mesh` to `0.9.0-rc.41`. ([peat-mesh#257](https://github.com/defenseunicorns/peat-mesh/pull/257))
+
+### Fixed
+
+- **`grpc_test` port collision eliminated** — `boot_server` now binds to `127.0.0.1:0` and reads the OS-assigned port via `BoundServer::local_addr()` rather than using hardcoded ports (50081–50087). Removes the `AddrInUse` flake that appeared when a prior test run left sockets in `TIME_WAIT`.
+
 ## [0.4.1] - 2026-06-16
 
 ### Added

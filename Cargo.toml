@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -116,7 +116,7 @@ path = "src/main.rs"
 #   Unhealthy before a blackout re-enters at Neutral on reconnect.
 #   30s cooldown matches the watchdog reconnect cycle; explicit reconnect
 #   via `reset_peer_health` supersedes it anyway.
-peat-mesh = { version = "=0.9.0-rc.40", features = ["automerge-backend"] }
+peat-mesh = { version = "=0.9.0-rc.41", features = ["automerge-backend"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
