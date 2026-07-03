@@ -2,7 +2,7 @@ name: QA Review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
     branches: [main]
 
 permissions:
@@ -34,10 +34,25 @@ jobs:
           SHORT_SHA="${HEAD_SHA:0:7}"
           echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
-          REVIEWS=$(gh pr view "${{ github.event.pull_request.number }}" --json reviews)
+          PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          if echo "$REVIEWS" | jq -e --arg tag "Peat QA Review (SHA: ${SHORT_SHA})" \
-               '.reviews[] | select(.body | contains($tag))' >/dev/null; then
+          # Hash of the PR title/body/base — the review INPUTS that live OUTSIDE the commit
+          # SHA. PR-description evidence (peat-mesh pin-bump verification, Helm/Zarf packaging)
+          # is part of what we review, and an `edited` event can change it without changing the
+          # head SHA. Piped gh -> jq -> sha256sum so the untrusted title/body never enters the
+          # shell (no interpolation = no command injection).
+          META=$(gh pr view "$PR_NUMBER" --json title,body,baseRefName --jq '{title,body,baseRefName}' | sha256sum | cut -c1-12)
+          echo "meta=${META}" >> "$GITHUB_OUTPUT"
+
+          REVIEWS=$(gh pr view "$PR_NUMBER" --json reviews)
+
+          # Skip only when a prior review matches BOTH the current head SHA AND the current
+          # title/body/base hash. Same SHA + a NEW hash (a title/description fix) must
+          # re-review, not skip — that was the bug: description fixes never re-triggered.
+          if echo "$REVIEWS" | jq -e \
+               --arg sha "Peat QA Review (SHA: ${SHORT_SHA})" \
+               --arg meta "peat-qa-meta: ${META}" \
+               '.reviews[] | select((.body | contains($sha)) and (.body | contains($meta)))' >/dev/null; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -59,6 +74,7 @@ jobs:
           HAS_PRIOR: ${{ steps.prior.outputs.has_prior }}
           PREV_SHA:  ${{ steps.prior.outputs.prev_sha }}
           SHORT_SHA: ${{ steps.prior.outputs.short_sha }}
+          META:      ${{ steps.prior.outputs.meta }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO:      ${{ github.repository }}
         run: |
@@ -96,6 +112,12 @@ jobs:
               echo "::error::could not retrieve peat-bot token from host gh credential store"
               exit 1
             fi
+            # Stamp the title/body/base hash into the posted review so future runs can
+            # distinguish "already reviewed this exact PR state" from "description changed
+            # since". An HTML comment: invisible in the rendered review, and its line does
+            # not start with a [BLOCKER]/[WARNING]/[ARCH] marker so the fail-closed grep above
+            # never trips on it.
+            printf '\n\n<!-- peat-qa-meta: %s -->\n' "$META" >> "$RUNNER_TEMP/peat-qa-review.md"
             if ! GH_TOKEN="$peat_bot_token" gh pr review "$PR_NUMBER" $verb --body-file "$RUNNER_TEMP/peat-qa-review.md"; then
               echo "::error::gh pr review ${verb} failed — verdict not posted"
               exit 1
@@ -108,13 +130,15 @@ jobs:
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
           echo "::group::QA Review attempt ${attempt}/${MAX_ATTEMPTS}"
 
-          # Idempotency: if a prior attempt already posted the review for this SHA,
-          # treat as success. Guards against re-posting if claude succeeded at
-          # `gh pr review` then crashed during teardown.
+          # Idempotency: if THIS run's review (matching both head SHA AND the current
+          # title/body/base hash) was already posted, treat as success. Guards against
+          # re-posting if claude succeeded at `gh pr review` then crashed during teardown.
+          # Matching the hash too is essential now that same-SHA re-reviews exist: a stale
+          # prior review for this SHA (older description) must NOT be mistaken for this one.
           if gh pr view "$PR_NUMBER" --json reviews \
-               | jq -e --arg tag "Peat QA Review (SHA: ${SHORT_SHA})" \
-                    '.reviews[] | select(.body | contains($tag))' >/dev/null 2>&1; then
-            echo "Review for SHA ${SHORT_SHA} already posted; treating as success."
+               | jq -e --arg sha "Peat QA Review (SHA: ${SHORT_SHA})" --arg meta "peat-qa-meta: ${META}" \
+                    '.reviews[] | select((.body | contains($sha)) and (.body | contains($meta)))' >/dev/null 2>&1; then
+            echo "Review for SHA ${SHORT_SHA} (meta ${META}) already posted; treating as success."
             echo "::endgroup::"
             exit 0
           fi
@@ -139,6 +163,12 @@ jobs:
              gh pr view ${PR_NUMBER} --json reviews --jq '[.reviews[] | select(.body | startswith("## Peat QA Review (SHA: "))] | sort_by(.submittedAt) | last | .body'
           2. Delta since last review:  git diff ${PREV_SHA}..${SHORT_SHA}
           3. PR metadata:  gh pr view ${PR_NUMBER}
+             NOTE: if \`git diff ${PREV_SHA}..${SHORT_SHA}\` shows no code changes, this
+             re-review was triggered by an edit to the PR title or description (not a new
+             commit). Re-evaluate the prior findings against the CURRENT title/description
+             from this step — especially any that depended on PR-description evidence
+             (peat-mesh pin-bump integration evidence, Helm/Zarf packaging evidence). A prior
+             finding that the corrected description now satisfies is "Resolved".
           4. Review the delta against peat-node criteria:
              - Wire contract: \`proto/sidecar.proto\` IS the contract. The Rust server is
                regenerated automatically by \`build.rs\` on every \`cargo build\`. Breaking changes to
