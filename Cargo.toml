@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -117,7 +117,7 @@ path = "src/main.rs"
 #   30s cooldown matches the watchdog reconnect cycle; explicit reconnect
 #   via `reset_peer_health` supersedes it anyway.
 #
-# The `kubernetes` feature gates this PR's `KubernetesDiscovery` wiring
+# The `kubernetes` feature gates the `KubernetesDiscovery` wiring
 # (EndpointSlice watch); it's additive on top of rc.40's surface.
 peat-mesh = { version = "=0.9.0-rc.43", features = ["automerge-backend", "kubernetes"] }
 

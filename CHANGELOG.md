@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-07-02
+
+### Fixed
+
+- **`grpc_test` port collision eliminated** — `boot_server` now binds to `127.0.0.1:0` and reads the OS-assigned port via `BoundServer::local_addr()` rather than using hardcoded ports (50081–50087). Removes the `AddrInUse` flake that appeared when a prior test run left sockets in `TIME_WAIT`.
+
 ## [0.4.8] - 2026-06-20
 
 ### Fixed

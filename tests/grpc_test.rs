@@ -12,9 +12,13 @@ use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
 
-/// Boot a Connect RPC server on the given port and return a reqwest client + base URL.
-async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Client, String) {
+/// Boot a Connect RPC server on an OS-assigned ephemeral port and return a reqwest client + base URL.
+async fn boot_server(encryption_key: Option<String>) -> (reqwest::Client, String) {
     let dir = tempfile::tempdir().unwrap();
+
+    let bound = connectrpc::Server::bind("127.0.0.1:0").await.unwrap();
+    let port = bound.local_addr().unwrap().port();
+
     let node = Arc::new(
         SidecarNode::new(SidecarConfig {
             blob_stall_timeout: None,
@@ -39,13 +43,12 @@ async fn boot_server(port: u16, encryption_key: Option<String>) -> (reqwest::Cli
 
     let service = Arc::new(PeatSidecarService::new(node));
     let router = service.register(connectrpc::Router::new());
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     tokio::spawn(async move {
-        connectrpc::Server::new(router).serve(addr).await.unwrap();
+        bound.serve(router).await.unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -81,11 +84,11 @@ async fn call(
 
 #[tokio::test]
 async fn connect_protocol_full_crud_plaintext() {
-    let (client, base) = boot_server(50081, None).await;
+    let (client, base) = boot_server(None).await;
 
     // GetStatus
     let status = call(&client, &base, "GetStatus", serde_json::json!({})).await;
-    assert_eq!(status["nodeId"], "test-50081");
+    assert!(status["nodeId"].as_str().unwrap().starts_with("test-"));
     assert!(!status["endpointAddr"].as_str().unwrap().is_empty());
 
     // PutDocument
@@ -174,7 +177,7 @@ async fn connect_protocol_full_crud_plaintext() {
 async fn connect_protocol_full_crud_encrypted() {
     use base64::Engine;
     let key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
-    let (client, base) = boot_server(50082, Some(key)).await;
+    let (client, base) = boot_server(Some(key)).await;
 
     // PutDocument (encrypted at rest)
     call(
@@ -252,7 +255,7 @@ async fn connect_protocol_full_crud_encrypted() {
 
 #[tokio::test]
 async fn connect_protocol_peer_and_sync_ops() {
-    let (client, base) = boot_server(50083, None).await;
+    let (client, base) = boot_server(None).await;
 
     // ListPeers (should be empty)
     let peers = call(&client, &base, "ListPeers", serde_json::json!({})).await;
@@ -274,7 +277,7 @@ async fn connect_peer_rejects_empty_addressing() {
     // ConnectPeer with neither `addresses` nor `relay_url` must error
     // explicitly — the previous behavior (silent 10-second wait for a
     // relay URL, then opaque 500) was the original peer-reported bug.
-    let (client, base) = boot_server(50084, None).await;
+    let (client, base) = boot_server(None).await;
 
     // A real-enough endpoint id (32 bytes hex). We never actually try to
     // connect; the empty-addressing check fails before the handshake.
@@ -308,7 +311,7 @@ async fn connect_protocol_structured_doc_with_value_field() {
     // top-level "value" string field must round-trip intact through the Connect
     // surface — the is_encrypted() gate in get_document must not confuse user
     // data with the encrypted-wrapper sentinel at the HTTP layer.
-    let (client, base) = boot_server(50085, None).await;
+    let (client, base) = boot_server(None).await;
 
     // Payload with a "value" key (the former encrypted-wrapper field name)
     call(
@@ -369,7 +372,7 @@ async fn connect_protocol_collection_config_rpcs() {
     // and ListCollectionConfigs must be exercised at the Connect HTTP+JSON layer
     // to verify wire encoding of CollectionConfig (DeletionPolicy enum, optional TTL
     // fields) end-to-end.
-    let (client, base) = boot_server(50086, None).await;
+    let (client, base) = boot_server(None).await;
 
     // GetCollectionConfig on a collection that has no config → empty response
     let not_found = call(
@@ -492,7 +495,7 @@ async fn connect_protocol_subscribe_initial_snapshot() {
     // Warning from peat-node#55 QA review: Subscribe snapshot interleaving with
     // live events is verified at the trait surface in subscribe_query_test.rs but
     // should also be exercised at the Connect HTTP+JSON wire layer.
-    let (client, base) = boot_server(50087, None).await;
+    let (client, base) = boot_server(None).await;
 
     // Write 2 documents before subscribing
     for (id, payload) in [("snap-1", r#"{"k":1}"#), ("snap-2", r#"{"k":2}"#)] {
