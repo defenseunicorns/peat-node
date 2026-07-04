@@ -81,6 +81,14 @@ jobs:
           set -uo pipefail
           set +e   # GH Actions defaults to bash -e; -e would abort before rc=$? captures the claude exit code
 
+          # Fork PRs receive an empty secret (GitHub strips secrets from fork
+          # pull_request events). Unset the var so claude falls back to the
+          # runner-local credential (~/.claude/.credentials.json).
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "CLAUDE_CODE_OAUTH_TOKEN is empty (expected for fork PRs) — falling back to runner-local credentials"
+            unset CLAUDE_CODE_OAUTH_TOKEN
+          fi
+
           submit_review() {
             local verdict verb peat_bot_token
             verdict=$(tr -d '[:space:]' < "$RUNNER_TEMP/peat-qa-verdict" 2>/dev/null || true)
