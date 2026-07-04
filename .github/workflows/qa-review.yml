@@ -16,7 +16,7 @@ concurrency:
 jobs:
   qa-review:
     name: Peat QA Review
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: peat-arm64-linux-gb10-node
     timeout-minutes: 30
     steps:
