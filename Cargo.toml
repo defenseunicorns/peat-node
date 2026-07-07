@@ -119,20 +119,32 @@ path = "src/main.rs"
 #
 # The `kubernetes` feature gates this PR's `KubernetesDiscovery` wiring
 # (EndpointSlice watch); it's additive on top of rc.40's surface.
-peat-mesh = { version = "=0.9.0-rc.43", features = ["automerge-backend", "kubernetes"] }
+# rc.44 (peat-mesh#270/#268): `add_peer_from_hex_id` for discovery-side
+#   registration; mDNS browse supervisor respawn, loopback/link-local
+#   address filtering, advertise dialable hex EndpointId on _peat browse,
+#   bridge mDNS-discovered PeerInfo into dialable PeerInfo (Android interop).
+#
+# rc.45 (peat-mesh#274): `fetch_blob_from_peer` — direct, pull-only,
+#   targeted blob fetch (peat#1013).
+#
+# rc.46 (peat-mesh#276): iroh 1.0 stable — iroh 1.0.2, iroh-blobs 0.103,
+#   iroh-mdns-address-lookup 0.4. Zero API breakage.
+peat-mesh = { version = "=0.9.0-rc.46", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
 # peat#935 / ADR-063). rc.16 picked up peat-mesh rc.24 (formation_handshake
 # → &dyn QuicMeshConnection, peat#932); rc.15 was the ADR-062 Phase 2
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
-peat-protocol = { version = ">=0.9.0-rc.26, <0.9.1", features = ["automerge-backend"] }
+# rc.29 (peat#1016/#1019): peat-mesh floor → rc.44, peat-ffi blob surface,
+# proto schema version unification, formation_handshake test race fix.
+peat-protocol = { version = ">=0.9.0-rc.29, <0.9.1", features = ["automerge-backend"] }
 
-# P2P networking — pinned to match peat-mesh's exact iroh pin
+# P2P networking — pinned to match peat-mesh's iroh version
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh
 # version; mixed versions in the same process cause undefined behavior
 # in iroh's process-global crypto provider + ALPN registry.
-iroh = "=1.0.0-rc.1"
+iroh = "1.0.2"
 
 # Connect RPC (Connect + gRPC + gRPC-Web on single port)
 connectrpc = { version = "0.2", features = ["server"] }
