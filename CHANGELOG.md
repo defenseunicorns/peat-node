@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.9] - 2026-07-02
+## [0.4.9] - 2026-07-07
+
+### Changed
+
+- **Bumped to peat-mesh 0.9.0-rc.46, peat-protocol rc.29, iroh 1.0.2 stable.**
+  peat-mesh rc.46 moves the iroh dependency chain from 1.0.0-rc.1 to 1.0.2
+  stable (iroh-blobs 0.103, iroh-mdns-address-lookup 0.4). Zero API breakage;
+  iroh exact-pins relaxed to caret now that iroh is post-1.0.
+  peat-protocol floor bumped to rc.29 (peat-ffi blob surface, proto schema
+  version unification). peat-schema floor bumped to rc.29.
 
 ### Fixed
 
