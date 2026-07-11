@@ -310,6 +310,8 @@ impl SidecarNode {
         // peers; `None` → iroh's random per-process identity. See
         // [`crate::identity`].
         backend_cfg.iroh_secret_key = config.iroh_secret_key;
+        // 256 MiB in-memory cache cap (peat-mesh#288).
+        backend_cfg.cache_byte_budget = Some(256 * 1024 * 1024);
 
         // peat-node#63 — deterministic iroh keypair for K8s peer discovery.
         // All pods in the same formation derive their iroh SecretKey from
@@ -351,6 +353,10 @@ impl SidecarNode {
         }
 
         let backend = AutomergeBackend::with_iroh(backend_cfg).await?;
+
+        // Activate peat-mesh OOM protections (#279/#280/#282/#288).
+        backend.store().start_write_coalescing();
+        backend.store().start_adaptive_compaction(Duration::from_secs(30));
 
         info!(
             node_id = %config.node_id,
