@@ -360,6 +360,14 @@ impl SidecarNode {
             .store()
             .start_adaptive_compaction(Duration::from_secs(30));
 
+        // Adaptive compaction (above) handles ongoing OpTree growth.
+        // Startup compact_all was removed: loading every doc to fork()
+        // them creates transient OpTree copies that fragment the heap
+        // (430+ MB RSS on a 44-doc store), and docs that are already
+        // compact (0% reduction) get no benefit. The adaptive path
+        // compacts each doc as its change_count crosses the threshold
+        // during normal sync operations.
+
         info!(
             node_id = %config.node_id,
             endpoint_id = %backend.blob_store().endpoint_id(),
