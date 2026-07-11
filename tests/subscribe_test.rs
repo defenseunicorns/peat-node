@@ -120,3 +120,142 @@ async fn subscriber_receives_events_for_multiple_collections() {
         "subscriber missed events: {collections:?}"
     );
 }
+
+#[tokio::test]
+async fn rapid_writes_no_dropped_events() {
+    let node = fresh_node().await;
+    let mut rx = node.subscribe();
+
+    let n = 50;
+    for i in 0..n {
+        node.put_document("rapid", &format!("doc-{i}"), &format!(r#"{{"i":{i}}}"#))
+            .await
+            .unwrap();
+    }
+
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while received < n && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(event)) if event.collection == "rapid" => received += 1,
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(received, n, "expected {n} events, got {received}");
+}
+
+#[tokio::test]
+async fn overwrites_produce_events() {
+    let node = fresh_node().await;
+    let mut rx = node.subscribe();
+
+    for v in 0..5 {
+        node.put_document("ow", "same-doc", &format!(r#"{{"v":{v}}}"#))
+            .await
+            .unwrap();
+    }
+
+    let mut count = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while count < 5 && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(event)) if event.doc_id == "same-doc" => count += 1,
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(count, 5, "each overwrite must produce an event");
+}
+
+#[tokio::test]
+async fn subscriber_sees_json_data_in_events() {
+    let node = fresh_node().await;
+    let mut rx = node.subscribe();
+
+    node.put_document("json", "d1", r#"{"key":"value"}"#)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("recv");
+
+    assert_eq!(event.collection, "json");
+    assert_eq!(event.doc_id, "d1");
+    let json = event.json_data.expect("event must carry json_data");
+    assert!(
+        json.contains(r#""key":"value""#) || json.contains(r#""key": "value""#),
+        "json_data must contain the written payload, got: {json}"
+    );
+}
+
+#[tokio::test]
+async fn subscriber_receives_writes_after_subscribe() {
+    let node = fresh_node().await;
+
+    node.put_document("pre", "existing", r#"{"v":1}"#)
+        .await
+        .unwrap();
+
+    // Let forward_store_changes drain pre-existing events.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut rx = node.subscribe();
+
+    node.put_document("live", "new-doc", r#"{"v":2}"#)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_live = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(event)) if event.doc_id == "new-doc" => {
+                saw_live = true;
+                assert_eq!(event.collection, "live");
+                assert!(matches!(event.change_type, ChangeType::Upsert));
+                break;
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert!(saw_live, "subscriber must see writes after subscribe");
+}
+
+#[tokio::test]
+async fn many_collections_all_events_delivered() {
+    let node = fresh_node().await;
+    let mut rx = node.subscribe();
+
+    let n_collections = 30;
+    for c in 0..n_collections {
+        node.put_document(
+            &format!("fleet/drone-{c}/telemetry"),
+            "sensor-0",
+            &format!(r#"{{"c":{c}}}"#),
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut seen_collections = std::collections::BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while seen_collections.len() < n_collections && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(event)) if event.collection.starts_with("fleet/") => {
+                seen_collections.insert(event.collection);
+            }
+            Ok(Ok(_)) => {}
+            _ => break,
+        }
+    }
+    assert_eq!(
+        seen_collections.len(),
+        n_collections,
+        "expected events from {n_collections} collections, got {}",
+        seen_collections.len()
+    );
+}
