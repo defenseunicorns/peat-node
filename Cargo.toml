@@ -129,7 +129,13 @@ path = "src/main.rs"
 #
 # rc.46 (peat-mesh#276): iroh 1.0 stable — iroh 1.0.2, iroh-blobs 0.103,
 #   iroh-mdns-address-lookup 0.4. Zero API breakage.
-peat-mesh = { version = "=0.9.0-rc.46", features = ["automerge-backend", "kubernetes"] }
+#
+# rc.47 (peat-mesh#289): bounded RSS on sync receive path — byte-bounded
+#   cache (4 MiB, 64x heap multiplier), dirty buffer cap (16), remote
+#   compaction weight (10x). Receive-path writes go through the same
+#   bounded pipeline as local puts. Validated: 36 MB stable RSS under
+#   sustained cross-node sync load.
+peat-mesh = { version = "=0.9.0-rc.47", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
@@ -224,5 +230,3 @@ serial_test = "3"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
 
-[patch.crates-io]
-peat-mesh = { path = "../peat-mesh" }
