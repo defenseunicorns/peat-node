@@ -221,3 +221,8 @@ rcgen = "0.13"
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[patch.crates-io]
+peat-mesh = { path = "../peat-mesh" }

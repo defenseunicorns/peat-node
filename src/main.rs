@@ -7,6 +7,10 @@
 //! Optionally watches a co-located UDS Remote Agent and syncs its state
 //! to the mesh for cross-cluster visibility.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -293,6 +297,34 @@ struct Args {
         default_value_t = peat_node::attachments::config::DEFAULT_OUTBOX_POLL_SECS
     )]
     attachment_outbox_poll_secs: u32,
+
+    // --- Zenoh Bridge ---
+    /// Zenoh endpoint(s) to connect to. Empty = multicast scouting.
+    /// Example: tcp/192.168.1.1:7447
+    #[cfg(feature = "zenoh-bridge")]
+    #[arg(long, env = "PEAT_NODE_ZENOH_CONNECT", value_delimiter = ',')]
+    zenoh_connect: Vec<String>,
+
+    /// Zenoh key expression(s) to subscribe to. Presence enables the bridge.
+    /// Example: local/**
+    #[cfg(feature = "zenoh-bridge")]
+    #[arg(long, env = "PEAT_NODE_ZENOH_SUBSCRIBE", value_delimiter = ',')]
+    zenoh_subscribe: Vec<String>,
+
+    /// Collection prefix for Zenoh-ingested documents. Default: "zenoh".
+    #[cfg(feature = "zenoh-bridge")]
+    #[arg(long, env = "PEAT_NODE_ZENOH_PREFIX", default_value = "zenoh")]
+    zenoh_prefix: String,
+
+    /// Minimum interval (milliseconds) between writes for the same Zenoh key.
+    /// Samples arriving faster are dropped (latest-wins). Default: 1000.
+    #[cfg(feature = "zenoh-bridge")]
+    #[arg(
+        long,
+        env = "PEAT_NODE_ZENOH_MIN_WRITE_INTERVAL_MS",
+        default_value = "1000"
+    )]
+    zenoh_min_write_interval_ms: u64,
 
     // --- Kubernetes peer discovery (peat-node#63) ---
     /// Enable Kubernetes EndpointSlice-based peer discovery for in-cluster
@@ -595,6 +627,22 @@ async fn main() -> anyhow::Result<()> {
         let watcher_node = Arc::clone(&node);
         tokio::spawn(async move {
             watcher::run(watcher_config, watcher_node).await;
+        });
+    }
+
+    // Start Zenoh bridge if configured
+    #[cfg(feature = "zenoh-bridge")]
+    if !args.zenoh_subscribe.is_empty() {
+        let zenoh_config = peat_node::zenoh_bridge::ZenohBridgeConfig {
+            connect: args.zenoh_connect,
+            subscribe: args.zenoh_subscribe,
+            prefix: args.zenoh_prefix,
+            node_id: node_id.clone(),
+            min_write_interval: std::time::Duration::from_millis(args.zenoh_min_write_interval_ms),
+        };
+        let zenoh_node = Arc::clone(&node);
+        tokio::spawn(async move {
+            peat_node::zenoh_bridge::run(zenoh_config, zenoh_node).await;
         });
     }
 

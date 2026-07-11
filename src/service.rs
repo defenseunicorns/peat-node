@@ -398,11 +398,17 @@ impl pb::PeatSidecar for PeatSidecarService {
         // missing events that arrive during the snapshot query.
         let rx = self.node.subscribe();
 
-        // Build an initial snapshot for collections named explicitly in the
-        // request. Wildcard subscribe (empty collections list) skips the
-        // snapshot — there's no index of all collection names in the store.
+        // Build an initial snapshot. When the client names specific
+        // collections, snapshot those. When the list is empty (wildcard
+        // subscribe), enumerate every collection in the store so callers
+        // that glob-filter client-side still see existing documents.
+        let snapshot_collections = if filter_collections.is_empty() {
+            self.node.list_collections().map_err(internal)?
+        } else {
+            filter_collections.clone()
+        };
         let mut snapshot: Vec<Result<pb::DocumentChange, ConnectError>> = vec![];
-        for collection in &filter_collections {
+        for collection in &snapshot_collections {
             let ids = self
                 .node
                 .list_documents(collection)

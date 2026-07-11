@@ -356,7 +356,9 @@ impl SidecarNode {
 
         // Activate peat-mesh OOM protections (#279/#280/#282/#288).
         backend.store().start_write_coalescing();
-        backend.store().start_adaptive_compaction(Duration::from_secs(30));
+        backend
+            .store()
+            .start_adaptive_compaction(Duration::from_secs(30));
 
         info!(
             node_id = %config.node_id,
@@ -1514,6 +1516,10 @@ impl SidecarNode {
         });
 
         Ok(())
+    }
+
+    pub fn list_collections(&self) -> anyhow::Result<Vec<String>> {
+        self.backend.store().list_collections()
     }
 
     pub async fn list_documents(&self, collection: &str) -> anyhow::Result<Vec<String>> {
