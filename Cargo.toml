@@ -163,6 +163,10 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
+# Core NATS bridge. Defaults stay disabled to exclude JetStream/WebSocket
+# surfaces; `ring` supplies the rustls crypto provider required by `tls://`.
+async-nats = { version = "=0.49.1", default-features = false, features = ["ring"] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -220,4 +224,3 @@ rcgen = "0.13"
 # relevant tests pins them to one-at-a-time execution within their
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
-
