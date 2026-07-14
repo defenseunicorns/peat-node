@@ -98,6 +98,44 @@ Publish the **UDP** `PEAT_NODE_IROH_UDP_PORT` on each host (and open it in the f
 |---|---|---|---|---|
 | `PEAT_NODE_ENCRYPTION_KEY` | `--encryption-key` | base64 | unset | Base64-encoded 32-byte AES-256-GCM key. When set, document payloads are encrypted before storage (Automerge envelope stays unencrypted so sync still works) and decrypted transparently on read. See `src/crypto.rs` for the `ENC:v1:` envelope format. |
 
+## Core NATS bridge (optional)
+
+The bridge is opt-in and uses Core NATS only. With no mappings configured,
+peat-node creates no NATS connection, retry timer, or bridge task. A URL by
+itself is validated but does not enable the subsystem.
+
+| Env var | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `PEAT_NODE_NATS_URL` | `--nats-url` | URL | unset | Local Core NATS endpoint. Only explicit `nats://` and `tls://` schemes are accepted. URL user-info authentication is permitted. |
+| `PEAT_NODE_NATS_MAPPING` | `--nats-mapping` | `subject=collection` (repeatable; comma-delimited in the environment) | *empty (bridge disabled)* | Literal subject-to-Peat-collection routes. Repeat `--nats-mapping` on the command line or separate environment entries with commas. When both sources are present, CLI mappings replace the environment mappings; they are not merged. |
+
+Example:
+
+```bash
+peat-node \
+  --nats-url 'nats://bridge-user:bridge-password@127.0.0.1:4222' \
+  --nats-mapping vision.summary=vision_frames \
+  --nats-mapping node.health=node_health
+```
+
+Authenticated user-info is retained only for the client connection. The URL
+appears only in the opt-in `--print-config` / `PEAT_NODE_PRINT_CONFIG` resolved
+configuration dump, where the entire user-info is replaced with `<redacted>`;
+ordinary startup output does not render a NATS URL.
+
+Bridge configuration is validated before data-directory or mesh bootstrap.
+Startup reports all detected safe issues together, including blank or
+ambiguous mappings, embedded whitespace, wildcard or reserved subjects,
+collection names outside `[A-Za-z0-9][A-Za-z0-9._-]*`, and exact duplicate
+subjects or collections. Accepted subjects and collections remain exact and
+case-sensitive after outer whitespace trimming.
+
+Bridge readiness is internal to the bridge subsystem: an enabled bridge is
+ready only while its NATS connection is active and every configured subject
+subscription is established. Phase 1 does not change the public
+`GetStatusResponse` or reinterpret `NodePhase`. Actual NATS subscriptions and
+message ingestion arrive in Phase 2.
+
 ## Agent watcher (optional)
 
 The watcher polls a co-located service (e.g. UDS Remote Agent) and mirrors its
