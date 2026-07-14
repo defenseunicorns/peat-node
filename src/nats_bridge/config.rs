@@ -4,6 +4,7 @@
 //! URLs and parser errors are deliberately discarded so credentials cannot
 //! escape through ordinary formatting or validation diagnostics.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -241,7 +242,14 @@ pub enum BridgeConfigIssueKind {
     InvalidMappingDelimiter,
     EmptySubject,
     EmptyCollection,
+    SubjectContainsWhitespace,
+    CollectionContainsWhitespace,
     InvalidSubject,
+    SubjectContainsWildcard,
+    ReservedSubject,
+    InvalidCollection,
+    DuplicateSubject { original_index: usize },
+    DuplicateCollection { original_index: usize },
 }
 
 impl BridgeConfigIssueKind {
@@ -257,7 +265,14 @@ impl BridgeConfigIssueKind {
             Self::InvalidMappingDelimiter => "mapping must contain exactly one '=' delimiter",
             Self::EmptySubject => "mapping subject must not be empty",
             Self::EmptyCollection => "mapping collection must not be empty",
+            Self::SubjectContainsWhitespace => "mapping subject must not contain whitespace",
+            Self::CollectionContainsWhitespace => "mapping collection must not contain whitespace",
             Self::InvalidSubject => "mapping subject is invalid",
+            Self::SubjectContainsWildcard => "mapping subject must be literal",
+            Self::ReservedSubject => "mapping subject uses a reserved prefix",
+            Self::InvalidCollection => "mapping collection has invalid characters",
+            Self::DuplicateSubject { .. } => "mapping subject duplicates an earlier mapping",
+            Self::DuplicateCollection { .. } => "mapping collection duplicates an earlier mapping",
         }
     }
 }
@@ -301,6 +316,8 @@ fn parse_mappings(
     issues: &mut Vec<BridgeConfigIssue>,
 ) -> Vec<SubjectMapping> {
     let mut mappings = Vec::new();
+    let mut subjects = HashMap::<String, usize>::new();
+    let mut collections = HashMap::<String, usize>::new();
     for (offset, raw) in raw_mappings.iter().enumerate() {
         let index = offset + 1;
         if raw.matches('=').count() != 1 {
@@ -313,32 +330,106 @@ fn parse_mappings(
         let (subject, collection) = raw.split_once('=').expect("one delimiter was counted");
         let subject = subject.trim();
         let collection = collection.trim();
+        let mut subject_value = None;
+        let mut collection_valid = true;
+
         if subject.is_empty() {
             issues.push(BridgeConfigIssue::mapping(
                 index,
                 BridgeConfigIssueKind::EmptySubject,
             ));
-            continue;
+        } else if subject.chars().any(char::is_whitespace) {
+            issues.push(BridgeConfigIssue::mapping(
+                index,
+                BridgeConfigIssueKind::SubjectContainsWhitespace,
+            ));
+        } else {
+            match Subject::validated(subject) {
+                Ok(parsed) => {
+                    if subject.contains(['*', '>']) {
+                        issues.push(BridgeConfigIssue::mapping(
+                            index,
+                            BridgeConfigIssueKind::SubjectContainsWildcard,
+                        ));
+                    } else {
+                        let first_token = subject.split('.').next().unwrap_or_default();
+                        if first_token.starts_with('$') || first_token == "_INBOX" {
+                            issues.push(BridgeConfigIssue::mapping(
+                                index,
+                                BridgeConfigIssueKind::ReservedSubject,
+                            ));
+                        } else {
+                            subject_value = Some(parsed);
+                        }
+                    }
+                }
+                Err(_) => issues.push(BridgeConfigIssue::mapping(
+                    index,
+                    BridgeConfigIssueKind::InvalidSubject,
+                )),
+            }
         }
+
         if collection.is_empty() {
+            collection_valid = false;
             issues.push(BridgeConfigIssue::mapping(
                 index,
                 BridgeConfigIssueKind::EmptyCollection,
             ));
-            continue;
+        } else if collection.chars().any(char::is_whitespace) {
+            collection_valid = false;
+            issues.push(BridgeConfigIssue::mapping(
+                index,
+                BridgeConfigIssueKind::CollectionContainsWhitespace,
+            ));
+        } else if !valid_collection(collection) {
+            collection_valid = false;
+            issues.push(BridgeConfigIssue::mapping(
+                index,
+                BridgeConfigIssueKind::InvalidCollection,
+            ));
         }
-        match Subject::validated(subject) {
-            Ok(subject) => mappings.push(SubjectMapping {
+
+        let mut unique = true;
+        if let Some(subject_value) = &subject_value {
+            if let Some(original_index) = subjects.get(subject_value.as_str()) {
+                unique = false;
+                issues.push(BridgeConfigIssue::mapping(
+                    index,
+                    BridgeConfigIssueKind::DuplicateSubject {
+                        original_index: *original_index,
+                    },
+                ));
+            }
+        }
+        if collection_valid {
+            if let Some(original_index) = collections.get(collection) {
+                unique = false;
+                issues.push(BridgeConfigIssue::mapping(
+                    index,
+                    BridgeConfigIssueKind::DuplicateCollection {
+                        original_index: *original_index,
+                    },
+                ));
+            }
+        }
+
+        if let (Some(subject), true, true) = (subject_value, collection_valid, unique) {
+            subjects.insert(subject.as_str().to_owned(), index);
+            collections.insert(collection.to_owned(), index);
+            mappings.push(SubjectMapping {
                 subject,
                 collection: collection.to_owned(),
-            }),
-            Err(_) => issues.push(BridgeConfigIssue::mapping(
-                index,
-                BridgeConfigIssueKind::InvalidSubject,
-            )),
+            });
         }
     }
     mappings
+}
+
+fn valid_collection(collection: &str) -> bool {
+    let mut bytes = collection.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 #[cfg(test)]
@@ -441,5 +532,143 @@ mod tests {
         for secret in ["raw-user", "raw-pass%65ncoded", "raw-passencoded"] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn trims_outer_whitespace_and_preserves_case() {
+        let mappings = vec!["  Vision.Summary = Frame_Store-1  ".to_owned()];
+        let config = BridgeConfig::from_raw(Some("nats://broker.example"), &mappings)
+            .expect("trimmed mapping should be valid");
+        let BridgeConfig::Enabled(config) = config else {
+            panic!("mapping should enable configuration");
+        };
+        assert_eq!(config.mappings()[0].subject().as_str(), "Vision.Summary");
+        assert_eq!(config.mappings()[0].collection(), "Frame_Store-1");
+    }
+
+    #[test]
+    fn rejects_delimiter_blank_and_whitespace_errors() {
+        let cases = [
+            ("subject", BridgeConfigIssueKind::InvalidMappingDelimiter),
+            ("a=b=c", BridgeConfigIssueKind::InvalidMappingDelimiter),
+            ("=collection", BridgeConfigIssueKind::EmptySubject),
+            ("subject=", BridgeConfigIssueKind::EmptyCollection),
+            (
+                "vision summary=frames",
+                BridgeConfigIssueKind::SubjectContainsWhitespace,
+            ),
+            (
+                "vision.summary=frame\u{2003}store",
+                BridgeConfigIssueKind::CollectionContainsWhitespace,
+            ),
+        ];
+        for (raw, expected) in cases {
+            let error = BridgeConfig::from_raw(Some("nats://broker.example"), &[raw.to_owned()])
+                .expect_err("mapping should be rejected");
+            assert!(error.issues().iter().any(|issue| issue.kind == expected));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_literal_and_reserved_subjects() {
+        let cases = [
+            (".a=x", BridgeConfigIssueKind::InvalidSubject),
+            ("a.=x", BridgeConfigIssueKind::InvalidSubject),
+            ("a..b=x", BridgeConfigIssueKind::InvalidSubject),
+            ("a.*=x", BridgeConfigIssueKind::SubjectContainsWildcard),
+            ("a>b=x", BridgeConfigIssueKind::SubjectContainsWildcard),
+            ("$SYS.events=x", BridgeConfigIssueKind::ReservedSubject),
+            ("_INBOX=x", BridgeConfigIssueKind::ReservedSubject),
+            ("_INBOX.reply=x", BridgeConfigIssueKind::ReservedSubject),
+        ];
+        for (raw, expected) in cases {
+            let error = BridgeConfig::from_raw(Some("nats://broker.example"), &[raw.to_owned()])
+                .expect_err("subject should be rejected");
+            assert!(error.issues().iter().any(|issue| issue.kind == expected));
+        }
+
+        assert!(BridgeConfig::from_raw(
+            Some("nats://broker.example"),
+            &["_INBOXED.reply=x".to_owned()]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn collection_grammar_matches_the_operating_contract() {
+        for collection in ["A", "frames.v1", "frame_store", "frame-store", "9frames"] {
+            let raw = format!("vision.summary={collection}");
+            assert!(BridgeConfig::from_raw(Some("nats://broker.example"), &[raw]).is_ok());
+        }
+        for collection in ["_frames", "-frames", ".frames", "frame:store", "fråmes"] {
+            let raw = format!("vision.summary={collection}");
+            let error = BridgeConfig::from_raw(Some("nats://broker.example"), &[raw])
+                .expect_err("collection should be rejected");
+            assert_eq!(
+                error.issues()[0].kind,
+                BridgeConfigIssueKind::InvalidCollection
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_subjects_and_collections_are_exact_and_indexed() {
+        let mappings = vec![
+            "Vision.Summary=Frames".to_owned(),
+            "Vision.Summary=Other".to_owned(),
+            "vision.summary=Frames".to_owned(),
+        ];
+        let error = BridgeConfig::from_raw(Some("nats://broker.example"), &mappings)
+            .expect_err("exact duplicates should be rejected");
+        assert_eq!(
+            error.issues(),
+            &[
+                BridgeConfigIssue::mapping(
+                    2,
+                    BridgeConfigIssueKind::DuplicateSubject { original_index: 1 }
+                ),
+                BridgeConfigIssue::mapping(
+                    3,
+                    BridgeConfigIssueKind::DuplicateCollection { original_index: 1 }
+                ),
+            ]
+        );
+
+        assert!(BridgeConfig::from_raw(
+            Some("nats://broker.example"),
+            &[
+                "Vision.Summary=Frames".to_owned(),
+                "vision.summary=frames".to_owned(),
+            ]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn aggregates_mapping_issues_in_stable_input_order() {
+        let mappings = vec![
+            "bad".to_owned(),
+            "=x".to_owned(),
+            "a=".to_owned(),
+            "a=x".to_owned(),
+            "a=y".to_owned(),
+            "b=x".to_owned(),
+        ];
+        let error = BridgeConfig::from_raw(Some("nats://broker.example"), &mappings)
+            .expect_err("all issues should be returned");
+        let positions: Vec<_> = error
+            .issues()
+            .iter()
+            .map(|issue| issue.mapping_index)
+            .collect();
+        assert_eq!(positions, vec![Some(1), Some(2), Some(3), Some(5), Some(6)]);
+        assert_eq!(
+            error.issues()[3].kind,
+            BridgeConfigIssueKind::DuplicateSubject { original_index: 4 }
+        );
+        assert_eq!(
+            error.issues()[4].kind,
+            BridgeConfigIssueKind::DuplicateCollection { original_index: 4 }
+        );
     }
 }
