@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::identity;
+use peat_node::nats_bridge::config::BridgeConfig;
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -380,6 +381,21 @@ where
         .collect()
 }
 
+/// Clone operator-visible configuration with every secret-bearing field
+/// replaced before the derived `Debug` implementation is invoked.
+fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
+    let mut redacted = args.clone();
+    redacted.shared_key = "<redacted>".to_string();
+    if redacted.encryption_key.is_some() {
+        redacted.encryption_key = Some("<redacted>".to_string());
+    }
+    redacted.nats_url = match bridge_config {
+        BridgeConfig::Enabled(config) => Some(config.endpoint().to_string()),
+        BridgeConfig::Disabled => None,
+    };
+    redacted
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -437,6 +453,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Reject the complete bridge configuration before any data-directory or
+    // mesh construction. The parsed value is retained for Plan 03's strictly
+    // enabled-only runtime match; no NATS work starts in this plan.
+    let bridge_config = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)?;
+
     // `node_id` is explicit only when the operator set it; otherwise it's a
     // fresh random UUID, which makes deterministic identity impossible (a new
     // id every boot). Track that so we can warn below.
@@ -457,11 +478,7 @@ async fn main() -> anyhow::Result<()> {
     // Full resolved-configuration dump (opt-in via --print-config /
     // PEAT_NODE_PRINT_CONFIG). Secrets are redacted before logging.
     if args.print_config {
-        let mut redacted = args.clone();
-        redacted.shared_key = "<redacted>".to_string();
-        if redacted.encryption_key.is_some() {
-            redacted.encryption_key = Some("<redacted>".to_string());
-        }
+        let redacted = redacted_resolved_args(&args, &bridge_config);
         info!("resolved configuration (PEAT_NODE_PRINT_CONFIG):\n{redacted:#?}");
     }
 
@@ -672,7 +689,9 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{empty_prefixed_env_keys, Args};
+    use peat_node::nats_bridge::config::BridgeConfig;
+
+    use super::{empty_prefixed_env_keys, redacted_resolved_args, Args};
 
     struct EnvRestore {
         key: &'static str,
@@ -766,5 +785,88 @@ mod tests {
         ])
         .expect("CLI mappings should parse");
         assert_eq!(args.nats_mapping, ["cli.one=one", "cli.two=two"]);
+    }
+
+    fn args_with_authenticated_nats(url: &str) -> Args {
+        Args::try_parse_from([
+            "peat-node",
+            "--shared-key",
+            "shared-secret",
+            "--encryption-key",
+            "encryption-secret",
+            "--nats-url",
+            url,
+            "--nats-mapping",
+            "vision.summary=frames",
+        ])
+        .expect("test arguments should parse")
+    }
+
+    #[test]
+    fn nats_resolved_config_redacts_all_authenticated_user_info() {
+        let cases = [
+            "nats://alice:password@broker.example",
+            "nats://token-value@broker.example:4333",
+            "tls://encoded:sec%72et@[2001:db8::1]",
+        ];
+        for url in cases {
+            let args = args_with_authenticated_nats(url);
+            let config = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)
+                .expect("bridge configuration should be valid");
+            let rendered = format!("{:#?}", redacted_resolved_args(&args, &config));
+
+            assert!(rendered.contains("<redacted>"));
+            for secret in [
+                "alice",
+                "password",
+                "token-value",
+                "encoded",
+                "sec%72et",
+                "secret",
+                "shared-secret",
+                "encryption-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn nats_malformed_authenticated_url_has_generic_safe_diagnostics() {
+        let args =
+            args_with_authenticated_nats("nats://raw-user:raw-pass%65ncoded@broker.example:99999");
+        let error = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)
+            .expect_err("invalid port should be rejected");
+        let rendered = format!("{error} {error:?}");
+        assert!(rendered.contains("NATS URL is malformed"));
+        for secret in ["raw-user", "raw-pass%65ncoded", "raw-passencoded"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn nats_validation_precedes_data_and_mesh_bootstrap() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        let validation = production
+            .find(concat!("BridgeConfig", "::from_raw"))
+            .expect("startup validation call should exist");
+        assert_eq!(
+            production
+                .match_indices(concat!("BridgeConfig", "::from_raw"))
+                .count(),
+            1
+        );
+        let data_dir = production
+            .find("tokio::fs::create_dir_all(&args.data_dir)")
+            .expect("data-directory creation should exist");
+        let mesh = production
+            .find("SidecarNode::new(config)")
+            .expect("mesh construction should exist");
+        assert!(validation < data_dir);
+        assert!(validation < mesh);
     }
 }
