@@ -17,7 +17,8 @@ use tracing::{error, info, warn};
 
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::identity;
-use peat_node::nats_bridge::config::BridgeConfig;
+use peat_node::nats_bridge::config::{BridgeConfig, EnabledBridgeConfig};
+use peat_node::nats_bridge::runtime::{BridgeRuntime, BridgeRuntimeHandle};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -396,6 +397,23 @@ fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
     redacted
 }
 
+fn start_bridge_runtime_with<T>(
+    bridge_config: BridgeConfig,
+    spawn: impl FnOnce(EnabledBridgeConfig) -> T,
+) -> Option<T> {
+    match bridge_config {
+        BridgeConfig::Disabled => {
+            info!("NATS bridge disabled — no --nats-mapping configured");
+            None
+        }
+        BridgeConfig::Enabled(config) => Some(spawn(config)),
+    }
+}
+
+fn start_bridge_runtime(bridge_config: BridgeConfig) -> Option<BridgeRuntimeHandle> {
+    start_bridge_runtime_with(bridge_config, BridgeRuntime::spawn)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -560,6 +578,11 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
+    // The disabled branch constructs no NATS state. The enabled constructor
+    // spawns one supervisor and returns before its first broker dial, keeping
+    // Peat/RPC startup independent of local broker availability.
+    let _bridge_runtime = start_bridge_runtime(bridge_config);
+
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
     // watcher. Spawned here (not in SidecarNode::new) because it drives the
@@ -691,7 +714,7 @@ mod tests {
 
     use peat_node::nats_bridge::config::BridgeConfig;
 
-    use super::{empty_prefixed_env_keys, redacted_resolved_args, Args};
+    use super::{empty_prefixed_env_keys, redacted_resolved_args, start_bridge_runtime_with, Args};
 
     struct EnvRestore {
         key: &'static str,
@@ -868,5 +891,41 @@ mod tests {
             .expect("mesh construction should exist");
         assert!(validation < data_dir);
         assert!(validation < mesh);
+    }
+
+    #[test]
+    fn nats_disabled_does_not_invoke_runtime_factory() {
+        let config = BridgeConfig::from_raw(None, &[]).expect("empty config should be valid");
+        let calls = std::cell::Cell::new(0usize);
+        let handle: Option<()> = start_bridge_runtime_with(config, |_| {
+            calls.set(calls.get() + 1);
+        });
+        assert!(handle.is_none());
+        assert_eq!(calls.get(), 0);
+
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        assert_eq!(
+            production
+                .matches("NATS bridge disabled — no --nats-mapping configured")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nats_enabled_invokes_runtime_factory_once() {
+        let mappings = vec!["vision.summary=frames".to_owned()];
+        let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
+            .expect("enabled config should be valid");
+        let calls = std::cell::Cell::new(0usize);
+        let handle = start_bridge_runtime_with(config, |_| {
+            calls.set(calls.get() + 1);
+            "spawned"
+        });
+        assert_eq!(handle, Some("spawned"));
+        assert_eq!(calls.get(), 1);
     }
 }
