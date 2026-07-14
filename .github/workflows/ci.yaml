@@ -71,11 +71,23 @@ jobs:
     # Same-repo PRs and push events run; fork PRs are skipped.
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     # Serialize e2e on the shared self-hosted runner: at most one run at a
-    # time repo-wide, newest wins. Prevents pileup and stops two concurrent
-    # runs' mDNS advertisements from cross-talking on the host's loopback.
+    # time, queued rather than cancelling. Prevents pileup and stops
+    # concurrent runs' mDNS advertisements from cross-talking on the host's
+    # loopback.
+    #
+    # This group is SHARED with peat-mesh's `P2P Functional Tests` job
+    # (peat-mesh#295) — both run on the same physical `gb10` self-hosted
+    # runner under repo-specific labels (`peat-arm64-linux-gb10-node` here,
+    # `peat-arm64-linux-gb10-mesh` in peat-mesh), and GitHub Actions only
+    # serializes runs whose `group` strings are byte-identical, so the name
+    # must match exactly. `cancel-in-progress` changed true->false: with a
+    # shared group, `true` would let this job cancel a peat-mesh P2P run
+    # that's already mid-test on the same box (or vice versa) — queueing
+    # instead avoids one repo's CI silently killing the other's in-flight
+    # network test.
     concurrency:
       group: peat-cli-e2e-self-hosted
-      cancel-in-progress: true
+      cancel-in-progress: false
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
