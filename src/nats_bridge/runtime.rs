@@ -4,12 +4,13 @@
 //! therefore uses the client's reconnect callback as the single retry owner
 //! instead of layering a competing outer dial loop over it.
 
+use std::future::pending;
 use std::time::Duration;
 
 use async_nats::{ConnectOptions, Event, Subject};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
@@ -164,7 +165,7 @@ impl BridgeRuntimeHandle {
                 LifecycleReason::Ready,
                 &self.nats_host,
                 self.nats_port,
-                &self.readiness.snapshot(),
+                transition.status(),
             )
             .emit();
         }
@@ -269,13 +270,8 @@ async fn run_client_supervisor(
     };
 
     let mut outage = OutageLogState::default();
-    let mut warning_tick = tokio::time::interval_at(
-        Instant::now() + OUTAGE_WARNING_INTERVAL,
-        OUTAGE_WARNING_INTERVAL,
-    );
-    warning_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     loop {
+        let warning_deadline = outage.deadline();
         tokio::select! {
             signal = signal_rx.recv() => {
                 let Some(signal) = signal else { return; };
@@ -311,7 +307,7 @@ async fn run_client_supervisor(
                     }
                 }
             }
-            _ = warning_tick.tick() => {
+            _ = wait_for_outage_deadline(warning_deadline) => {
                 if outage.periodic_due(Instant::now()) {
                     LifecycleAction::unavailable(
                         &nats_host,
@@ -321,6 +317,13 @@ async fn run_client_supervisor(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_outage_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
     }
 }
 
@@ -359,6 +362,10 @@ impl OutageLogState {
             }
             _ => false,
         }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.next_warning
     }
 
     fn recovered(&mut self) {
@@ -418,6 +425,19 @@ mod tests {
         assert!(outage.periodic_due(now + Duration::from_secs(600)));
         outage.recovered();
         assert!(outage.begin(now + Duration::from_secs(601)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outage_warning_wait_is_anchored_to_outage_start() {
+        tokio::time::advance(Duration::from_secs(299)).await;
+        let mut outage = OutageLogState::default();
+        assert!(outage.begin(Instant::now()));
+
+        let waiter = tokio::spawn(wait_for_outage_deadline(outage.deadline()));
+        tokio::time::advance(Duration::from_secs(299)).await;
+        assert!(!waiter.is_finished());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.expect("deadline waiter should finish");
     }
 
     #[test]

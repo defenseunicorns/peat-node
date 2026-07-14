@@ -31,17 +31,23 @@ impl BridgeStatus {
 }
 
 /// Readiness information returned from every state transition.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadinessTransition {
     pub was_ready: bool,
     pub is_ready: bool,
     pub changed: bool,
+    status: BridgeStatus,
 }
 
 impl ReadinessTransition {
     /// True exactly once at each not-ready to fully-ready boundary.
-    pub fn became_ready(self) -> bool {
+    pub fn became_ready(&self) -> bool {
         !self.was_ready && self.is_ready
+    }
+
+    /// Snapshot captured atomically with this transition.
+    pub fn status(&self) -> &BridgeStatus {
+        &self.status
     }
 }
 
@@ -100,14 +106,18 @@ impl BridgeReadiness {
     }
 
     fn update(&self, mutate: impl FnOnce(&mut BridgeStatus)) -> ReadinessTransition {
-        let before = self.snapshot();
-        self.tx.send_modify(mutate);
-        let after = self.snapshot();
-        ReadinessTransition {
-            was_ready: before.is_ready(),
-            is_ready: after.is_ready(),
-            changed: before != after,
-        }
+        let mut transition = None;
+        self.tx.send_modify(|status| {
+            let before = status.clone();
+            mutate(status);
+            transition = Some(ReadinessTransition {
+                was_ready: before.is_ready(),
+                is_ready: status.is_ready(),
+                changed: before != *status,
+                status: status.clone(),
+            });
+        });
+        transition.expect("watch mutation always captures a readiness transition")
     }
 }
 
