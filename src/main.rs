@@ -58,6 +58,20 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
 
+    // --- Core NATS bridge ---
+    /// Local Core NATS server URL. Accepted schemes are `nats://` and `tls://`.
+    #[arg(long, env = "PEAT_NODE_NATS_URL")]
+    nats_url: Option<String>,
+
+    /// Literal `subject=collection` bridge mapping. Repeat the flag for more
+    /// mappings; `PEAT_NODE_NATS_MAPPING` uses comma-delimited entries.
+    #[arg(
+        long = "nats-mapping",
+        env = "PEAT_NODE_NATS_MAPPING",
+        value_delimiter = ','
+    )]
+    nats_mapping: Vec<String>,
+
     /// Peers to connect to on startup, in `endpoint_id@host:port` form.
     /// The `@host:port` suffix is required (the n0 public relay is no longer
     /// used by default, so a bare endpoint ID has no way to locate the peer).
@@ -654,7 +668,34 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::empty_prefixed_env_keys;
+    use std::ffi::OsString;
+
+    use clap::Parser;
+
+    use super::{empty_prefixed_env_keys, Args};
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn empty_prefixed_env_keys_selects_only_empty_matching_prefix() {
@@ -662,6 +703,7 @@ mod tests {
             ("PEAT_NODE_ATTACHMENT_INBOX".to_string(), "".to_string()), // empty + prefix -> drop
             ("PEAT_NODE_SHARED_KEY".to_string(), "abc".to_string()),    // non-empty -> keep
             ("PEAT_NODE_AGENT_ADDR".to_string(), "".to_string()),       // empty + prefix -> drop
+            ("PEAT_NODE_NATS_MAPPING".to_string(), "".to_string()),     // wholly empty -> unset
             ("OTHER_VAR".to_string(), "".to_string()), // empty but wrong prefix -> keep
             ("PATH".to_string(), "/usr/bin".to_string()), // unrelated -> keep
         ];
@@ -669,7 +711,11 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec!["PEAT_NODE_AGENT_ADDR", "PEAT_NODE_ATTACHMENT_INBOX"]
+            vec![
+                "PEAT_NODE_AGENT_ADDR",
+                "PEAT_NODE_ATTACHMENT_INBOX",
+                "PEAT_NODE_NATS_MAPPING"
+            ]
         );
     }
 
@@ -680,5 +726,45 @@ mod tests {
             "tcp://0.0.0.0:50051".to_string(),
         )];
         assert!(empty_prefixed_env_keys(vars, "PEAT_NODE_").is_empty());
+    }
+
+    #[test]
+    fn nats_mapping_accepts_one_and_repeated_cli_values() {
+        let one = Args::try_parse_from(["peat-node", "--nats-mapping", "a=one"])
+            .expect("one CLI mapping should parse");
+        assert_eq!(one.nats_mapping, ["a=one"]);
+
+        let repeated = Args::try_parse_from([
+            "peat-node",
+            "--nats-mapping",
+            "a=one",
+            "--nats-mapping",
+            "b=two",
+        ])
+        .expect("repeated CLI mappings should parse");
+        assert_eq!(repeated.nats_mapping, ["a=one", "b=two"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_mapping_accepts_comma_delimited_environment_values() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_MAPPING", "a=one,b=two");
+        let args = Args::try_parse_from(["peat-node"]).expect("environment mappings should parse");
+        assert_eq!(args.nats_mapping, ["a=one", "b=two"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_mapping_cli_values_replace_environment_values() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_MAPPING", "env.subject=env_collection");
+        let args = Args::try_parse_from([
+            "peat-node",
+            "--nats-mapping",
+            "cli.one=one",
+            "--nats-mapping",
+            "cli.two=two",
+        ])
+        .expect("CLI mappings should parse");
+        assert_eq!(args.nats_mapping, ["cli.one=one", "cli.two=two"]);
     }
 }
