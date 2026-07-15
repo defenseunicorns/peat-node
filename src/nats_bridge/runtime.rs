@@ -17,7 +17,8 @@ use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
 use super::ingress::{
-    ingress_channel, run_ingress_processor, IngressItem, IngressSender, IngressStats,
+    ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
+    IngressSender, IngressStats,
 };
 use super::readiness::{BridgeReadiness, BridgeStatus};
 use crate::node::SidecarNode;
@@ -297,6 +298,12 @@ impl BridgeRuntime {
         node: Arc<SidecarNode>,
     ) -> BridgeRuntimeHandle {
         let stats = IngressStats::default();
+        let diagnostics = IngressDiagnostics::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| (mapping.subject().clone(), mapping.collection().to_owned())),
+        );
         let (ingress_tx, ingress_rx) = ingress_channel();
         let configured_subjects = config
             .mappings()
@@ -310,13 +317,13 @@ impl BridgeRuntime {
             stats.clone(),
             configured_subjects,
         ));
-        Self::spawn_supervisor(config, stats, Some(ingress_tx))
+        Self::spawn_supervisor(config, stats, Some((ingress_tx, diagnostics)))
     }
 
     fn spawn_supervisor(
         config: EnabledBridgeConfig,
         stats: IngressStats,
-        ingress_tx: Option<IngressSender>,
+        ingress: Option<(IngressSender, IngressDiagnostics)>,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -352,7 +359,7 @@ impl BridgeRuntime {
                     stats: task_stats,
                 },
                 config,
-                ingress_tx,
+                ingress,
             )
             .await;
         });
@@ -488,7 +495,7 @@ async fn run_client_supervisor(
     nats_port: u16,
     runtime: SupervisorRuntime,
     config: EnabledBridgeConfig,
-    ingress_tx: Option<IngressSender>,
+    ingress: Option<(IngressSender, IngressDiagnostics)>,
 ) {
     let SupervisorRuntime {
         readiness,
@@ -601,7 +608,7 @@ async fn run_client_supervisor(
                         nats_port,
                         &readiness.snapshot(),
                     ).emit();
-                    if let Some(ingress_tx) = ingress_tx.as_ref() {
+                    if let Some((ingress_tx, diagnostics)) = ingress.as_ref() {
                         let action = connected_generation_action(
                             generation.as_ref(),
                             config.mappings().len(),
@@ -613,6 +620,8 @@ async fn run_client_supervisor(
                                     &client,
                                     &config,
                                     ingress_tx.clone(),
+                                    stats.clone(),
+                                    diagnostics.clone(),
                                     signal_tx.clone(),
                                     next_generation_id,
                                 ).await;
@@ -667,13 +676,15 @@ async fn run_client_supervisor(
                         }
                         if let GenerationAction::RebuildAll { subject_count, .. } = action {
                             debug_assert_eq!(subject_count, config.mappings().len());
-                            let Some(ingress_tx) = ingress_tx.as_ref() else {
+                            let Some((ingress_tx, diagnostics)) = ingress.as_ref() else {
                                 continue;
                             };
                             generation = build_subscription_generation(
                                 &client,
                                 &config,
                                 ingress_tx.clone(),
+                                stats.clone(),
+                                diagnostics.clone(),
                                 signal_tx.clone(),
                                 next_generation_id,
                             ).await;
@@ -741,6 +752,8 @@ async fn build_subscription_generation(
     client: &Client,
     config: &EnabledBridgeConfig,
     ingress_tx: IngressSender,
+    stats: IngressStats,
+    diagnostics: IngressDiagnostics,
     signal_tx: mpsc::Sender<ClientSignal>,
     generation_id: u64,
 ) -> Option<SubscriptionGeneration> {
@@ -759,6 +772,8 @@ async fn build_subscription_generation(
                 subscriber,
                 collection,
                 ingress_tx.clone(),
+                stats.clone(),
+                diagnostics.clone(),
             ));
         }
         if readers.next().await.is_some() {
@@ -777,13 +792,24 @@ async fn read_subscription(
     mut subscriber: Subscriber,
     collection: String,
     ingress_tx: IngressSender,
+    stats: IngressStats,
+    diagnostics: IngressDiagnostics,
 ) {
     while let Some(message) = subscriber.next().await {
+        let payload_bytes = message.payload.len();
+        if is_payload_oversized(payload_bytes) {
+            stats.record_oversized_payload();
+            diagnostics.record_oversized(&message.subject, &collection, payload_bytes);
+            drop(message);
+            continue;
+        }
         let item = IngressItem::new(
-            message.subject,
+            message.subject.clone(),
             collection.clone(),
             message.payload.to_vec(),
         );
+        // Release async-nats' original Bytes before queue backpressure can await.
+        drop(message);
         if ingress_tx.send(item).await.is_err() {
             return;
         }

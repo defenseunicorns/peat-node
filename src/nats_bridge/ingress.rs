@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_nats::Subject;
@@ -24,6 +24,9 @@ use crate::node::{CreateBridgeDocumentError, SidecarNode};
 
 /// Process-wide number of raw NATS messages allowed to await persistence.
 pub const INGRESS_QUEUE_CAPACITY: usize = 256;
+
+/// Largest Core NATS payload the bridge will clone into its ingress queue.
+pub const MAX_INGRESS_PAYLOAD_BYTES: usize = 1_048_576;
 
 /// Maximum create-only storage calls made for one accepted NATS message.
 pub const STORE_MAX_ATTEMPTS: usize = 3;
@@ -43,6 +46,9 @@ const STORE_ATTEMPT_DELAYS: [Option<Duration>; STORE_MAX_ATTEMPTS] = [
 /// Cadence for per-subject summaries of suppressed invalid input warnings.
 pub const INVALID_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Minimum interval between oversized-payload warnings for one configured subject.
+pub const OVERSIZED_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Cloneable, label-free ingress counters shared with runtime diagnostics.
 #[derive(Clone, Default)]
 pub struct IngressStats {
@@ -55,6 +61,7 @@ struct IngressStatsInner {
     stored: AtomicU64,
     invalid_utf8: AtomicU64,
     invalid_json: AtomicU64,
+    oversized_payloads: AtomicU64,
     final_store_failures: AtomicU64,
     slow_consumer_events: AtomicU64,
 }
@@ -66,6 +73,7 @@ pub struct IngressStatsSnapshot {
     pub stored: u64,
     pub invalid_utf8: u64,
     pub invalid_json: u64,
+    pub oversized_payloads: u64,
     pub final_store_failures: u64,
     pub slow_consumer_events: u64,
 }
@@ -78,6 +86,7 @@ impl IngressStats {
             stored: self.inner.stored.load(Ordering::Relaxed),
             invalid_utf8: self.inner.invalid_utf8.load(Ordering::Relaxed),
             invalid_json: self.inner.invalid_json.load(Ordering::Relaxed),
+            oversized_payloads: self.inner.oversized_payloads.load(Ordering::Relaxed),
             final_store_failures: self.inner.final_store_failures.load(Ordering::Relaxed),
             slow_consumer_events: self.inner.slow_consumer_events.load(Ordering::Relaxed),
         }
@@ -89,11 +98,19 @@ impl IngressStats {
             .slow_consumer_events
             .fetch_add(1, Ordering::Relaxed);
     }
+
+    /// Record one payload rejected before ingress allocation or queueing.
+    pub fn record_oversized_payload(&self) {
+        self.inner
+            .oversized_payloads
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Fixed reason carried by a payload-safe ingress action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngressActionKind {
+    OversizedPayload,
     InvalidOccurrence,
     InvalidWarning,
     InvalidSummary,
@@ -104,6 +121,7 @@ pub enum IngressActionKind {
 /// Fixed error classifications safe to expose in bridge diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngressErrorKind {
+    OversizedPayload,
     InvalidUtf8,
     InvalidJson,
     InvalidInputSummary,
@@ -119,6 +137,7 @@ pub enum IngressErrorKind {
 impl IngressErrorKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::OversizedPayload => "oversized_payload",
             Self::InvalidUtf8 => "invalid_utf8",
             Self::InvalidJson => "invalid_json",
             Self::InvalidInputSummary => "invalid_input_summary",
@@ -171,7 +190,8 @@ impl IngressAction {
                 error_kind,
                 "NATS bridge ingress action"
             ),
-            IngressActionKind::InvalidWarning
+            IngressActionKind::OversizedPayload
+            | IngressActionKind::InvalidWarning
             | IngressActionKind::InvalidSummary
             | IngressActionKind::StoreFailure => warn!(
                 subject,
@@ -191,6 +211,15 @@ trait IngressActionEmitter: Send + Sync + 'static {
     fn emit(&self, action: IngressAction);
 }
 
+impl<T> IngressActionEmitter for Arc<T>
+where
+    T: IngressActionEmitter + ?Sized,
+{
+    fn emit(&self, action: IngressAction) {
+        (**self).emit(action);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TracingIngressEmitter;
 
@@ -204,6 +233,87 @@ impl IngressActionEmitter for TracingIngressEmitter {
 struct InvalidWarningState {
     warning_emitted: bool,
     suppressed: u64,
+}
+
+#[derive(Default)]
+struct OversizedWarningState {
+    next_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+/// Cloneable, bounded diagnostics state for pre-queue oversized rejections.
+#[derive(Clone)]
+pub struct IngressDiagnostics {
+    warnings: Arc<Mutex<HashMap<String, OversizedWarningState>>>,
+    emitter: Arc<dyn IngressActionEmitter>,
+}
+
+impl IngressDiagnostics {
+    /// Pre-seed diagnostics exclusively from validated configured routes.
+    pub fn new(routes: impl IntoIterator<Item = (Subject, String)>) -> Self {
+        Self::with_emitter(routes, TracingIngressEmitter)
+    }
+
+    fn with_emitter<E>(routes: impl IntoIterator<Item = (Subject, String)>, emitter: E) -> Self
+    where
+        E: IngressActionEmitter,
+    {
+        let warnings = routes
+            .into_iter()
+            .map(|(subject, _collection)| (subject.to_string(), OversizedWarningState::default()))
+            .collect();
+        Self {
+            warnings: Arc::new(Mutex::new(warnings)),
+            emitter: Arc::new(emitter),
+        }
+    }
+
+    /// Emit at most one safe warning per configured subject per interval.
+    pub fn record_oversized(&self, subject: &Subject, collection: &str, payload_bytes: usize) {
+        self.record_oversized_at(subject, collection, payload_bytes, Instant::now());
+    }
+
+    fn record_oversized_at(
+        &self,
+        subject: &Subject,
+        collection: &str,
+        payload_bytes: usize,
+        now: Instant,
+    ) {
+        let mut warnings = self
+            .warnings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // The map is seeded only from configured subjects and never grows from input.
+        let Some(state) = warnings.get_mut(subject.as_str()) else {
+            return;
+        };
+        if state.next_warning.is_some_and(|deadline| now < deadline) {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return;
+        }
+        let suppressed_count = state.suppressed;
+        state.suppressed = 0;
+        state.next_warning = Some(now + OVERSIZED_WARNING_INTERVAL);
+        drop(warnings);
+
+        self.emitter.emit(IngressAction {
+            kind: IngressActionKind::OversizedPayload,
+            subject: Some(subject.to_string()),
+            collection: Some(collection.to_owned()),
+            payload_bytes: Some(payload_bytes),
+            document_id: None,
+            attempt: None,
+            delay_ms: None,
+            suppressed_count: Some(suppressed_count),
+            error_kind: IngressErrorKind::OversizedPayload,
+        });
+    }
+}
+
+/// Decide admission without allocating or touching the shared ingress queue.
+pub(crate) fn is_payload_oversized(payload_bytes: usize) -> bool {
+    payload_bytes > MAX_INGRESS_PAYLOAD_BYTES
 }
 
 /// One routed message awaiting validation and persistence.
@@ -941,9 +1051,73 @@ mod tests {
                 stored: 1,
                 invalid_utf8: 1,
                 invalid_json: 1,
+                oversized_payloads: 0,
                 final_store_failures: 1,
                 slow_consumer_events: 1,
             }
+        );
+    }
+
+    #[test]
+    fn payload_ceiling_accepts_exactly_one_mebibyte_and_rejects_the_next_byte() {
+        assert_eq!(MAX_INGRESS_PAYLOAD_BYTES, 1_048_576);
+        assert!(!is_payload_oversized(MAX_INGRESS_PAYLOAD_BYTES));
+        assert!(is_payload_oversized(MAX_INGRESS_PAYLOAD_BYTES + 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn oversized_diagnostics_are_bounded_rate_limited_and_payload_safe() {
+        let emitter = RecordingEmitter::default();
+        let diagnostics = IngressDiagnostics::with_emitter(
+            [(Subject::from("vision.summary"), "frames".to_owned())],
+            emitter.clone(),
+        );
+        let stats = IngressStats::default();
+        let subject = Subject::from("vision.summary");
+        let now = Instant::now();
+
+        for offset in 0..3 {
+            stats.record_oversized_payload();
+            diagnostics.record_oversized_at(
+                &subject,
+                "frames",
+                MAX_INGRESS_PAYLOAD_BYTES + 1 + offset,
+                now + Duration::from_secs(offset as u64),
+            );
+        }
+        assert_eq!(stats.snapshot().oversized_payloads, 3);
+        assert_eq!(emitter.actions().len(), 1);
+        assert_eq!(emitter.actions()[0].suppressed_count, Some(0));
+
+        diagnostics.record_oversized_at(
+            &subject,
+            "frames",
+            MAX_INGRESS_PAYLOAD_BYTES + 4,
+            now + OVERSIZED_WARNING_INTERVAL,
+        );
+        let actions = emitter.actions();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[1].suppressed_count, Some(2));
+        assert_eq!(actions[1].error_kind, IngressErrorKind::OversizedPayload);
+        let rendered = format!("{actions:?}");
+        for forbidden in [
+            r#"{"secret_payload":"do-not-log"}"#,
+            "raw-user:raw-password@broker.internal",
+            "expected value at line 1 column 19",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+
+        diagnostics.record_oversized_at(
+            &Subject::from("payload-derived-subject"),
+            "untrusted-collection",
+            usize::MAX,
+            now + Duration::from_secs(120),
+        );
+        assert_eq!(
+            emitter.actions().len(),
+            2,
+            "unconfigured input cannot grow state"
         );
     }
 
