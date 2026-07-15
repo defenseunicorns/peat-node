@@ -272,6 +272,45 @@ struct SubscriptionGeneration {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GenerationAction {
+    BuildAll {
+        subject_count: usize,
+    },
+    FlushRetained {
+        generation_id: u64,
+    },
+    RebuildAll {
+        generation_id: u64,
+        subject_count: usize,
+    },
+}
+
+fn connected_generation_action(
+    generation: Option<&SubscriptionGeneration>,
+    subject_count: usize,
+) -> GenerationAction {
+    match generation {
+        Some(generation) => GenerationAction::FlushRetained {
+            generation_id: generation.id,
+        },
+        None => GenerationAction::BuildAll { subject_count },
+    }
+}
+
+fn ended_generation_action(
+    generation: Option<&SubscriptionGeneration>,
+    ended_generation_id: u64,
+    connected: bool,
+    subject_count: usize,
+) -> Option<GenerationAction> {
+    let generation = generation?;
+    (connected && generation.id == ended_generation_id).then_some(GenerationAction::RebuildAll {
+        generation_id: generation.id,
+        subject_count,
+    })
+}
+
 impl SubscriptionGeneration {
     async fn stop(self) {
         self.task.abort();
@@ -351,15 +390,31 @@ async fn run_client_supervisor(
                             &readiness.snapshot(),
                         ).emit();
                         if let Some(ingress_tx) = ingress_tx.as_ref() {
-                            if generation.is_none() {
-                                generation = build_subscription_generation(
-                                    &client,
-                                    &config,
-                                    ingress_tx.clone(),
-                                    signal_tx.clone(),
-                                    next_generation_id,
-                                ).await;
-                                next_generation_id = next_generation_id.saturating_add(1);
+                            let action = connected_generation_action(
+                                generation.as_ref(),
+                                config.mappings().len(),
+                            );
+                            match action {
+                                GenerationAction::BuildAll { subject_count } => {
+                                    debug_assert_eq!(subject_count, config.mappings().len());
+                                    generation = build_subscription_generation(
+                                        &client,
+                                        &config,
+                                        ingress_tx.clone(),
+                                        signal_tx.clone(),
+                                        next_generation_id,
+                                    ).await;
+                                    next_generation_id = next_generation_id.saturating_add(1);
+                                }
+                                GenerationAction::FlushRetained { generation_id } => {
+                                    debug_assert_eq!(
+                                        generation.as_ref().map(|current| current.id),
+                                        Some(generation_id),
+                                    );
+                                }
+                                GenerationAction::RebuildAll { .. } => unreachable!(
+                                    "connected transition cannot request generation rebuild"
+                                ),
                             }
                             establish_generation(
                                 &client,
@@ -371,7 +426,7 @@ async fn run_client_supervisor(
                         }
                     }
                     ClientSignal::Disconnected => {
-                        readiness.mark_disconnected();
+                        handle_disconnected(&readiness);
                         outage.begin(Instant::now());
                         LifecycleAction::status(
                             LifecycleReason::Disconnected,
@@ -390,17 +445,30 @@ async fn run_client_supervisor(
                         }
                     }
                     ClientSignal::SlowConsumer => {
-                        stats.record_slow_consumer();
-                        if slow_consumers.should_warn(Instant::now()) {
-                            SlowConsumerAction::new(&nats_host, nats_port, stats.snapshot().slow_consumer_events).emit();
+                        if let Some(action) = handle_slow_consumer(
+                            &stats,
+                            &mut slow_consumers,
+                            Instant::now(),
+                            &nats_host,
+                            nats_port,
+                        ) {
+                            action.emit();
                         }
                     }
                     ClientSignal::GenerationEnded { generation_id } => {
-                        if generation.as_ref().map(|current| current.id) != Some(generation_id)
-                            || !readiness.snapshot().connected
-                        {
+                        let Some(GenerationAction::RebuildAll {
+                            generation_id: current_generation_id,
+                            subject_count,
+                        }) = ended_generation_action(
+                            generation.as_ref(),
+                            generation_id,
+                            readiness.snapshot().connected,
+                            config.mappings().len(),
+                        ) else {
                             continue;
-                        }
+                        };
+                        debug_assert_eq!(current_generation_id, generation_id);
+                        debug_assert_eq!(subject_count, config.mappings().len());
                         readiness.invalidate_subscription_generation();
                         if let Some(old_generation) = generation.take() {
                             old_generation.stop().await;
@@ -498,19 +566,29 @@ async fn establish_generation(
     nats_host: &str,
     nats_port: u16,
 ) {
-    if generation.is_none() || client.flush().await.is_err() {
+    if generation.is_none() {
         return;
     }
-    let transition = readiness.mark_all_subscriptions_established();
-    if transition.became_ready() {
+    if complete_flush(readiness, client.flush().await.is_ok()) {
         LifecycleAction::status(
             LifecycleReason::Ready,
             nats_host,
             nats_port,
-            transition.status(),
+            &readiness.snapshot(),
         )
         .emit();
     }
+}
+
+fn complete_flush(readiness: &BridgeReadiness, succeeded: bool) -> bool {
+    succeeded
+        && readiness
+            .mark_all_subscriptions_established()
+            .became_ready()
+}
+
+fn handle_disconnected(readiness: &BridgeReadiness) {
+    readiness.mark_disconnected();
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -553,6 +631,19 @@ impl SlowConsumerLogState {
         self.next_warning = Some(now + SLOW_CONSUMER_WARNING_INTERVAL);
         true
     }
+}
+
+fn handle_slow_consumer(
+    stats: &IngressStats,
+    warning_state: &mut SlowConsumerLogState,
+    now: Instant,
+    nats_host: &str,
+    nats_port: u16,
+) -> Option<SlowConsumerAction> {
+    stats.record_slow_consumer();
+    warning_state.should_warn(now).then(|| {
+        SlowConsumerAction::new(nats_host, nats_port, stats.snapshot().slow_consumer_events)
+    })
 }
 
 async fn wait_for_outage_deadline(deadline: Option<Instant>) {
@@ -612,6 +703,7 @@ impl OutageLogState {
 mod tests {
     use super::*;
     use crate::nats_bridge::config::BridgeConfig;
+    use crate::nats_bridge::ingress::INGRESS_QUEUE_CAPACITY;
 
     fn enabled_config() -> EnabledBridgeConfig {
         let mappings = vec![
@@ -625,6 +717,13 @@ mod tests {
             panic!("mappings should enable config");
         };
         config
+    }
+
+    fn generation(id: u64) -> SubscriptionGeneration {
+        SubscriptionGeneration {
+            id,
+            task: tokio::spawn(pending()),
+        }
     }
 
     #[test]
@@ -728,6 +827,188 @@ mod tests {
         assert!(disconnected.established_subscriptions == 0);
         readiness.set_connected();
         assert!(!readiness.snapshot().is_ready());
+    }
+
+    #[test]
+    fn flush_success_is_the_only_atomic_ready_transition() {
+        let config = enabled_config();
+        let readiness = BridgeReadiness::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| mapping.subject().clone()),
+        );
+        readiness.set_connected();
+
+        assert!(!complete_flush(&readiness, false));
+        assert!(!readiness.snapshot().is_ready());
+        assert!(complete_flush(&readiness, true));
+        assert_eq!(readiness.snapshot().established_subjects.len(), 2);
+        assert!(readiness.snapshot().is_ready());
+        assert!(!complete_flush(&readiness, true));
+    }
+
+    #[tokio::test]
+    async fn ingress_accepts_messages_before_flush_confirmation() {
+        let config = enabled_config();
+        let readiness = BridgeReadiness::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| mapping.subject().clone()),
+        );
+        readiness.set_connected();
+        let (sender, mut rx) = ingress_channel();
+
+        sender
+            .send(IngressItem::new(
+                "vision.summary".into(),
+                "frames".to_owned(),
+                br#"{"pre_flush":true}"#.to_vec(),
+            ))
+            .await
+            .expect("pre-flush ingress should not be readiness-gated");
+
+        let _item = rx.recv().await.expect("message should be queued");
+        assert!(!readiness.snapshot().is_ready());
+    }
+
+    #[tokio::test]
+    async fn full_ingress_queue_cannot_delay_disconnect_readiness() {
+        let config = enabled_config();
+        let readiness = BridgeReadiness::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| mapping.subject().clone()),
+        );
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        let (sender, _rx) = ingress_channel();
+        for sequence in 0..INGRESS_QUEUE_CAPACITY {
+            sender
+                .send(IngressItem::new(
+                    "vision.summary".into(),
+                    "frames".to_owned(),
+                    sequence.to_string().into_bytes(),
+                ))
+                .await
+                .expect("queue should accept its bounded capacity");
+        }
+        let blocked = tokio::spawn(async move {
+            sender
+                .send(IngressItem::new(
+                    "vision.summary".into(),
+                    "frames".to_owned(),
+                    Vec::new(),
+                ))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+
+        handle_disconnected(&readiness);
+        assert!(!readiness.snapshot().connected);
+        assert!(!readiness.snapshot().is_ready());
+        blocked.abort();
+    }
+
+    #[tokio::test]
+    async fn reconnect_retains_generation_but_stream_end_rebuilds_all_subjects() {
+        let generation = generation(41);
+        assert_eq!(
+            connected_generation_action(Some(&generation), 2),
+            GenerationAction::FlushRetained { generation_id: 41 }
+        );
+        assert_eq!(
+            connected_generation_action(None, 2),
+            GenerationAction::BuildAll { subject_count: 2 }
+        );
+        assert_eq!(
+            ended_generation_action(Some(&generation), 41, true, 2),
+            Some(GenerationAction::RebuildAll {
+                generation_id: 41,
+                subject_count: 2,
+            })
+        );
+        assert_eq!(
+            ended_generation_action(Some(&generation), 42, true, 2),
+            None,
+            "a stale sentinel cannot replace the live generation"
+        );
+        generation.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_consumers_count_every_event_and_warn_once_per_sixty_seconds() {
+        let stats = IngressStats::default();
+        let mut warnings = SlowConsumerLogState::default();
+        let config = enabled_config();
+        let readiness = BridgeReadiness::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| mapping.subject().clone()),
+        );
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        let before = readiness.snapshot();
+        let generation_id = 19_u64;
+        let now = Instant::now();
+
+        assert!(handle_slow_consumer(&stats, &mut warnings, now, "127.0.0.1", 4222).is_some());
+        assert!(handle_slow_consumer(
+            &stats,
+            &mut warnings,
+            now + Duration::from_secs(59),
+            "127.0.0.1",
+            4222,
+        )
+        .is_none());
+        assert!(handle_slow_consumer(
+            &stats,
+            &mut warnings,
+            now + SLOW_CONSUMER_WARNING_INTERVAL,
+            "127.0.0.1",
+            4222,
+        )
+        .is_some());
+        assert_eq!(stats.snapshot().slow_consumer_events, 3);
+        assert_eq!(readiness.snapshot(), before);
+        assert_eq!(generation_id, 19);
+    }
+
+    #[test]
+    fn lifecycle_and_slow_consumer_actions_cannot_retain_unsafe_sources() {
+        let mappings = vec!["vision.summary=frames".to_owned()];
+        let BridgeConfig::Enabled(config) = BridgeConfig::from_raw(
+            Some("nats://raw-user:raw-pass%65ncoded@broker.internal:4222"),
+            &mappings,
+        )
+        .expect("credential-bearing config should be valid") else {
+            panic!("mapping should enable config");
+        };
+        let readiness = BridgeReadiness::new(["vision.summary".into()]);
+        let lifecycle = LifecycleAction::unavailable(
+            config.server_addr().host(),
+            config.server_addr().port(),
+            &readiness.snapshot(),
+        );
+        let slow =
+            SlowConsumerAction::new(config.server_addr().host(), config.server_addr().port(), 7);
+        let rendered = format!("{lifecycle:?} {slow:?}");
+        for forbidden in [
+            "raw-user",
+            "raw-pass%65ncoded",
+            "nats://",
+            "subscription 923",
+            "server source error",
+            r#"{"private":"payload"}"#,
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(rendered.contains("broker.internal"));
+        assert!(rendered.contains("SlowConsumerAction"));
     }
 
     #[tokio::test]
