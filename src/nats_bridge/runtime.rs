@@ -8,7 +8,7 @@ use std::future::pending;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_nats::{Client, ConnectOptions, Event, Subscriber};
+use async_nats::{Client, ConnectOptions, Event, Request, RequestErrorKind, Subscriber};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -27,6 +27,8 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTAGE_WARNING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SLOW_CONSUMER_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const SUPERVISOR_SIGNAL_CAPACITY: usize = 64;
+const READINESS_BARRIER_SUBJECT: &str = "_PEAT.NATS_BRIDGE.READINESS";
+const READINESS_BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Stable reason values for credential-safe lifecycle events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -569,7 +571,7 @@ async fn establish_generation(
     if generation.is_none() {
         return;
     }
-    if complete_flush(readiness, client.flush().await.is_ok()) {
+    if complete_barrier(readiness, broker_round_trip(client).await) {
         LifecycleAction::status(
             LifecycleReason::Ready,
             nats_host,
@@ -580,7 +582,18 @@ async fn establish_generation(
     }
 }
 
-fn complete_flush(readiness: &BridgeReadiness, succeeded: bool) -> bool {
+async fn broker_round_trip(client: &Client) -> bool {
+    let request = Request::new().timeout(Some(READINESS_BARRIER_TIMEOUT));
+    match client
+        .send_request(READINESS_BARRIER_SUBJECT, request)
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => error.kind() == RequestErrorKind::NoResponders,
+    }
+}
+
+fn complete_barrier(readiness: &BridgeReadiness, succeeded: bool) -> bool {
     succeeded
         && readiness
             .mark_all_subscriptions_established()
@@ -830,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_success_is_the_only_atomic_ready_transition() {
+    fn broker_barrier_success_is_the_only_atomic_ready_transition() {
         let config = enabled_config();
         let readiness = BridgeReadiness::new(
             config
@@ -840,16 +853,16 @@ mod tests {
         );
         readiness.set_connected();
 
-        assert!(!complete_flush(&readiness, false));
+        assert!(!complete_barrier(&readiness, false));
         assert!(!readiness.snapshot().is_ready());
-        assert!(complete_flush(&readiness, true));
+        assert!(complete_barrier(&readiness, true));
         assert_eq!(readiness.snapshot().established_subjects.len(), 2);
         assert!(readiness.snapshot().is_ready());
-        assert!(!complete_flush(&readiness, true));
+        assert!(!complete_barrier(&readiness, true));
     }
 
     #[tokio::test]
-    async fn ingress_accepts_messages_before_flush_confirmation() {
+    async fn ingress_accepts_messages_before_barrier_confirmation() {
         let config = enabled_config();
         let readiness = BridgeReadiness::new(
             config
@@ -864,10 +877,10 @@ mod tests {
             .send(IngressItem::new(
                 "vision.summary".into(),
                 "frames".to_owned(),
-                br#"{"pre_flush":true}"#.to_vec(),
+                br#"{"pre_barrier":true}"#.to_vec(),
             ))
             .await
-            .expect("pre-flush ingress should not be readiness-gated");
+            .expect("pre-barrier ingress should not be readiness-gated");
 
         let _item = rx.recv().await.expect("message should be queued");
         assert!(!readiness.snapshot().is_ready());

@@ -353,7 +353,10 @@ fn parse_mappings(
                         ));
                     } else {
                         let first_token = subject.split('.').next().unwrap_or_default();
-                        if first_token.starts_with('$') || first_token == "_INBOX" {
+                        if first_token.starts_with('$')
+                            || first_token == "_INBOX"
+                            || first_token == "_PEAT"
+                        {
                             issues.push(BridgeConfigIssue::mapping(
                                 index,
                                 BridgeConfigIssueKind::ReservedSubject,
@@ -580,6 +583,11 @@ mod tests {
             ("$SYS.events=x", BridgeConfigIssueKind::ReservedSubject),
             ("_INBOX=x", BridgeConfigIssueKind::ReservedSubject),
             ("_INBOX.reply=x", BridgeConfigIssueKind::ReservedSubject),
+            ("_PEAT=x", BridgeConfigIssueKind::ReservedSubject),
+            (
+                "_PEAT.NATS_BRIDGE.READINESS=x",
+                BridgeConfigIssueKind::ReservedSubject,
+            ),
         ];
         for (raw, expected) in cases {
             let error = BridgeConfig::from_raw(Some("nats://broker.example"), &[raw.to_owned()])
