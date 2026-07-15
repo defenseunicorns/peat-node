@@ -228,6 +228,109 @@ mmap allocations, native-library and kernel buffers, allocations on other OS
 threads, RSS, async-nats transport retention, and whole-process memory; it is
 not a transport or process-memory bound.
 
+### Remote-origin egress and loop safety
+
+The bridge publishes only a private node event classified as a remote Peat
+upsert. Local NATS ingress, local `PutDocument`/`DeleteDocument` operations,
+all deletes and tombstones, and other local mutations never enter that event
+stream. A remote document is eligible only when its stored envelope has the
+exact `peat.nats-bridge` kind and numeric version `1`, its collection is a
+configured route, its envelope subject exactly and case-sensitively matches
+that route, and its durable `source_node_id` differs from the receiving node's
+ID. Ordinary JSON, malformed or unsupported envelopes, route mismatches, and
+documents returning to their durable source are skipped. The immediate Peat
+peer is diagnostic transport context only; it is never trusted as durable
+provenance.
+
+The eligible envelope's `payload` string is moved directly to the configured
+Core NATS subject as bytes. It is never parsed or reserialized on egress. The
+wire body therefore contains no Peat envelope, document ID, timestamp, source
+identity, or transformation. One serial worker publishes events in their
+observed FIFO order; concurrent Peat activity and event loss mean this is not
+a global or durable ordering guarantee.
+
+Each publication has exactly one private
+`Peat-Nats-Bridge-Origin: <local-node-id>` header. Ingress suppresses a message
+only when that header has exactly one value and it equals the local node ID
+byte-for-byte. An absent header, a foreign/case-variant/empty/unfamiliar value,
+or repeated values are accepted as ordinary input. The marker is deliberately
+unauthenticated: an application able to publish the exact local value can
+cause that local message to be dropped. The shared async-nats connection also
+uses `no_echo` (`CONNECT echo=false`) as defense in depth; `no_echo` alone does
+not protect another connection and does not replace the exact marker check.
+
+The remote event broadcast retains at most 256 pending events and the egress
+FIFO retains at most 256 eligible payloads of at most 1,048,576 bytes each.
+Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
+queue-closed, unavailable-client, publish, and negotiated `max_payload`
+failures are terminal losses for that document; later events continue. There
+is no bridge-owned retry, disconnected backlog, broker acknowledgement,
+per-item flush, replay, or reconciliation in this phase. Success means
+async-nats accepted the publish into its bounded client command path, not that
+the broker or a subscriber received it. The two supervisor signal FIFOs each
+hold 64 events, each configured async-nats subscriber holds one message, the
+shared ingress FIFO holds 256, the private and public node broadcasts each
+hold 256, and lifecycle/readiness use watch channels that retain only their
+latest snapshot. The pinned async-nats client separately uses its bounded
+128-event callback queue described above.
+
+The required origin header counts toward the broker's negotiated
+`max_payload`. Consequently an exact 1,048,576-byte message accepted on
+ingress can be rejected on egress by a broker whose `max_payload` is also
+1,048,576, because the HPUB header block increases the total publish size.
+Provision broker headroom for the NATS header. The bridge reports a fixed
+`max_payload` loss classification and never truncates, rewrites, or retries the
+payload.
+
+Remote duplicate suppression retains exactly 4,096 SHA-256 document digests
+(4,096 × 32 = 131,072 bytes) for the process lifetime. Its domain-separated,
+big-endian length-framed input is `(collection, document ID)`; it retains no
+attacker-controlled strings. A digest collision is treated as a duplicate.
+The digest is inserted before FIFO admission, so queue or publication failure
+cannot turn a later notification into an implicit retry. There is no eviction:
+after the table fills, all previously unseen documents fail closed until
+restart, while an existing digest remains a duplicate. Restart clears this
+in-memory table and does not provide durable exactly-once behavior.
+
+Origin attribution has a separate local-revision guard with exactly 4,096
+SHA-256 slots (also 4,096 × 32 = 131,072 retained digest bytes). Its
+domain-separated, length-framed digest covers the document key and exact
+canonical Automerge heads. It retains neither document keys nor head vectors.
+Local writes record their completed heads while holding the same per-key store
+lock used by the remote event snapshot. The remote forwarder rereads and
+classifies the current exact heads under that lock, so a later local snapshot
+cannot be mislabeled remote. If a remote revision is superseded before capture,
+it may be lost; there is no historical snapshot recovery.
+
+`MAX_REVISION_HEADS=64` bounds only digest iteration and retained/admitted
+journal work after `get_heads()` returns. Under the locked Automerge pin,
+`get_heads()` first allocates and sorts all current heads. That inherited
+transient exposure has no bounded iterator and is explicitly not a 2,048-byte
+temporary cap, peak-memory limit, RSS guarantee, or whole-process bound. Both
+fixed digest tables add small fixed metadata beyond their 131,072-byte slot
+arrays; neither statement is a whole-runtime memory ceiling.
+
+Before 1.0, `SidecarNode::document_store()` changed from a mutable raw-store
+handle to `DocumentStoreReader`. Existing reads (`get`, `scan_prefix`,
+`keys_with_prefix`, and observer subscription) remain available, but callers
+can no longer recover the backing `AutomergeStore` or call raw `put`/`delete`.
+This closes the public mutation path that could bypass local-origin
+attribution.
+
+The exact, case-sensitive collection name `file_distributions` is reserved and
+rejected in NATS bridge mappings. Public `IrohFileDistribution`/attachment
+mutation can preserve arbitrary pre-existing root fields, including content
+that resembles a bridge envelope, so this boundary must not depend on a fixed
+attachment schema or unknown-field rejection. The attachment mutation facade
+is restricted to that canonical collection. Inventory found no other public
+facade that mutates document collections: watcher writes are mediated through
+the node, while blob and bundle APIs do not mutate Automerge documents.
+
+Egress logs and metrics use fixed enums, monotonic label-free counters,
+startup-bounded route indexes, and byte counts. They do not include payload or
+envelope text, origin-header values, peer or document IDs, credentials,
+untrusted NATS/store/parser error text, or error chains.
+
 Core NATS remains at-most-once: sustained overload can still trigger client
 slow-consumer loss. Such events are counted and warned about at a rate-limited
 cadence without changing readiness, and lost Core NATS messages cannot be
@@ -244,10 +347,9 @@ source chains are never logged. Invalid UTF-8, malformed JSON, excessive
 nesting, and out-of-range numbers are counted safely and never stored or
 relayed.
 
-Phase 2 ends after local NATS ingestion and Peat storage/mesh synchronization.
-Publishing remote-origin documents to local NATS and preventing local loops is
-Phase 3. Bounded shutdown draining, persisted reconciliation, and the complete
-metrics surface are Phase 4. This Core NATS bridge provides no durable input,
+Phase 3 ends with remote-only Core NATS egress and in-memory loop safety.
+Bounded shutdown draining, persisted reconciliation, and the complete metrics
+surface are Phase 4. This Core NATS bridge provides no durable input,
 acknowledgement, replay, ordering, exactly-once delivery, or zero-loss overload
 guarantee; JetStream is out of scope.
 
