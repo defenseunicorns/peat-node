@@ -37,7 +37,7 @@ pub(crate) const EGRESS_DEDUP_CAPACITY: usize = 4096;
 /// Minimum interval between diagnostics in one fixed egress classification.
 pub(crate) const EGRESS_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
 
-const EGRESS_DIAGNOSTIC_BUCKETS: usize = 16;
+const EGRESS_DIAGNOSTIC_CLASSIFICATIONS: usize = 16;
 
 const EGRESS_DOCUMENT_DIGEST_DOMAIN: &[u8] = b"peat-node/egress-document/v1\0";
 
@@ -95,23 +95,23 @@ pub(crate) struct EgressAction {
 
 impl EgressAction {
     fn emit(&self) {
-        let route_index = self.route_index.unwrap_or_default();
+        let route_index = self.route_index;
         let payload_bytes = self.payload_bytes.unwrap_or_default();
         let suppressed_count = self.suppressed_count;
         match self.kind {
             EgressActionKind::Published => debug!(
-                route_index,
+                ?route_index,
                 payload_bytes, suppressed_count, "NATS bridge egress publish enqueued"
             ),
             EgressActionKind::Skipped(kind) => debug!(
-                route_index,
+                ?route_index,
                 payload_bytes,
                 suppressed_count,
                 reason = ?kind,
                 "NATS bridge egress skipped"
             ),
             EgressActionKind::Lost(kind) => warn!(
-                route_index,
+                ?route_index,
                 payload_bytes,
                 suppressed_count,
                 reason = ?kind,
@@ -143,22 +143,34 @@ struct DiagnosticBucket {
 /// Fixed-size, label-free rate limiter shared by every egress producer.
 #[derive(Clone)]
 pub(crate) struct EgressDiagnostics {
-    buckets: Arc<Mutex<[DiagnosticBucket; EGRESS_DIAGNOSTIC_BUCKETS]>>,
+    buckets: Arc<Mutex<Box<[DiagnosticBucket]>>>,
+    route_count: usize,
     emitter: Arc<dyn EgressActionEmitter>,
 }
 
 impl Default for EgressDiagnostics {
     fn default() -> Self {
-        Self::with_emitter(TracingEgressEmitter)
+        Self::new(0)
     }
 }
 
 impl EgressDiagnostics {
-    fn with_emitter<E: EgressActionEmitter>(emitter: E) -> Self {
+    fn new(route_count: usize) -> Self {
+        Self::with_emitter(route_count, TracingEgressEmitter)
+    }
+
+    fn with_emitter<E: EgressActionEmitter>(route_count: usize, emitter: E) -> Self {
+        // The first classification bank is route-less. Each validated startup
+        // route receives its own fixed bank so suppression can never attribute
+        // one route's flood to another route's later diagnostic.
+        let bucket_count = route_count
+            .saturating_add(1)
+            .saturating_mul(EGRESS_DIAGNOSTIC_CLASSIFICATIONS);
         Self {
             buckets: Arc::new(Mutex::new(
-                [DiagnosticBucket::default(); EGRESS_DIAGNOSTIC_BUCKETS],
+                vec![DiagnosticBucket::default(); bucket_count].into_boxed_slice(),
             )),
+            route_count,
             emitter: Arc::new(emitter),
         }
     }
@@ -168,7 +180,12 @@ impl EgressDiagnostics {
     }
 
     fn record_at(&self, mut action: EgressAction, now: Instant) {
-        let index = diagnostic_bucket(action.kind);
+        let classification = diagnostic_classification(action.kind);
+        let route_bank = action
+            .route_index
+            .filter(|index| *index < self.route_count)
+            .map_or(0, |index| index + 1);
+        let index = route_bank * EGRESS_DIAGNOSTIC_CLASSIFICATIONS + classification;
         let suppressed = {
             let mut buckets = self
                 .buckets
@@ -189,7 +206,7 @@ impl EgressDiagnostics {
     }
 }
 
-fn diagnostic_bucket(kind: EgressActionKind) -> usize {
+fn diagnostic_classification(kind: EgressActionKind) -> usize {
     match kind {
         EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope) => 0,
         EgressActionKind::Skipped(EgressSkipKind::UnsupportedKind) => 1,
@@ -487,7 +504,7 @@ impl EgressRouter {
                 dedup: Mutex::new(EgressDedup::with_digest_fn(digest_fn)),
                 tx,
                 stats,
-                diagnostics: EgressDiagnostics::with_emitter(emitter),
+                diagnostics: EgressDiagnostics::with_emitter(mappings.len(), emitter),
             },
             rx,
         )
@@ -1171,7 +1188,7 @@ mod tests {
     async fn serial_worker_preserves_each_validated_route_index_in_diagnostics() {
         let stats = EgressStats::default();
         let emitter = RecordingEmitter::default();
-        let diagnostics = EgressDiagnostics::with_emitter(emitter.clone());
+        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
         let (tx, rx) = mpsc::channel(2);
         tx.send(EgressItem {
             subject: Subject::from("Vision.Summary"),
@@ -1293,7 +1310,7 @@ mod tests {
     #[test]
     fn diagnostics_rate_limit_and_periodically_aggregate_fixed_classifications() {
         let emitter = RecordingEmitter::default();
-        let diagnostics = EgressDiagnostics::with_emitter(emitter.clone());
+        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
         let start = Instant::now();
         let kinds = [
             EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope),
@@ -1328,8 +1345,58 @@ mod tests {
         }
         assert_eq!(
             diagnostics.buckets.lock().unwrap().len(),
-            EGRESS_DIAGNOSTIC_BUCKETS
+            3 * EGRESS_DIAGNOSTIC_CLASSIFICATIONS
         );
+    }
+
+    #[test]
+    fn diagnostics_keep_same_classification_aggregates_route_exact_and_none_distinct() {
+        let emitter = RecordingEmitter::default();
+        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
+        let start = Instant::now();
+        let unavailable = |route_index| EgressAction {
+            kind: EgressActionKind::Lost(EgressFailureKind::Unavailable),
+            route_index,
+            payload_bytes: Some(1),
+            suppressed_count: 0,
+        };
+        let lag = EgressAction {
+            kind: EgressActionKind::Lost(EgressFailureKind::EventLagged),
+            route_index: None,
+            payload_bytes: None,
+            suppressed_count: 0,
+        };
+
+        diagnostics.record_at(unavailable(Some(0)), start);
+        diagnostics.record_at(unavailable(Some(1)), start);
+        diagnostics.record_at(lag.clone(), start);
+        for _ in 0..3 {
+            diagnostics.record_at(unavailable(Some(0)), start + Duration::from_secs(1));
+        }
+        for _ in 0..7 {
+            diagnostics.record_at(unavailable(Some(1)), start + Duration::from_secs(1));
+        }
+        diagnostics.record_at(lag.clone(), start + Duration::from_secs(1));
+        diagnostics.record_at(unavailable(Some(0)), start + EGRESS_DIAGNOSTIC_INTERVAL);
+        diagnostics.record_at(unavailable(Some(1)), start + EGRESS_DIAGNOSTIC_INTERVAL);
+        diagnostics.record_at(lag, start + EGRESS_DIAGNOSTIC_INTERVAL);
+
+        let actions = emitter.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .map(|action| (action.route_index, action.suppressed_count))
+                .collect::<Vec<_>>(),
+            [
+                (Some(0), 0),
+                (Some(1), 0),
+                (None, 0),
+                (Some(0), 3),
+                (Some(1), 7),
+                (None, 1),
+            ]
+        );
+        assert_eq!(format!("{:?}", actions[5].route_index), "None");
     }
 
     #[test]

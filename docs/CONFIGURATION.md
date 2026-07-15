@@ -301,13 +301,16 @@ latest snapshot. The pinned async-nats client separately uses its bounded
 128-event callback queue described above.
 
 Egress classification and delivery counters remain label-free monotonic
-counters. Diagnostic emission uses exactly 16 fixed classification buckets:
-the first event is emitted, subsequent events in the same classification are
-aggregated for 60 seconds, and the next periodic event reports the suppressed
-count. No document, peer, payload, marker, credential, parser text, or source
-error becomes a diagnostic label. A delivery diagnostic carries the finite
-validated startup route index preserved with its FIFO item; it does not infer
-or default the route after publication.
+counters. Diagnostic emission allocates exactly 16 fixed classification
+buckets for route-less events plus 16 buckets for each finite validated
+startup route. The first event is emitted, subsequent events in the same
+classification and route are aggregated for 60 seconds, and the next periodic
+event reports the suppressed count. Cross-route floods cannot be attributed
+to another route; route-less broadcast lag remains explicitly route-less and
+is never rendered as route zero. No document, peer, payload, marker,
+credential, parser text, or source error becomes a diagnostic label. A
+delivery diagnostic carries the finite validated startup route index preserved
+with its FIFO item; it does not infer or default the route after publication.
 
 The required origin header counts toward the broker's negotiated
 `max_payload`. Consequently an exact 1,048,576-byte message accepted on
