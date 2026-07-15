@@ -130,11 +130,60 @@ collection names outside `[A-Za-z0-9][A-Za-z0-9._-]*`, and exact duplicate
 subjects or collections. Accepted subjects and collections remain exact and
 case-sensitive after outer whitespace trimming.
 
-Bridge readiness is internal to the bridge subsystem: an enabled bridge is
-ready only while its NATS connection is active and every configured subject
-subscription is established. Phase 1 does not change the public
-`GetStatusResponse` or reinterpret `NodePhase`. Actual NATS subscriptions and
-message ingestion arrive in Phase 2.
+Bridge readiness is internal to the bridge subsystem and does not change the
+public `GetStatusResponse` or reinterpret `NodePhase`. The runtime creates one
+generation containing every configured literal subscription, with subscriber
+capacity 1 per mapping, before it attempts to establish readiness. It then
+sends an empty Core NATS request to the reserved
+`_PEAT.NATS_BRIDGE.READINESS` subject with a two-second timeout. A broker
+`503 No Responders` reply (or a normal response) confirms the post-subscription
+round trip; only then are all configured subjects marked established in one
+atomic transition. A timeout or client error leaves readiness false. Messages
+may still be consumed before this barrier completes because readiness is an
+establishment signal, not an ingestion gate. Application mappings cannot use
+the reserved `_PEAT` namespace.
+
+The NATS account used by the bridge must be allowed to subscribe to every
+configured application subject, publish to the exact
+`_PEAT.NATS_BRIDGE.READINESS` subject, and subscribe to its async-nats request
+inbox (`_INBOX.>` in a permission allow-list). The barrier carries an empty
+payload and no application document, credentials, or error detail. It is never
+part of a configured subscription generation and therefore never enters a Peat
+collection or the later egress path. Brokers that deny either request
+permission or do not return a no-responder status when no service is listening
+will leave the bridge not ready.
+
+Each valid UTF-8, syntactically valid JSON message creates one immutable Peat
+document with a fresh UUID v4 in its mapped collection. The durable envelope
+has exactly five fields: fixed `kind`, numeric `version`, the original literal
+`subject`, the effective operator-visible `source_node_id`, and `payload`. The
+payload field preserves the original UTF-8 JSON text byte-for-byte, including
+whitespace, key order, numeric spelling, escapes, and Unicode. The envelope is
+stored and synchronized through the existing Peat document path; it is not
+published to NATS.
+
+Ingress memory is bounded by one 256-item process-wide FIFO plus
+`O(configured mappings)` subscriber/reader slack. Each async-nats subscriber
+has capacity 1, and readers await shared FIFO capacity rather than deliberately
+dropping at the bridge boundary. Core NATS remains at-most-once: sustained
+overload can still trigger client slow-consumer loss. Such events are counted
+and warned about at a rate-limited cadence without changing readiness, and
+lost Core NATS messages cannot be replayed.
+
+Peat storage is serial and preserves FIFO processing. A transient store failure
+gets three total attempts using the same generated document ID and envelope,
+with 50 ms then 200 ms delays. Final loss is reported once with only safe route
+metadata, payload byte length, document ID, bounded attempt values, and a fixed
+error classification. Payload text, NATS credentials, unrestricted parser or
+store errors, and source chains are never logged. Invalid UTF-8 and malformed
+JSON are counted separately and never stored or relayed.
+
+Phase 2 ends after local NATS ingestion and Peat storage/mesh synchronization.
+Publishing remote-origin documents to local NATS and preventing local loops is
+Phase 3. Bounded shutdown draining, persisted reconciliation, and the complete
+metrics surface are Phase 4. This Core NATS bridge provides no durable input,
+acknowledgement, replay, ordering, exactly-once delivery, or zero-loss overload
+guarantee; JetStream is out of scope.
 
 ## Agent watcher (optional)
 
