@@ -95,15 +95,6 @@ impl BridgeReadiness {
         })
     }
 
-    /// Legacy per-subject transition retained until the runtime batch seam is replaced.
-    pub(crate) fn mark_subscription_established(&self, subject: &Subject) -> ReadinessTransition {
-        self.update(|status| {
-            if status.configured_subjects.contains(subject) {
-                status.established_subjects.insert(subject.clone());
-            }
-        })
-    }
-
     /// Invalidate the complete subscription generation without claiming disconnect.
     pub fn invalidate_subscription_generation(&self) -> ReadinessTransition {
         self.update(|status| status.established_subjects.clear())

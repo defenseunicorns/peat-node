@@ -5,20 +5,28 @@
 //! instead of layering a competing outer dial loop over it.
 
 use std::future::pending;
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_nats::{ConnectOptions, Event, Subject};
+use async_nats::{Client, ConnectOptions, Event, Subscriber};
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
+use super::ingress::{
+    ingress_channel, run_ingress_processor, IngressItem, IngressSender, IngressStats,
+};
 use super::readiness::{BridgeReadiness, BridgeStatus};
+use crate::node::SidecarNode;
 
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 const OUTAGE_WARNING_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const SLOW_CONSUMER_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+const SUPERVISOR_SIGNAL_CAPACITY: usize = 64;
 
 /// Stable reason values for credential-safe lifecycle events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,8 +155,7 @@ impl LifecycleAction {
 pub struct BridgeRuntimeHandle {
     readiness: BridgeReadiness,
     task: JoinHandle<()>,
-    nats_host: String,
-    nats_port: u16,
+    stats: IngressStats,
 }
 
 impl BridgeRuntimeHandle {
@@ -157,18 +164,9 @@ impl BridgeRuntimeHandle {
         &self.readiness
     }
 
-    /// Stable Phase 2 seam, called only after a real subscribe plus flush.
-    pub fn mark_subscription_established(&self, subject: &Subject) {
-        let transition = self.readiness.mark_subscription_established(subject);
-        if transition.became_ready() {
-            LifecycleAction::status(
-                LifecycleReason::Ready,
-                &self.nats_host,
-                self.nats_port,
-                transition.status(),
-            )
-            .emit();
-        }
+    /// Label-free ingress counters for operational and integration evidence.
+    pub fn stats(&self) -> &IngressStats {
+        &self.stats
     }
 
     /// Whether the supervisor has unexpectedly terminated.
@@ -181,8 +179,43 @@ impl BridgeRuntimeHandle {
 pub struct BridgeRuntime;
 
 impl BridgeRuntime {
-    /// Spawn one supervisor and return immediately without awaiting a broker dial.
+    /// Phase 1 compatibility constructor used until process wiring supplies a node.
+    ///
+    /// This keeps the connection lifecycle non-blocking; [`Self::spawn_with_node`]
+    /// owns the Phase 2 subscription and ingress generation.
     pub fn spawn(config: EnabledBridgeConfig) -> BridgeRuntimeHandle {
+        let stats = IngressStats::default();
+        Self::spawn_supervisor(config, stats, None)
+    }
+
+    /// Spawn the complete subscription-aware ingress runtime.
+    pub fn spawn_with_node(
+        config: EnabledBridgeConfig,
+        source_node_id: String,
+        node: Arc<SidecarNode>,
+    ) -> BridgeRuntimeHandle {
+        let stats = IngressStats::default();
+        let (ingress_tx, ingress_rx) = ingress_channel();
+        let configured_subjects = config
+            .mappings()
+            .iter()
+            .map(|mapping| mapping.subject().clone())
+            .collect::<Vec<_>>();
+        tokio::spawn(run_ingress_processor(
+            ingress_rx,
+            source_node_id,
+            node,
+            stats.clone(),
+            configured_subjects,
+        ));
+        Self::spawn_supervisor(config, stats, Some(ingress_tx))
+    }
+
+    fn spawn_supervisor(
+        config: EnabledBridgeConfig,
+        stats: IngressStats,
+        ingress_tx: Option<IngressSender>,
+    ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
         let nats_port = server_addr.port();
@@ -203,24 +236,47 @@ impl BridgeRuntime {
 
         let task_readiness = readiness.clone();
         let task_host = nats_host.clone();
+        let task_stats = stats.clone();
         let task = tokio::spawn(async move {
-            run_client_supervisor(server_addr, task_host, nats_port, task_readiness).await;
+            run_client_supervisor(
+                server_addr,
+                task_host,
+                nats_port,
+                task_readiness,
+                config,
+                ingress_tx,
+                task_stats,
+            )
+            .await;
         });
 
         BridgeRuntimeHandle {
             readiness,
             task,
-            nats_host,
-            nats_port,
+            stats,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ClientSignal {
     Connected,
     Disconnected,
     Unavailable,
+    SlowConsumer,
+    GenerationEnded { generation_id: u64 },
+}
+
+struct SubscriptionGeneration {
+    id: u64,
+    task: JoinHandle<()>,
+}
+
+impl SubscriptionGeneration {
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
 }
 
 async fn run_client_supervisor(
@@ -228,12 +284,17 @@ async fn run_client_supervisor(
     nats_host: String,
     nats_port: u16,
     readiness: BridgeReadiness,
+    config: EnabledBridgeConfig,
+    ingress_tx: Option<IngressSender>,
+    stats: IngressStats,
 ) {
-    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+    let (signal_tx, mut signal_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
     let retry_host = nats_host.clone();
+    let event_signal_tx = signal_tx.clone();
     let options = ConnectOptions::new()
         .retry_on_initial_connect()
         .max_reconnects(None)
+        .subscription_capacity(1)
         .reconnect_delay_callback(move |attempt| {
             let jitter_percent = rand::random::<u8>() % 21;
             let delay = retry_delay(attempt, jitter_percent);
@@ -241,7 +302,7 @@ async fn run_client_supervisor(
             delay
         })
         .event_callback(move |event| {
-            let signal_tx = signal_tx.clone();
+            let signal_tx = event_signal_tx.clone();
             async move {
                 let signal = match event {
                     Event::Connected => Some(ClientSignal::Connected),
@@ -249,10 +310,11 @@ async fn run_client_supervisor(
                     Event::ClientError(_) | Event::ServerError(_) => {
                         Some(ClientSignal::Unavailable)
                     }
+                    Event::SlowConsumer(_) => Some(ClientSignal::SlowConsumer),
                     _ => None,
                 };
                 if let Some(signal) = signal {
-                    let _ = signal_tx.send(signal);
+                    let _ = signal_tx.send(signal).await;
                 }
             }
         });
@@ -260,7 +322,7 @@ async fn run_client_supervisor(
     // retry_on_initial_connect makes this return a client before the first
     // network attempt completes. Retaining it here keeps exactly one internal
     // connector/reconnect owner alive for the supervisor lifetime.
-    let _client = match options.connect(server_addr).await {
+    let client = match options.connect(server_addr).await {
         Ok(client) => client,
         Err(_) => {
             let status = readiness.snapshot();
@@ -270,6 +332,9 @@ async fn run_client_supervisor(
     };
 
     let mut outage = OutageLogState::default();
+    let mut slow_consumers = SlowConsumerLogState::default();
+    let mut generation = None;
+    let mut next_generation_id = 1_u64;
     loop {
         let warning_deadline = outage.deadline();
         tokio::select! {
@@ -285,6 +350,25 @@ async fn run_client_supervisor(
                             nats_port,
                             &readiness.snapshot(),
                         ).emit();
+                        if let Some(ingress_tx) = ingress_tx.as_ref() {
+                            if generation.is_none() {
+                                generation = build_subscription_generation(
+                                    &client,
+                                    &config,
+                                    ingress_tx.clone(),
+                                    signal_tx.clone(),
+                                    next_generation_id,
+                                ).await;
+                                next_generation_id = next_generation_id.saturating_add(1);
+                            }
+                            establish_generation(
+                                &client,
+                                generation.as_ref(),
+                                &readiness,
+                                &nats_host,
+                                nats_port,
+                            ).await;
+                        }
                     }
                     ClientSignal::Disconnected => {
                         readiness.mark_disconnected();
@@ -305,6 +389,40 @@ async fn run_client_supervisor(
                             ).emit();
                         }
                     }
+                    ClientSignal::SlowConsumer => {
+                        stats.record_slow_consumer();
+                        if slow_consumers.should_warn(Instant::now()) {
+                            SlowConsumerAction::new(&nats_host, nats_port, stats.snapshot().slow_consumer_events).emit();
+                        }
+                    }
+                    ClientSignal::GenerationEnded { generation_id } => {
+                        if generation.as_ref().map(|current| current.id) != Some(generation_id)
+                            || !readiness.snapshot().connected
+                        {
+                            continue;
+                        }
+                        readiness.invalidate_subscription_generation();
+                        if let Some(old_generation) = generation.take() {
+                            old_generation.stop().await;
+                        }
+                        if let Some(ingress_tx) = ingress_tx.as_ref() {
+                            generation = build_subscription_generation(
+                                &client,
+                                &config,
+                                ingress_tx.clone(),
+                                signal_tx.clone(),
+                                next_generation_id,
+                            ).await;
+                            next_generation_id = next_generation_id.saturating_add(1);
+                            establish_generation(
+                                &client,
+                                generation.as_ref(),
+                                &readiness,
+                                &nats_host,
+                                nats_port,
+                            ).await;
+                        }
+                    }
                 }
             }
             _ = wait_for_outage_deadline(warning_deadline) => {
@@ -317,6 +435,123 @@ async fn run_client_supervisor(
                 }
             }
         }
+    }
+}
+
+async fn build_subscription_generation(
+    client: &Client,
+    config: &EnabledBridgeConfig,
+    ingress_tx: IngressSender,
+    signal_tx: mpsc::Sender<ClientSignal>,
+    generation_id: u64,
+) -> Option<SubscriptionGeneration> {
+    let mut subscribers = Vec::with_capacity(config.mappings().len());
+    for mapping in config.mappings() {
+        let Ok(subscriber) = client.subscribe(mapping.subject().clone()).await else {
+            return None;
+        };
+        subscribers.push((subscriber, mapping.collection().to_owned()));
+    }
+
+    let task = tokio::spawn(async move {
+        let mut readers = FuturesUnordered::new();
+        for (subscriber, collection) in subscribers {
+            readers.push(read_subscription(
+                subscriber,
+                collection,
+                ingress_tx.clone(),
+            ));
+        }
+        if readers.next().await.is_some() {
+            let _ = signal_tx
+                .send(ClientSignal::GenerationEnded { generation_id })
+                .await;
+        }
+    });
+    Some(SubscriptionGeneration {
+        id: generation_id,
+        task,
+    })
+}
+
+async fn read_subscription(
+    mut subscriber: Subscriber,
+    collection: String,
+    ingress_tx: IngressSender,
+) {
+    while let Some(message) = subscriber.next().await {
+        let item = IngressItem::new(
+            message.subject,
+            collection.clone(),
+            message.payload.to_vec(),
+        );
+        if ingress_tx.send(item).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn establish_generation(
+    client: &Client,
+    generation: Option<&SubscriptionGeneration>,
+    readiness: &BridgeReadiness,
+    nats_host: &str,
+    nats_port: u16,
+) {
+    if generation.is_none() || client.flush().await.is_err() {
+        return;
+    }
+    let transition = readiness.mark_all_subscriptions_established();
+    if transition.became_ready() {
+        LifecycleAction::status(
+            LifecycleReason::Ready,
+            nats_host,
+            nats_port,
+            transition.status(),
+        )
+        .emit();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlowConsumerAction {
+    nats_host: String,
+    nats_port: u16,
+    event_count: u64,
+}
+
+impl SlowConsumerAction {
+    fn new(nats_host: &str, nats_port: u16, event_count: u64) -> Self {
+        Self {
+            nats_host: nats_host.to_owned(),
+            nats_port,
+            event_count,
+        }
+    }
+
+    fn emit(&self) {
+        warn!(
+            nats_host = %self.nats_host,
+            nats_port = self.nats_port,
+            slow_consumer_events = self.event_count,
+            error_kind = "slow_consumer",
+            "NATS bridge slow consumer"
+        );
+    }
+}
+
+#[derive(Default)]
+struct SlowConsumerLogState {
+    next_warning: Option<Instant>,
+}
+
+impl SlowConsumerLogState {
+    fn should_warn(&mut self, now: Instant) -> bool {
+        if self.next_warning.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        self.next_warning = Some(now + SLOW_CONSUMER_WARNING_INTERVAL);
+        true
     }
 }
 
@@ -472,15 +707,13 @@ mod tests {
         assert!(pending.connected);
         assert!(!pending.bridge_ready);
 
-        readiness.mark_subscription_established(&Subject::from("vision.summary"));
-        assert!(!readiness.snapshot().is_ready());
-        let transition = readiness.mark_subscription_established(&Subject::from("node.health"));
+        let transition = readiness.mark_all_subscriptions_established();
         assert!(transition.became_ready());
         let ready =
             LifecycleAction::status(LifecycleReason::Ready, &host, port, &readiness.snapshot());
         assert!(ready.bridge_ready);
         assert!(!readiness
-            .mark_subscription_established(&Subject::from("node.health"))
+            .mark_all_subscriptions_established()
             .became_ready());
 
         readiness.mark_disconnected();
