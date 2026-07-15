@@ -12,10 +12,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
+use crate::nats_bridge::config::MAX_BRIDGE_IDENTITY_BYTES;
+use automerge::{ObjId, ObjType, ReadDoc, ScalarValueRef, ValueRef, ROOT};
 use base64::Engine as _;
 use peat_mesh::discovery::{
     DiscoveryEvent, DiscoveryStrategy, KubernetesDiscovery, KubernetesDiscoveryConfig,
@@ -138,6 +140,8 @@ pub struct SidecarNode {
     #[allow(dead_code)]
     bridge_change_tx: broadcast::Sender<BridgeChangeEvent>,
     local_revisions: Arc<Mutex<LocalRevisionGuard>>,
+    #[cfg(test)]
+    node_change_diagnostics: NodeChangeDiagnostics,
     cipher: Option<StoreCipher>,
     /// PRD-006 attachment configuration. Carried through so handlers can
     /// short-circuit to `Unimplemented` when no `--attachment-root` is
@@ -282,16 +286,278 @@ const BRIDGE_CHANGE_CAPACITY: usize = 256;
 // fields, but never retain an arbitrarily large remote document in the
 // broadcast ring.
 const MAX_BRIDGE_EVENT_JSON_BYTES: usize = 2 * 1_048_576 + 4_096;
-const MAX_BRIDGE_EVENT_IDENTITY_BYTES: usize = 1_024;
 // Pinned Automerge exposes no borrowed store read or encoded-size metadata:
 // `AutomergeStore::get` deep-clones the cached document. A no-compression save
 // is therefore the earliest available representation-size gate before the
 // bridge recursively hydrates a serde_json::Value. The temporary save itself
 // is an inherited full-document allocation; see the forwarder comment.
 const MAX_BRIDGE_AUTOMERGE_BYTES: usize = 8 * 1_048_576;
+const MAX_EVENT_DOCUMENT_DEPTH: usize = 64;
+const MAX_EVENT_DOCUMENT_OBJECTS: usize = 4_096;
+const MAX_EVENT_CONTAINER_ENTRIES: usize = 4_096;
+const MAX_EVENT_TOTAL_ENTRIES: usize = 65_536;
+const MAX_EVENT_SCALAR_BYTES: usize = 2 * 1_048_576;
+const MAX_EVENT_OUTPUT_PROXY_BYTES: usize = 6 * MAX_BRIDGE_EVENT_JSON_BYTES;
+const NODE_CHANGE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_REVISION_CAPACITY: usize = 4096;
 const MAX_REVISION_HEADS: usize = 64;
 const REVISION_DIGEST_DOMAIN: &[u8] = b"peat-node:local-revision:v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeChangePath {
+    PublicObserver,
+    BridgeRemote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeChangeRejectKind {
+    InvalidKey,
+    IdentityTooLarge,
+    StoreRead,
+    EncodedTooLarge,
+    StructuralLimit,
+    Decrypt,
+    Conversion,
+    EventTooLarge,
+}
+
+const NODE_CHANGE_REJECT_KINDS: usize = 8;
+const NODE_CHANGE_DIAGNOSTIC_BUCKETS: usize = 2 * NODE_CHANGE_REJECT_KINDS;
+
+impl NodeChangeRejectKind {
+    fn index(self) -> usize {
+        match self {
+            Self::InvalidKey => 0,
+            Self::IdentityTooLarge => 1,
+            Self::StoreRead => 2,
+            Self::EncodedTooLarge => 3,
+            Self::StructuralLimit => 4,
+            Self::Decrypt => 5,
+            Self::Conversion => 6,
+            Self::EventTooLarge => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NodeChangeWarningBucket {
+    next_emit: Option<Instant>,
+    suppressed: u64,
+}
+
+trait NodeChangeEmitter: Send + Sync + 'static {
+    fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64);
+}
+
+#[derive(Clone, Copy)]
+struct TracingNodeChangeEmitter;
+
+impl NodeChangeEmitter for TracingNodeChangeEmitter {
+    fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64) {
+        warn!(?path, ?kind, suppressed, "node change event rejected");
+    }
+}
+
+#[derive(Clone)]
+struct NodeChangeDiagnostics {
+    counters: Arc<[std::sync::atomic::AtomicU64; NODE_CHANGE_DIAGNOSTIC_BUCKETS]>,
+    warnings: Arc<Mutex<[NodeChangeWarningBucket; NODE_CHANGE_DIAGNOSTIC_BUCKETS]>>,
+    emitter: Arc<dyn NodeChangeEmitter>,
+}
+
+impl Default for NodeChangeDiagnostics {
+    fn default() -> Self {
+        Self::with_emitter(TracingNodeChangeEmitter)
+    }
+}
+
+impl NodeChangeDiagnostics {
+    fn with_emitter<E: NodeChangeEmitter>(emitter: E) -> Self {
+        Self {
+            counters: Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            warnings: Arc::new(Mutex::new(
+                [NodeChangeWarningBucket::default(); NODE_CHANGE_DIAGNOSTIC_BUCKETS],
+            )),
+            emitter: Arc::new(emitter),
+        }
+    }
+
+    fn index(path: NodeChangePath, kind: NodeChangeRejectKind) -> usize {
+        let path_offset = match path {
+            NodeChangePath::PublicObserver => 0,
+            NodeChangePath::BridgeRemote => NODE_CHANGE_REJECT_KINDS,
+        };
+        path_offset + kind.index()
+    }
+
+    fn record(&self, path: NodeChangePath, kind: NodeChangeRejectKind) {
+        self.record_at(path, kind, Instant::now());
+    }
+
+    fn record_at(&self, path: NodeChangePath, kind: NodeChangeRejectKind, now: Instant) {
+        let index = Self::index(path, kind);
+        self.counters[index].fetch_add(1, Ordering::Relaxed);
+        let suppressed = {
+            let mut warnings = self
+                .warnings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let bucket = &mut warnings[index];
+            if bucket.next_emit.is_some_and(|deadline| now < deadline) {
+                bucket.suppressed = bucket.suppressed.saturating_add(1);
+                return;
+            }
+            let suppressed = bucket.suppressed;
+            bucket.suppressed = 0;
+            bucket.next_emit = Some(now + NODE_CHANGE_WARNING_INTERVAL);
+            suppressed
+        };
+        self.emitter.emit(path, kind, suppressed);
+    }
+
+    #[cfg(test)]
+    fn count(&self, path: NodeChangePath, kind: NodeChangeRejectKind) -> u64 {
+        self.counters[Self::index(path, kind)].load(Ordering::Relaxed)
+    }
+}
+
+fn preflight_event_document(doc: &automerge::Automerge) -> Result<(), NodeChangeRejectKind> {
+    let mut stack = vec![(ROOT, ObjType::Map, 0_usize)];
+    let mut object_count = 1_usize;
+    let mut total_entries = 0_usize;
+    let mut scalar_bytes = 0_usize;
+    let mut output_proxy = 2_usize;
+
+    while let Some((object, object_type, depth)) = stack.pop() {
+        if depth > MAX_EVENT_DOCUMENT_DEPTH {
+            return Err(NodeChangeRejectKind::StructuralLimit);
+        }
+        let mut container_entries = 0_usize;
+        match object_type {
+            ObjType::Map | ObjType::Table => {
+                for item in doc.map_range(&object, ..) {
+                    let child_id = item.id();
+                    container_entries = container_entries.saturating_add(1);
+                    total_entries = total_entries.saturating_add(1);
+                    output_proxy = output_proxy
+                        .saturating_add(item.key.len().saturating_mul(6))
+                        .saturating_add(4);
+                    preflight_value(
+                        item.value,
+                        child_id,
+                        depth,
+                        &mut stack,
+                        &mut object_count,
+                        &mut scalar_bytes,
+                        &mut output_proxy,
+                    )?;
+                    enforce_preflight_counts(
+                        container_entries,
+                        total_entries,
+                        object_count,
+                        scalar_bytes,
+                        output_proxy,
+                    )?;
+                }
+            }
+            ObjType::List => {
+                for item in doc.list_range(&object, ..) {
+                    let child_id = item.id();
+                    container_entries = container_entries.saturating_add(1);
+                    total_entries = total_entries.saturating_add(1);
+                    output_proxy = output_proxy.saturating_add(1);
+                    preflight_value(
+                        item.value,
+                        child_id,
+                        depth,
+                        &mut stack,
+                        &mut object_count,
+                        &mut scalar_bytes,
+                        &mut output_proxy,
+                    )?;
+                    enforce_preflight_counts(
+                        container_entries,
+                        total_entries,
+                        object_count,
+                        scalar_bytes,
+                        output_proxy,
+                    )?;
+                }
+            }
+            ObjType::Text => {
+                let text_len = doc.length(&object);
+                scalar_bytes = scalar_bytes.saturating_add(text_len);
+                output_proxy = output_proxy.saturating_add(text_len.saturating_mul(6));
+                enforce_preflight_counts(
+                    0,
+                    total_entries,
+                    object_count,
+                    scalar_bytes,
+                    output_proxy,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_value(
+    value: ValueRef<'_>,
+    id: ObjId,
+    depth: usize,
+    stack: &mut Vec<(ObjId, ObjType, usize)>,
+    object_count: &mut usize,
+    scalar_bytes: &mut usize,
+    output_proxy: &mut usize,
+) -> Result<(), NodeChangeRejectKind> {
+    match value {
+        ValueRef::Object(object_type) => {
+            *object_count = object_count.saturating_add(1);
+            if *object_count > MAX_EVENT_DOCUMENT_OBJECTS || depth >= MAX_EVENT_DOCUMENT_DEPTH {
+                return Err(NodeChangeRejectKind::StructuralLimit);
+            }
+            stack.push((id, object_type, depth + 1));
+        }
+        ValueRef::Scalar(scalar) => {
+            let (bytes, proxy) = match scalar {
+                ScalarValueRef::Str(value) => (value.len(), value.len().saturating_mul(6) + 2),
+                ScalarValueRef::Bytes(value) => (value.len(), 4),
+                ScalarValueRef::Unknown { bytes, .. } => (bytes.len(), 4),
+                ScalarValueRef::Int(_)
+                | ScalarValueRef::Uint(_)
+                | ScalarValueRef::F64(_)
+                | ScalarValueRef::Counter(_)
+                | ScalarValueRef::Timestamp(_) => (0, 32),
+                ScalarValueRef::Boolean(_) => (0, 5),
+                ScalarValueRef::Null => (0, 4),
+            };
+            *scalar_bytes = scalar_bytes.saturating_add(bytes);
+            *output_proxy = output_proxy.saturating_add(proxy);
+        }
+    }
+    Ok(())
+}
+
+fn enforce_preflight_counts(
+    container_entries: usize,
+    total_entries: usize,
+    object_count: usize,
+    scalar_bytes: usize,
+    output_proxy: usize,
+) -> Result<(), NodeChangeRejectKind> {
+    if container_entries > MAX_EVENT_CONTAINER_ENTRIES
+        || total_entries > MAX_EVENT_TOTAL_ENTRIES
+        || object_count > MAX_EVENT_DOCUMENT_OBJECTS
+        || scalar_bytes > MAX_EVENT_SCALAR_BYTES
+        || output_proxy > MAX_EVENT_OUTPUT_PROXY_BYTES
+    {
+        return Err(NodeChangeRejectKind::StructuralLimit);
+    }
+    Ok(())
+}
 
 /// Fixed-width, non-evicting journal of locally authored revisions.
 ///
@@ -583,6 +849,7 @@ impl SidecarNode {
         let (change_tx, _) = broadcast::channel(256);
         let (bridge_change_tx, _) = broadcast::channel(BRIDGE_CHANGE_CAPACITY);
         let local_revisions = Arc::new(Mutex::new(LocalRevisionGuard::new()));
+        let node_change_diagnostics = NodeChangeDiagnostics::default();
 
         // Forward AutomergeStore observer events into our ChangeEvent shape
         // (collection/doc_id split + cipher decrypt) for service.rs::subscribe.
@@ -592,9 +859,16 @@ impl SidecarNode {
         let change_tx_clone = change_tx.clone();
         let store_clone = Arc::clone(backend.store());
         let cipher_clone = cipher.clone();
+        let observer_diagnostics = node_change_diagnostics.clone();
         tokio::spawn(async move {
-            Self::forward_store_changes(observer_rx, change_tx_clone, store_clone, cipher_clone)
-                .await;
+            Self::forward_store_changes(
+                observer_rx,
+                change_tx_clone,
+                store_clone,
+                cipher_clone,
+                observer_diagnostics,
+            )
+            .await;
         });
 
         // On every change (local or sync-received), push the doc to
@@ -621,6 +895,7 @@ impl SidecarNode {
         let bridge_tx = bridge_change_tx.clone();
         let bridge_cipher = cipher.clone();
         let bridge_local_revisions = Arc::clone(&local_revisions);
+        let bridge_diagnostics = node_change_diagnostics.clone();
         tokio::spawn(async move {
             Self::forward_bridge_changes(
                 bridge_rx,
@@ -628,6 +903,7 @@ impl SidecarNode {
                 bridge_store,
                 bridge_cipher,
                 bridge_local_revisions,
+                bridge_diagnostics,
             )
             .await;
         });
@@ -1025,6 +1301,8 @@ impl SidecarNode {
             change_tx,
             bridge_change_tx,
             local_revisions,
+            #[cfg(test)]
+            node_change_diagnostics,
             cipher,
             attachment_config: config.attachment_config,
             bundle_registry,
@@ -1331,18 +1609,41 @@ impl SidecarNode {
         tx: broadcast::Sender<ChangeEvent>,
         store: Arc<AutomergeStore>,
         cipher: Option<StoreCipher>,
+        diagnostics: NodeChangeDiagnostics,
     ) {
         loop {
             match rx.recv().await {
                 Ok(key) => {
                     // Keys are "collection:doc_id"
                     if let Some((collection, doc_id)) = key.split_once(':') {
+                        if collection.len() > MAX_BRIDGE_IDENTITY_BYTES
+                            || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        {
+                            diagnostics.record(
+                                NodeChangePath::PublicObserver,
+                                NodeChangeRejectKind::IdentityTooLarge,
+                            );
+                            continue;
+                        }
                         // Read the current doc and extract a JSON string for the event.
                         // Two storage formats co-exist (peat-node#7):
                         //   - encrypted: {"value":"<ENC:v1:...>"} — extract & decrypt
                         //   - structured: direct Automerge map — serialize as JSON
                         let raw = match store.get(&key) {
                             Ok(Some(doc)) => {
+                                let encoded = doc.save_nocompress();
+                                if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
+                                    diagnostics.record(
+                                        NodeChangePath::PublicObserver,
+                                        NodeChangeRejectKind::EncodedTooLarge,
+                                    );
+                                    continue;
+                                }
+                                drop(encoded);
+                                if let Err(kind) = preflight_event_document(&doc) {
+                                    diagnostics.record(NodeChangePath::PublicObserver, kind);
+                                    continue;
+                                }
                                 let j = automerge_to_json(&doc);
                                 if let Some(s) = j
                                     .get("value")
@@ -1351,31 +1652,65 @@ impl SidecarNode {
                                 {
                                     Some(s.to_string())
                                 } else {
-                                    serde_json::to_string(&j).ok()
+                                    match serde_json::to_string(&j) {
+                                        Ok(json) => Some(json),
+                                        Err(_) => {
+                                            diagnostics.record(
+                                                NodeChangePath::PublicObserver,
+                                                NodeChangeRejectKind::Conversion,
+                                            );
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
-                            _ => None,
+                            Ok(None) => None,
+                            Err(_) => {
+                                diagnostics.record(
+                                    NodeChangePath::PublicObserver,
+                                    NodeChangeRejectKind::StoreRead,
+                                );
+                                continue;
+                            }
                         };
                         // Decrypt if the raw value carries an ENC prefix.
                         let json_data = match raw {
                             Some(v) if crate::crypto::is_encrypted(&v) => match &cipher {
                                 Some(c) => match c.decrypt(&v) {
                                     Ok(plain) => Some(plain),
-                                    Err(e) => {
-                                        warn!(key, "failed to decrypt change event: {e}");
-                                        None
+                                    Err(_) => {
+                                        diagnostics.record(
+                                            NodeChangePath::PublicObserver,
+                                            NodeChangeRejectKind::Decrypt,
+                                        );
+                                        continue;
                                     }
                                 },
                                 None => Some(v),
                             },
                             other => other,
                         };
+                        if json_data
+                            .as_ref()
+                            .is_some_and(|json| json.len() > MAX_BRIDGE_EVENT_JSON_BYTES)
+                        {
+                            diagnostics.record(
+                                NodeChangePath::PublicObserver,
+                                NodeChangeRejectKind::EventTooLarge,
+                            );
+                            continue;
+                        }
                         let _ = tx.send(ChangeEvent {
                             collection: collection.to_string(),
                             doc_id: doc_id.to_string(),
                             change_type: ChangeType::Upsert,
                             json_data,
                         });
+                    } else {
+                        diagnostics.record(
+                            NodeChangePath::PublicObserver,
+                            NodeChangeRejectKind::InvalidKey,
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1400,6 +1735,7 @@ impl SidecarNode {
         store: Arc<AutomergeStore>,
         cipher: Option<StoreCipher>,
         local_revisions: Arc<Mutex<LocalRevisionGuard>>,
+        diagnostics: NodeChangeDiagnostics,
     ) {
         loop {
             match rx.recv().await {
@@ -1412,14 +1748,20 @@ impl SidecarNode {
                     // encoded size, so this is the only admission work
                     // possible without materializing the current document.
                     let Some((collection, doc_id)) = key.split_once(':') else {
-                        warn!("bridge snapshot key classification failed");
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::InvalidKey,
+                        );
                         continue;
                     };
-                    if collection.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
-                        || doc_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
-                        || remote_peer_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                    if collection.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        || remote_peer_id.len() > MAX_BRIDGE_IDENTITY_BYTES
                     {
-                        warn!("bridge change exceeds retained identity bounds");
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::IdentityTooLarge,
+                        );
                         continue;
                     }
                     let collection = collection.to_owned();
@@ -1431,7 +1773,10 @@ impl SidecarNode {
                             Ok(Some(doc)) => doc,
                             Ok(None) => continue,
                             Err(_) => {
-                                warn!("bridge snapshot read failed");
+                                diagnostics.record(
+                                    NodeChangePath::BridgeRemote,
+                                    NodeChangeRejectKind::StoreRead,
+                                );
                                 continue;
                             }
                         };
@@ -1459,10 +1804,17 @@ impl SidecarNode {
                     // gate and retains neither allocation.
                     let encoded = doc.save_nocompress();
                     if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
-                        warn!("bridge document exceeds processing bound");
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::EncodedTooLarge,
+                        );
                         continue;
                     }
                     drop(encoded);
+                    if let Err(kind) = preflight_event_document(&doc) {
+                        diagnostics.record(NodeChangePath::BridgeRemote, kind);
+                        continue;
+                    }
                     let snapshot = automerge_to_json(&doc);
                     let json_data = if let Some(encrypted) = snapshot
                         .get("value")
@@ -1470,13 +1822,19 @@ impl SidecarNode {
                         .filter(|value| crate::crypto::is_encrypted(value))
                     {
                         let Some(cipher) = &cipher else {
-                            warn!("bridge snapshot decrypt unavailable");
+                            diagnostics.record(
+                                NodeChangePath::BridgeRemote,
+                                NodeChangeRejectKind::Decrypt,
+                            );
                             continue;
                         };
                         match cipher.decrypt(encrypted) {
                             Ok(plaintext) => plaintext,
                             Err(_) => {
-                                warn!("bridge snapshot decrypt failed");
+                                diagnostics.record(
+                                    NodeChangePath::BridgeRemote,
+                                    NodeChangeRejectKind::Decrypt,
+                                );
                                 continue;
                             }
                         }
@@ -1484,7 +1842,10 @@ impl SidecarNode {
                         match serde_json::to_string(&snapshot) {
                             Ok(json) => json,
                             Err(_) => {
-                                warn!("bridge snapshot conversion failed");
+                                diagnostics.record(
+                                    NodeChangePath::BridgeRemote,
+                                    NodeChangeRejectKind::Conversion,
+                                );
                                 continue;
                             }
                         }
@@ -1497,7 +1858,10 @@ impl SidecarNode {
                     // Oversized events fail closed; the listener remains live
                     // for later valid remote changes.
                     if json_data.len() > MAX_BRIDGE_EVENT_JSON_BYTES {
-                        warn!("bridge change exceeds retained event bounds");
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::EventTooLarge,
+                        );
                         continue;
                     }
 
@@ -2117,6 +2481,17 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingNodeChangeEmitter {
+        actions: Arc<Mutex<Vec<(NodeChangePath, NodeChangeRejectKind, u64)>>>,
+    }
+
+    impl NodeChangeEmitter for RecordingNodeChangeEmitter {
+        fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64) {
+            self.actions.lock().unwrap().push((path, kind, suppressed));
+        }
+    }
+
     async fn test_node(encrypted: bool) -> (tempfile::TempDir, SidecarNode) {
         let dir = tempfile::tempdir().unwrap();
         let encryption_key =
@@ -2404,6 +2779,125 @@ mod tests {
         assert!(
             live_delta <= 1_048_576,
             "oversized bridge processing retained forged-document memory: {live_delta}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_and_wide_remote_documents_reject_iteratively_and_both_streams_continue() {
+        let (_dir, node) = test_node(false).await;
+        let mut bridge_rx = node.subscribe_bridge_changes();
+        let mut public_rx = node.subscribe();
+
+        let mut deep = serde_json::json!({"leaf": true});
+        for _ in 0..=MAX_EVENT_DOCUMENT_DEPTH {
+            deep = serde_json::json!({"child": deep});
+        }
+        put_remote(
+            &node,
+            "frames:too-deep",
+            &serde_json::to_string(&deep).unwrap(),
+            "peer-a",
+        );
+
+        let wide = serde_json::json!({
+            "wide": serde_json::Value::Array(
+                (0..=MAX_EVENT_CONTAINER_ENTRIES)
+                    .map(|_| serde_json::json!({}))
+                    .collect(),
+            )
+        });
+        put_remote(
+            &node,
+            "frames:too-wide",
+            &serde_json::to_string(&wide).unwrap(),
+            "peer-a",
+        );
+        put_remote(&node, "frames:shape-valid", r#"{"valid":true}"#, "peer-a");
+
+        let bridge = tokio::time::timeout(Duration::from_secs(10), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let public = tokio::time::timeout(Duration::from_secs(10), public_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bridge.doc_id, "shape-valid");
+        assert_eq!(public.doc_id, "shape-valid");
+        expect_no_bridge_event(&mut bridge_rx).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), public_rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            node.node_change_diagnostics.count(
+                NodeChangePath::BridgeRemote,
+                NodeChangeRejectKind::StructuralLimit
+            ),
+            2
+        );
+        assert_eq!(
+            node.node_change_diagnostics.count(
+                NodeChangePath::PublicObserver,
+                NodeChangeRejectKind::StructuralLimit
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn node_change_rejection_diagnostics_count_all_and_rate_limit_by_fixed_path_and_kind() {
+        let emitter = RecordingNodeChangeEmitter::default();
+        let diagnostics = NodeChangeDiagnostics::with_emitter(emitter.clone());
+        let start = Instant::now();
+        for path in [NodeChangePath::PublicObserver, NodeChangePath::BridgeRemote] {
+            diagnostics.record_at(path, NodeChangeRejectKind::StructuralLimit, start);
+            for _ in 0..100 {
+                diagnostics.record_at(
+                    path,
+                    NodeChangeRejectKind::StructuralLimit,
+                    start + Duration::from_secs(59),
+                );
+            }
+            diagnostics.record_at(
+                path,
+                NodeChangeRejectKind::StructuralLimit,
+                start + NODE_CHANGE_WARNING_INTERVAL,
+            );
+            assert_eq!(
+                diagnostics.count(path, NodeChangeRejectKind::StructuralLimit),
+                102
+            );
+        }
+        assert_eq!(
+            emitter.actions.lock().unwrap().as_slice(),
+            [
+                (
+                    NodeChangePath::PublicObserver,
+                    NodeChangeRejectKind::StructuralLimit,
+                    0
+                ),
+                (
+                    NodeChangePath::PublicObserver,
+                    NodeChangeRejectKind::StructuralLimit,
+                    100
+                ),
+                (
+                    NodeChangePath::BridgeRemote,
+                    NodeChangeRejectKind::StructuralLimit,
+                    0
+                ),
+                (
+                    NodeChangePath::BridgeRemote,
+                    NodeChangeRejectKind::StructuralLimit,
+                    100
+                ),
+            ]
+        );
+        assert_eq!(
+            diagnostics.warnings.lock().unwrap().len(),
+            NODE_CHANGE_DIAGNOSTIC_BUCKETS
         );
     }
 

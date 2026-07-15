@@ -128,7 +128,12 @@ Startup reports all detected safe issues together, including blank or
 ambiguous mappings, embedded whitespace, wildcard or reserved subjects,
 collection names outside `[A-Za-z0-9][A-Za-z0-9._-]*`, and exact duplicate
 subjects or collections. Accepted subjects and collections remain exact and
-case-sensitive after outer whitespace trimming.
+case-sensitive after outer whitespace trimming. A mapped collection may be at
+most 1,024 bytes. When at least one route enables the bridge, the effective
+node ID must also be non-empty, at most 1,024 bytes, and representable as an
+async-nats header value; this is checked before any data directory, mesh, or
+NATS task is created. The node-ID restriction does not apply when the bridge
+is disabled because no origin header is produced.
 
 Bridge readiness is internal to the bridge subsystem and does not change the
 public `GetStatusResponse` or reinterpret `NodePhase`. The runtime creates one
@@ -270,8 +275,14 @@ FIFO retains at most 256 eligible payloads of at most 1,048,576 bytes each.
 Collection, document, and immediate-peer identity limits are checked before
 the bridge reads the store. Before recursive Automerge-to-JSON hydration, the
 bridge also rejects a `save_nocompress()` representation larger than 8 MiB.
-This prevents an oversized current document from creating an unbounded JSON
-Value tree and serialized event string.
+It then performs a non-recursive Automerge traversal with these exact ceilings:
+depth 64, 4,096 objects, 4,096 entries in any one map/list, 65,536 entries
+across the document, 2 MiB of string/byte scalar data, and a conservative
+12,607,488-byte JSON-output proxy. The same gates protect the public observer
+and the private remote bridge forwarder. A rejected deep, wide, or otherwise
+over-limit document emits no event, and both forwarders continue with later
+valid changes. This prevents an admitted current document from reaching the
+recursive JSON converter with attacker-controlled structure.
 
 The pinned peat-mesh/Automerge API has an explicit residual limitation:
 `DocChange` carries only a key and origin, `AutomergeStore::get()` deep-clones
@@ -285,7 +296,10 @@ document to bound observed amplification to four document sizes plus 1 MiB,
 prove no more than 1 MiB remains live after rejection, and verify a later
 valid event continues. Eliminating the two inherited transient allocations
 requires a new bounded/borrowed peat-mesh store API and is not an RSS or
-whole-process memory guarantee.
+whole-process memory guarantee. peat-node directly names the already locked
+`automerge = 0.9.0` package so it can use the read-only iterator API for this
+preflight; the exact version matches peat-mesh and introduces no second
+Automerge version.
 
 Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
 queue-closed, unavailable-client, publish, and negotiated `max_payload`
@@ -311,6 +325,15 @@ is never rendered as route zero. No document, peer, payload, marker,
 credential, parser text, or source error becomes a diagnostic label. A
 delivery diagnostic carries the finite validated startup route index preserved
 with its FIFO item; it does not infer or default the route after publication.
+
+Node-side event rejection has a separate fixed table of 16 counters and 16
+warning buckets: eight rejection kinds for each of the public-observer and
+private-bridge paths. Every rejection increments its monotonic counter. The
+first warning for a path/kind pair is immediate, later warnings are suppressed
+for a fixed 60-second interval, and the next event reports the aggregate
+suppressed count. These diagnostics retain and render only the two fixed enums
+and the count; document keys, collection/document/peer identities, payloads,
+stored values, and error text are never labels or log fields.
 
 The required origin header counts toward the broker's negotiated
 `max_payload`. Consequently an exact 1,048,576-byte message accepted on

@@ -8,14 +8,16 @@ use std::future::pending;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_nats::{Client, ConnectOptions, Event, Request, RequestErrorKind, Subscriber};
+use async_nats::{
+    Client, ConnectOptions, Event, HeaderValue, Request, RequestErrorKind, Subscriber,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::config::EnabledBridgeConfig;
+use super::config::{validate_bridge_node_identity, EnabledBridgeConfig};
 use super::egress::{
     run_bridge_event_router, run_egress_worker, EgressDiagnostics, EgressRouter, EgressStats,
     NatsBridgePublisher, BRIDGE_ORIGIN_HEADER,
@@ -343,7 +345,19 @@ impl BridgeRuntime {
         source_node_id: String,
         node: Arc<SidecarNode>,
     ) -> BridgeRuntimeHandle {
+        Self::try_spawn(config, source_node_id, node)
+            .expect("bridge runtime requires startup-validated node identity")
+    }
+
+    /// Fallible startup boundary used by the process before any NATS task starts.
+    pub fn try_spawn(
+        config: EnabledBridgeConfig,
+        source_node_id: String,
+        node: Arc<SidecarNode>,
+    ) -> anyhow::Result<BridgeRuntimeHandle> {
         let local_node_id = node.node_id().to_owned();
+        let origin_header_value = validate_bridge_node_identity(&local_node_id)
+            .map_err(|_| anyhow::anyhow!("invalid effective NATS bridge node identity"))?;
         if source_node_id != local_node_id {
             warn!(
                 error_kind = "node_identity_mismatch",
@@ -386,18 +400,18 @@ impl BridgeRuntime {
             )
             .await;
         });
-        Self::spawn_supervisor(
+        Ok(Self::spawn_supervisor(
             config,
             stats,
             Some((ingress_tx, diagnostics, local_node_id)),
             Some(EgressSupervisor {
                 rx: egress_rx,
-                local_node_id: node.node_id().to_owned(),
+                origin_header_value,
                 stats: egress_stats,
                 diagnostics: egress_diagnostics,
             }),
             vec![ingress_task, router_task],
-        )
+        ))
     }
 
     fn spawn_supervisor(
@@ -489,7 +503,7 @@ struct SupervisorRuntime {
 
 struct EgressSupervisor {
     rx: mpsc::Receiver<super::egress::EgressItem>,
-    local_node_id: String,
+    origin_header_value: HeaderValue,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
 }
@@ -670,7 +684,7 @@ async fn run_client_supervisor(
         let publisher = NatsBridgePublisher::new(client.clone(), readiness.clone());
         AbortTaskOnDrop(tokio::spawn(run_egress_worker(
             state.rx,
-            state.local_node_id,
+            state.origin_header_value,
             publisher,
             state.stats,
             state.diagnostics,
@@ -1118,6 +1132,34 @@ mod tests {
     use crate::nats_bridge::config::BridgeConfig;
     use crate::nats_bridge::ingress::INGRESS_QUEUE_CAPACITY;
     use async_nats::HeaderMap;
+
+    #[tokio::test]
+    async fn runtime_try_spawn_rejects_invalid_origin_identity_before_nats_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            SidecarNode::new(crate::node::SidecarConfig {
+                node_id: "invalid\norigin".to_owned(),
+                app_id: "runtime-identity-test".to_owned(),
+                data_dir: dir.path().to_path_buf(),
+                disable_mdns: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let result = BridgeRuntime::try_spawn(
+            enabled_config(),
+            "invalid\norigin".to_owned(),
+            Arc::clone(&node),
+        );
+        let Err(error) = result else {
+            panic!("invalid header identity must reject runtime startup");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid effective NATS bridge node identity"
+        );
+    }
 
     fn enabled_config() -> EnabledBridgeConfig {
         let mappings = vec![

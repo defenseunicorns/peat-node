@@ -682,27 +682,16 @@ pub(crate) async fn run_bridge_event_router(
 /// Drain the sole FIFO serially; failures are terminal and later items continue.
 pub(crate) async fn run_egress_worker<P: BridgePublisher>(
     mut rx: mpsc::Receiver<EgressItem>,
-    local_node_id: String,
+    origin_header_value: HeaderValue,
     publisher: P,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
 ) {
-    let origin_header_value = local_node_id.parse::<HeaderValue>().ok();
     while let Some(item) = rx.recv().await {
         let payload_bytes = item.payload.len();
         let route_index = Some(item.route_index);
-        let Some(origin_header_value) = origin_header_value.clone() else {
-            stats.record_failure(EgressFailureKind::PublishFailed);
-            diagnostics.record(EgressAction {
-                kind: EgressActionKind::Lost(EgressFailureKind::PublishFailed),
-                route_index,
-                payload_bytes: Some(payload_bytes),
-                suppressed_count: 0,
-            });
-            continue;
-        };
         let mut headers = HeaderMap::new();
-        headers.insert(BRIDGE_ORIGIN_HEADER, origin_header_value);
+        headers.insert(BRIDGE_ORIGIN_HEADER, origin_header_value.clone());
         match publisher.publish(item.subject, headers, item.payload).await {
             Ok(()) => {
                 stats.inner.published.fetch_add(1, Ordering::Relaxed);
@@ -1141,7 +1130,7 @@ mod tests {
         ]);
         let worker = tokio::spawn(run_egress_worker(
             rx,
-            "local-node".to_owned(),
+            "local-node".parse().unwrap(),
             publisher.clone(),
             stats.clone(),
             router.diagnostics(),
@@ -1207,7 +1196,7 @@ mod tests {
         drop(tx);
         run_egress_worker(
             rx,
-            "local-node".to_owned(),
+            "local-node".parse().unwrap(),
             FakePublisher::with_results([
                 Err(EgressFailureKind::Unavailable),
                 Err(EgressFailureKind::PublishFailed),
@@ -1234,34 +1223,6 @@ mod tests {
                 ),
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn invalid_origin_header_value_fails_safely_without_panicking_or_publishing() {
-        let stats = EgressStats::default();
-        let (router, rx) = EgressRouter::new(&mappings(), "local\nnode", stats.clone());
-        let publisher = FakePublisher::default();
-        let worker = tokio::spawn(run_egress_worker(
-            rx,
-            "local\nnode".to_owned(),
-            publisher.clone(),
-            stats.clone(),
-            router.diagnostics(),
-        ));
-        for sequence in 0..2 {
-            let valid = envelope("Vision.Summary", "remote-node", "true");
-            router
-                .admit(event_with_id(
-                    "Frame_Store-1",
-                    &format!("invalid-header-{sequence}"),
-                    &valid,
-                ))
-                .expect("queue admission");
-        }
-        drop(router);
-        worker.await.expect("worker continues and closes");
-        assert!(publisher.calls().is_empty());
-        assert_eq!(stats.snapshot().publish_failed, 2);
     }
 
     #[test]

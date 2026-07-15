@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
-use async_nats::{ServerAddr, Subject};
+use async_nats::{HeaderValue, ServerAddr, Subject};
 use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
 
 const DEFAULT_NATS_PORT: u16 = 4222;
+pub(crate) const MAX_BRIDGE_IDENTITY_BYTES: usize = 1_024;
 
 /// Validated bridge configuration.
 pub enum BridgeConfig {
@@ -57,6 +58,28 @@ impl BridgeConfig {
             mappings,
         }))
     }
+
+    /// Validate the effective node identity only when bridge routes are enabled.
+    pub fn validate_node_identity(&self, node_id: &str) -> Result<(), BridgeConfigErrors> {
+        if matches!(self, Self::Disabled) {
+            return Ok(());
+        }
+        validate_bridge_node_identity(node_id).map_err(|kind| BridgeConfigErrors {
+            issues: vec![BridgeConfigIssue::new(kind)],
+        })?;
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_bridge_node_identity(
+    node_id: &str,
+) -> Result<HeaderValue, BridgeConfigIssueKind> {
+    if node_id.is_empty() || node_id.len() > MAX_BRIDGE_IDENTITY_BYTES {
+        return Err(BridgeConfigIssueKind::InvalidNodeIdentity);
+    }
+    node_id
+        .parse::<HeaderValue>()
+        .map_err(|_| BridgeConfigIssueKind::InvalidNodeIdentity)
 }
 
 impl fmt::Debug for BridgeConfig {
@@ -249,7 +272,9 @@ pub enum BridgeConfigIssueKind {
     SubjectContainsWildcard,
     ReservedSubject,
     InvalidCollection,
+    CollectionTooLong,
     ReservedCollection,
+    InvalidNodeIdentity,
     DuplicateSubject { original_index: usize },
     DuplicateCollection { original_index: usize },
 }
@@ -273,7 +298,11 @@ impl BridgeConfigIssueKind {
             Self::SubjectContainsWildcard => "mapping subject must be literal",
             Self::ReservedSubject => "mapping subject uses a reserved prefix",
             Self::InvalidCollection => "mapping collection has invalid characters",
+            Self::CollectionTooLong => "mapping collection exceeds the retained identity limit",
             Self::ReservedCollection => "mapping collection is reserved for internal use",
+            Self::InvalidNodeIdentity => {
+                "effective node ID is empty, too long, or invalid as a NATS header value"
+            }
             Self::DuplicateSubject { .. } => "mapping subject duplicates an earlier mapping",
             Self::DuplicateCollection { .. } => "mapping collection duplicates an earlier mapping",
         }
@@ -387,6 +416,12 @@ fn parse_mappings(
             issues.push(BridgeConfigIssue::mapping(
                 index,
                 BridgeConfigIssueKind::CollectionContainsWhitespace,
+            ));
+        } else if collection.len() > MAX_BRIDGE_IDENTITY_BYTES {
+            collection_valid = false;
+            issues.push(BridgeConfigIssue::mapping(
+                index,
+                BridgeConfigIssueKind::CollectionTooLong,
             ));
         } else if !valid_collection(collection) {
             collection_valid = false;
@@ -626,6 +661,54 @@ mod tests {
                 BridgeConfigIssueKind::InvalidCollection
             );
         }
+    }
+
+    #[test]
+    fn rejects_collection_beyond_retained_identity_limit_during_aggregate_validation() {
+        let over = "a".repeat(MAX_BRIDGE_IDENTITY_BYTES + 1);
+        let error = BridgeConfig::from_raw(
+            Some("nats://broker.example"),
+            &[format!("vision.summary={over}")],
+        )
+        .expect_err("over-limit collection must fail startup validation");
+        assert_eq!(
+            error.issues(),
+            &[BridgeConfigIssue::mapping(
+                1,
+                BridgeConfigIssueKind::CollectionTooLong
+            )]
+        );
+        assert!(!format!("{error:?} {error}").contains(&over));
+    }
+
+    #[test]
+    fn enabled_bridge_rejects_impossible_origin_header_node_id_but_disabled_does_not() {
+        let enabled = BridgeConfig::from_raw(Some("nats://broker.example"), &mapping()).unwrap();
+        for invalid in [
+            "".to_owned(),
+            "line\nbreak".to_owned(),
+            "x".repeat(MAX_BRIDGE_IDENTITY_BYTES + 1),
+        ] {
+            let error = enabled
+                .validate_node_identity(&invalid)
+                .expect_err("invalid marker identity must fail startup");
+            assert_eq!(
+                error.issues(),
+                &[BridgeConfigIssue::new(
+                    BridgeConfigIssueKind::InvalidNodeIdentity
+                )]
+            );
+            if !invalid.is_empty() {
+                assert!(!format!("{error:?} {error}").contains(&invalid));
+            }
+        }
+        enabled
+            .validate_node_identity(&"x".repeat(MAX_BRIDGE_IDENTITY_BYTES))
+            .expect("exact identity ceiling is valid");
+
+        BridgeConfig::Disabled
+            .validate_node_identity("line\nbreak")
+            .expect("disabled bridge does not use a header identity");
     }
 
     #[test]

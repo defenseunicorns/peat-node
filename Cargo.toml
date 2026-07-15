@@ -130,6 +130,11 @@ path = "src/main.rs"
 # rc.46 (peat-mesh#276): iroh 1.0 stable — iroh 1.0.2, iroh-blobs 0.103,
 #   iroh-mdns-address-lookup 0.4. Zero API breakage.
 peat-mesh = { version = "=0.9.0-rc.46", features = ["automerge-backend", "kubernetes"] }
+# Directly match peat-mesh's locked Automerge API so peat-node can perform a
+# non-recursive structural preflight before peat-mesh's recursive JSON helper.
+# This adds no package or version to Cargo.lock; it makes the existing pin an
+# explicit safety-boundary dependency.
+automerge = "=0.9.0"
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,

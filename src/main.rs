@@ -401,14 +401,14 @@ fn start_bridge_runtime_with<N, T>(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<N>,
-    spawn: impl FnOnce(EnabledBridgeConfig, String, Arc<N>) -> T,
-) -> Option<T> {
+    spawn: impl FnOnce(EnabledBridgeConfig, String, Arc<N>) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<T>> {
     match bridge_config {
         BridgeConfig::Disabled => {
             info!("NATS bridge disabled — no --nats-mapping configured");
-            None
+            Ok(None)
         }
-        BridgeConfig::Enabled(config) => Some(spawn(config, node_id, node)),
+        BridgeConfig::Enabled(config) => spawn(config, node_id, node).map(Some),
     }
 }
 
@@ -416,8 +416,8 @@ fn start_bridge_runtime(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<SidecarNode>,
-) -> Option<BridgeRuntimeHandle> {
-    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::spawn)
+) -> anyhow::Result<Option<BridgeRuntimeHandle>> {
+    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::try_spawn)
 }
 
 #[tokio::main]
@@ -490,6 +490,7 @@ async fn main() -> anyhow::Result<()> {
         .node_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    bridge_config.validate_node_identity(&node_id)?;
 
     info!(
         node_id = %node_id,
@@ -587,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
     // The disabled branch constructs no NATS state. The enabled constructor
     // spawns one supervisor and returns before its first broker dial, keeping
     // Peat/RPC startup independent of local broker availability.
-    let _bridge_runtime = start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node));
+    let _bridge_runtime = start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node))?;
 
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
@@ -896,8 +897,13 @@ mod tests {
         let mesh = production
             .find("SidecarNode::new(config)")
             .expect("mesh construction should exist");
+        let node_identity_validation = production
+            .find("bridge_config.validate_node_identity(&node_id)")
+            .expect("effective bridge node identity must be startup-validated");
         assert!(validation < data_dir);
         assert!(validation < mesh);
+        assert!(node_identity_validation < data_dir);
+        assert!(node_identity_validation < mesh);
     }
 
     #[test]
@@ -911,8 +917,10 @@ mod tests {
             Arc::clone(&node),
             |_, _, _| {
                 calls.set(calls.get() + 1);
+                Ok(())
             },
-        );
+        )
+        .unwrap();
         assert!(handle.is_none());
         assert_eq!(calls.get(), 0);
 
@@ -951,9 +959,10 @@ mod tests {
                 assert_eq!(actual_config.mappings()[0].collection(), "frames");
                 assert_eq!(actual_node_id, expected_node_id);
                 assert!(Arc::ptr_eq(&actual_node, &node));
-                "spawned"
+                Ok("spawned")
             },
-        );
+        )
+        .unwrap();
         assert_eq!(handle, Some("spawned"));
         assert_eq!(calls.get(), 1);
     }
