@@ -8,7 +8,7 @@
 //! broadcast channel that `service.rs::subscribe` consumes, the
 //! `connect_peer` retry loop, and the `start_sync`/`stop_sync` flag.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
 use crate::nats_bridge::config::MAX_BRIDGE_IDENTITY_BYTES;
+use crate::nats_bridge::ledger::{
+    document_digest, BridgeLedger, DeliveryLedger, LedgerError, LedgerOpenError,
+    LocalExclusionLedger,
+};
 use automerge::{ObjId, ObjType, ReadDoc, ScalarValueRef, ValueRef, ROOT};
 use base64::Engine as _;
 use peat_mesh::discovery::{
@@ -31,7 +35,7 @@ use peat_protocol::storage::file_distribution::{
     DistributionDocument, IrohFileDistribution, NodeTransferStatus,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::{debug, info, warn};
 
 use crate::attachments::config::AttachmentConfig;
@@ -140,6 +144,11 @@ pub struct SidecarNode {
     #[allow(dead_code)]
     bridge_change_tx: broadcast::Sender<BridgeChangeEvent>,
     local_revisions: Arc<Mutex<LocalRevisionGuard>>,
+    /// Async stripes order local write-ahead exclusion against remote capture
+    /// without ever retaining a synchronous store guard across an await.
+    bridge_mutation_guards: Arc<[AsyncMutex<()>]>,
+    bridge_ledger: RwLock<Option<InstalledBridgeLedger>>,
+    bridge_ledger_data_dir: PathBuf,
     #[cfg(test)]
     node_change_diagnostics: NodeChangeDiagnostics,
     cipher: Option<StoreCipher>,
@@ -182,6 +191,27 @@ pub struct SidecarNode {
     /// lifetime. `None` when `--enable-kubernetes-discovery` is false or
     /// discovery failed to start.
     _k8s_discovery: Option<KubernetesDiscovery>,
+}
+
+const BRIDGE_MUTATION_GUARD_STRIPES: usize = 256;
+
+fn mutation_guard_stripe(collection: &str, doc_id: &str) -> usize {
+    let digest = document_digest(collection, doc_id);
+    let prefix = u64::from_be_bytes(digest.0[..8].try_into().expect("digest prefix is fixed"));
+    prefix as usize % BRIDGE_MUTATION_GUARD_STRIPES
+}
+
+struct InstalledBridgeLedger {
+    collections: BTreeSet<String>,
+    exclusion: LocalExclusionLedger,
+    delivery: Option<DeliveryLedger>,
+}
+
+/// Independent ledger-health facts returned by the install-once boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BridgeLedgerHealth {
+    pub(crate) exclusion_healthy: bool,
+    pub(crate) delivery_healthy: bool,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -685,6 +715,7 @@ pub enum CreateBridgeDocumentError {
     Conversion,
     StoreRead,
     StoreWrite,
+    Ledger,
 }
 
 impl std::fmt::Display for CreateBridgeDocumentError {
@@ -696,6 +727,7 @@ impl std::fmt::Display for CreateBridgeDocumentError {
             Self::Conversion => "bridge document conversion failed",
             Self::StoreRead => "bridge document store read failed",
             Self::StoreWrite => "bridge document store write failed",
+            Self::Ledger => "bridge document local-exclusion persistence failed",
         })
     }
 }
@@ -715,6 +747,7 @@ enum DocumentWriteError {
     Conversion(anyhow::Error),
     StoreRead(anyhow::Error),
     StoreWrite(anyhow::Error),
+    Ledger,
 }
 
 impl DocumentWriteError {
@@ -726,6 +759,7 @@ impl DocumentWriteError {
             Self::Conversion(_) => CreateBridgeDocumentError::Conversion,
             Self::StoreRead(_) => CreateBridgeDocumentError::StoreRead,
             Self::StoreWrite(_) => CreateBridgeDocumentError::StoreWrite,
+            Self::Ledger => CreateBridgeDocumentError::Ledger,
         }
     }
 
@@ -737,6 +771,7 @@ impl DocumentWriteError {
             | Self::Conversion(error)
             | Self::StoreRead(error)
             | Self::StoreWrite(error) => error,
+            Self::Ledger => anyhow::anyhow!("bridge local-exclusion persistence failed"),
         }
     }
 }
@@ -849,6 +884,10 @@ impl SidecarNode {
         let (change_tx, _) = broadcast::channel(256);
         let (bridge_change_tx, _) = broadcast::channel(BRIDGE_CHANGE_CAPACITY);
         let local_revisions = Arc::new(Mutex::new(LocalRevisionGuard::new()));
+        let bridge_mutation_guards: Arc<[AsyncMutex<()>]> = (0..BRIDGE_MUTATION_GUARD_STRIPES)
+            .map(|_| AsyncMutex::new(()))
+            .collect::<Vec<_>>()
+            .into();
         let node_change_diagnostics = NodeChangeDiagnostics::default();
 
         // Forward AutomergeStore observer events into our ChangeEvent shape
@@ -895,6 +934,7 @@ impl SidecarNode {
         let bridge_tx = bridge_change_tx.clone();
         let bridge_cipher = cipher.clone();
         let bridge_local_revisions = Arc::clone(&local_revisions);
+        let bridge_forward_guards = Arc::clone(&bridge_mutation_guards);
         let bridge_diagnostics = node_change_diagnostics.clone();
         tokio::spawn(async move {
             Self::forward_bridge_changes(
@@ -903,6 +943,7 @@ impl SidecarNode {
                 bridge_store,
                 bridge_cipher,
                 bridge_local_revisions,
+                bridge_forward_guards,
                 bridge_diagnostics,
             )
             .await;
@@ -1301,6 +1342,9 @@ impl SidecarNode {
             change_tx,
             bridge_change_tx,
             local_revisions,
+            bridge_mutation_guards,
+            bridge_ledger: RwLock::new(None),
+            bridge_ledger_data_dir: config.data_dir.clone(),
             #[cfg(test)]
             node_change_diagnostics,
             cipher,
@@ -1735,6 +1779,7 @@ impl SidecarNode {
         store: Arc<AutomergeStore>,
         cipher: Option<StoreCipher>,
         local_revisions: Arc<Mutex<LocalRevisionGuard>>,
+        mutation_guards: Arc<[AsyncMutex<()>]>,
         diagnostics: NodeChangeDiagnostics,
     ) {
         loop {
@@ -1766,6 +1811,9 @@ impl SidecarNode {
                     }
                     let collection = collection.to_owned();
                     let doc_id = doc_id.to_owned();
+
+                    let stripe = mutation_guard_stripe(&collection, &doc_id);
+                    let _mutation_guard = mutation_guards[stripe].lock().await;
 
                     let doc = {
                         let _key_guard = store.lock_doc(&key);
@@ -2202,6 +2250,7 @@ impl SidecarNode {
         json_data: &str,
     ) -> anyhow::Result<()> {
         self.write_document(collection, doc_id, json_data, DocumentWriteMode::Upsert)
+            .await
             .map_err(DocumentWriteError::into_anyhow)?;
 
         // `store.put` fires the AutomergeStore observer, which the
@@ -2232,10 +2281,11 @@ impl SidecarNode {
             envelope_json,
             DocumentWriteMode::CreateOnly,
         )
+        .await
         .map_err(|error| error.classification())
     }
 
-    fn write_document(
+    async fn write_document(
         &self,
         collection: &str,
         doc_id: &str,
@@ -2246,6 +2296,11 @@ impl SidecarNode {
             serde_json::from_str(json_data).map_err(DocumentWriteError::InvalidInput)?;
 
         let key = format!("{collection}:{doc_id}");
+        let stripe = mutation_guard_stripe(collection, doc_id);
+        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
+        self.record_local_exclusion(collection, doc_id)
+            .await
+            .map_err(|_| DocumentWriteError::Ledger)?;
         let store = self.backend.store();
         let _key_guard = store.lock_doc(&key);
         let existing = store.get(&key).map_err(DocumentWriteError::StoreRead)?;
@@ -2319,6 +2374,11 @@ impl SidecarNode {
 
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
+        let stripe = mutation_guard_stripe(collection, doc_id);
+        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
+        self.record_local_exclusion(collection, doc_id)
+            .await
+            .map_err(|_| anyhow::anyhow!("bridge local-exclusion persistence failed"))?;
         let store = self.backend.store();
         let _key_guard = store.lock_doc(&key);
         store.delete(&key)?;
@@ -2351,6 +2411,78 @@ impl SidecarNode {
                 None => Ok(Some(v)), // no cipher configured, return as-is
             },
             other => Ok(other),
+        }
+    }
+
+    /// Install the validated mapped-collection set and its journals exactly
+    /// once. An identical second call is idempotent; conflicting mappings are
+    /// rejected before any bridge subscription can be started.
+    pub(crate) fn install_bridge_ledger(
+        &self,
+        collections: impl IntoIterator<Item = String>,
+    ) -> Result<BridgeLedgerHealth, LedgerError> {
+        let collections: BTreeSet<_> = collections.into_iter().collect();
+        let mut installed = self
+            .bridge_ledger
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(installed) = installed.as_ref() {
+            if installed.collections != collections {
+                return Err(LedgerError::Corrupt);
+            }
+            return Ok(BridgeLedgerHealth {
+                exclusion_healthy: installed.exclusion.is_healthy(),
+                delivery_healthy: installed
+                    .delivery
+                    .as_ref()
+                    .is_some_and(DeliveryLedger::is_healthy),
+            });
+        }
+
+        let (exclusion, delivery) = match BridgeLedger::open(&self.bridge_ledger_data_dir) {
+            Ok(ledger) => (ledger.exclusion(), Some(ledger.delivery())),
+            Err(LedgerOpenError::Delivery {
+                error: _,
+                exclusion,
+            }) => (exclusion, None),
+            Err(LedgerOpenError::Exclusion(error)) => return Err(error),
+        };
+        let health = BridgeLedgerHealth {
+            exclusion_healthy: exclusion.is_healthy(),
+            delivery_healthy: delivery.as_ref().is_some_and(DeliveryLedger::is_healthy),
+        };
+        *installed = Some(InstalledBridgeLedger {
+            collections,
+            exclusion,
+            delivery,
+        });
+        Ok(health)
+    }
+
+    async fn record_local_exclusion(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<(), LedgerError> {
+        let exclusion = {
+            let installed = self
+                .bridge_ledger
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            installed.as_ref().and_then(|installed| {
+                installed
+                    .collections
+                    .contains(collection)
+                    .then(|| installed.exclusion.clone())
+            })
+        };
+        match exclusion {
+            Some(exclusion) => {
+                exclusion
+                    .record_local_excluded(document_digest(collection, doc_id))
+                    .await
+            }
+            None => Ok(()),
         }
     }
 
@@ -2575,6 +2707,142 @@ mod tests {
                 .unwrap();
         }
         expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_mapped_put_create_and_delete_are_write_ahead_excluded() {
+        let (_dir, node) = test_node(false).await;
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .expect("healthy journals install");
+        assert_eq!(
+            health,
+            BridgeLedgerHealth {
+                exclusion_healthy: true,
+                delivery_healthy: true,
+            }
+        );
+
+        node.put_document("frames", "rpc-put", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        node.create_bridge_document("frames", "nats-create", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        put_remote(
+            &node,
+            "frames:delete-target",
+            r#"{"source_node_id":"foreign"}"#,
+            "peer-a",
+        );
+        node.delete_document("frames", "delete-target")
+            .await
+            .unwrap();
+        node.put_document("unmapped", "plain", r#"{"local":true}"#)
+            .await
+            .unwrap();
+
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .clone();
+        for doc_id in ["rpc-put", "nats-create", "delete-target"] {
+            assert!(exclusion
+                .contains(document_digest("frames", doc_id))
+                .await
+                .unwrap());
+        }
+        assert!(!exclusion
+            .contains(document_digest("unmapped", "plain"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_exclusion_failure_rejects_before_store_mutation() {
+        let (_dir, node) = test_node(false).await;
+        node.install_bridge_ledger(["frames".to_owned()]).unwrap();
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .clone();
+        exclusion.stop_for_test();
+
+        let error = node
+            .put_document("frames", "rejected", r#"{"local":true}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bridge local-exclusion persistence failed"
+        );
+        assert!(node
+            .get_document("frames", "rejected")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_delivery_corruption_keeps_excluded_local_ingress_usable() {
+        let (_dir, node) = test_node(false).await;
+        let ledger = BridgeLedger::open(&node.bridge_ledger_data_dir).unwrap();
+        ledger.join().unwrap();
+        let delivery_path = node
+            .bridge_ledger_data_dir
+            .join("nats-bridge-ledger-v1")
+            .join("remote-delivery-v1");
+        let mut bytes = std::fs::read(&delivery_path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&delivery_path, bytes).unwrap();
+
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .expect("delivery corruption preserves exclusion installation");
+        assert!(health.exclusion_healthy);
+        assert!(!health.delivery_healthy);
+        node.create_bridge_document("frames", "after-corruption", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        assert!(node
+            .get_document("frames", "after-corruption")
+            .await
+            .unwrap()
+            .is_some());
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .clone();
+        assert!(exclusion
+            .contains(document_digest("frames", "after-corruption"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_install_is_idempotent_but_rejects_conflicting_routes() {
+        let (_dir, node) = test_node(false).await;
+        let first = node.install_bridge_ledger(["frames".to_owned()]).unwrap();
+        assert_eq!(
+            node.install_bridge_ledger(["frames".to_owned()]).unwrap(),
+            first
+        );
+        assert_eq!(
+            node.install_bridge_ledger(["other".to_owned()]),
+            Err(LedgerError::Corrupt)
+        );
     }
 
     #[tokio::test]

@@ -140,6 +140,7 @@ pub enum IngressErrorKind {
     Conversion,
     StoreRead,
     StoreWrite,
+    LocalExclusion,
 }
 
 impl IngressErrorKind {
@@ -156,6 +157,7 @@ impl IngressErrorKind {
             Self::Conversion => "conversion",
             Self::StoreRead => "store_read",
             Self::StoreWrite => "store_write",
+            Self::LocalExclusion => "local_exclusion",
         }
     }
 }
@@ -638,6 +640,7 @@ impl From<CreateBridgeDocumentError> for IngressErrorKind {
             CreateBridgeDocumentError::Conversion => Self::Conversion,
             CreateBridgeDocumentError::StoreRead => Self::StoreRead,
             CreateBridgeDocumentError::StoreWrite => Self::StoreWrite,
+            CreateBridgeDocumentError::Ledger => Self::LocalExclusion,
         }
     }
 }

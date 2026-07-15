@@ -364,6 +364,14 @@ impl BridgeRuntime {
                 "NATS bridge ignored divergent caller node identity"
             );
         }
+        let ledger_health = node
+            .install_bridge_ledger(
+                config
+                    .mappings()
+                    .iter()
+                    .map(|mapping| mapping.collection().to_owned()),
+            )
+            .map_err(|_| anyhow::anyhow!("NATS bridge local-exclusion ledger unavailable"))?;
         let stats = IngressStats::default();
         let diagnostics = IngressDiagnostics::new(
             config
@@ -400,7 +408,7 @@ impl BridgeRuntime {
             )
             .await;
         });
-        Ok(Self::spawn_supervisor(
+        let handle = Self::spawn_supervisor(
             config,
             stats,
             Some((ingress_tx, diagnostics, local_node_id)),
@@ -411,7 +419,14 @@ impl BridgeRuntime {
                 diagnostics: egress_diagnostics,
             }),
             vec![ingress_task, router_task],
-        ))
+        );
+        handle
+            .readiness
+            .set_exclusion_healthy(ledger_health.exclusion_healthy);
+        handle
+            .readiness
+            .set_delivery_healthy(ledger_health.delivery_healthy);
+        Ok(handle)
     }
 
     fn spawn_supervisor(

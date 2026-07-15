@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(not(unix), test))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -95,6 +97,10 @@ impl JournalKind {
 
 /// Payload-safe journal failure classification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Plan 04-02 consumes the delivery transitions and Plan 04-03 consumes the
+// explicit join classification. Keeping the complete actor contract here is
+// intentional even though 04-01 wires only local exclusion.
+#[allow(dead_code)]
 pub(crate) enum LedgerError {
     Unavailable,
     Corrupt,
@@ -121,11 +127,13 @@ impl std::error::Error for LedgerError {}
 
 /// Result of atomically checking and durably reserving a delivery key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum ReserveResult {
     Reserved,
     Suppressed,
 }
 
+#[allow(dead_code)]
 enum Command {
     Record {
         digest: LedgerDigest,
@@ -137,8 +145,14 @@ enum Command {
         response: oneshot::Sender<Result<Option<RecordState>, LedgerError>>,
     },
     Stop,
+    #[cfg(test)]
+    CooperativeBlock {
+        entered: std_mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    },
 }
 
+#[allow(dead_code)]
 struct Worker {
     sender: std_mpsc::SyncSender<Command>,
     healthy: Arc<AtomicBool>,
@@ -146,6 +160,7 @@ struct Worker {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
+#[allow(dead_code)]
 impl Worker {
     fn spawn(data_dir: &Path, kind: JournalKind) -> Result<Arc<Self>, LedgerError> {
         let (sender, receiver) = std_mpsc::sync_channel(COMMAND_CAPACITY);
@@ -194,6 +209,22 @@ impl Worker {
                                     let _ = response.send(result);
                                 }
                                 Command::Stop => break,
+                                #[cfg(test)]
+                                Command::CooperativeBlock { entered, release } => {
+                                    let _ = entered.send(());
+                                    let (lock, wake) = &*release;
+                                    let mut released =
+                                        lock.lock().unwrap_or_else(|error| error.into_inner());
+                                    while !*released && !worker_stopped.load(Ordering::Acquire) {
+                                        released = wake
+                                            .wait_timeout(
+                                                released,
+                                                std::time::Duration::from_millis(10),
+                                            )
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .0;
+                                    }
+                                }
                             }
                         }
                     }
@@ -287,11 +318,33 @@ impl LocalExclusionLedger {
     }
 
     #[cfg(test)]
-    async fn contains(&self, digest: LedgerDigest) -> Result<bool, LedgerError> {
+    pub(crate) async fn contains(&self, digest: LedgerDigest) -> Result<bool, LedgerError> {
         Ok(matches!(
             self.worker.lookup(digest).await?,
             Some(RecordState::LocalExcluded)
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.worker.request_stop();
+    }
+
+    #[cfg(test)]
+    fn cooperative_block_for_test(
+        &self,
+        entered: std_mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        self.worker
+            .sender
+            .try_send(Command::CooperativeBlock { entered, release })
+            .unwrap_or_else(|_| panic!("test command queue should accept cooperative block"));
+    }
+
+    #[cfg(test)]
+    fn join_for_test(&self) -> Result<(), LedgerError> {
+        self.worker.join()
     }
 }
 
@@ -301,6 +354,7 @@ pub(crate) struct DeliveryLedger {
     worker: Arc<Worker>,
 }
 
+#[allow(dead_code)]
 impl DeliveryLedger {
     pub(crate) fn is_healthy(&self) -> bool {
         self.worker.is_healthy()
@@ -345,8 +399,8 @@ pub(crate) struct BridgeLedger {
 
 impl BridgeLedger {
     pub(crate) fn open(data_dir: &Path) -> Result<Self, LedgerOpenError> {
-        let exclusion = Worker::spawn(data_dir, JournalKind::Exclusion)
-            .map_err(|error| LedgerOpenError::Exclusion(error))?;
+        let exclusion =
+            Worker::spawn(data_dir, JournalKind::Exclusion).map_err(LedgerOpenError::Exclusion)?;
         let delivery = match Worker::spawn(data_dir, JournalKind::Delivery) {
             Ok(worker) => worker,
             Err(error) => {
@@ -372,11 +426,13 @@ impl BridgeLedger {
         self.delivery.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn request_stop(&self) {
         self.exclusion.worker.request_stop();
         self.delivery.worker.request_stop();
     }
 
+    #[allow(dead_code)]
     pub(crate) fn join(&self) -> Result<(), LedgerError> {
         self.exclusion.worker.join()?;
         self.delivery.worker.join()
@@ -882,6 +938,99 @@ mod tests {
             .await
             .unwrap();
         exclusion.worker.join().unwrap();
+    }
+
+    #[test]
+    fn impossible_complete_transition_and_file_cap_preserve_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = BridgeLedger::open(dir.path()).unwrap();
+        ledger.join().unwrap();
+        let delivery = ledger_path(&dir, DELIVERY_FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&delivery)
+            .unwrap();
+        file.write_all(&encode_record(
+            1,
+            RecordState::Completed,
+            document_digest("frames", "impossible"),
+        ))
+        .unwrap();
+        file.sync_all().unwrap();
+        let before = std::fs::read(&delivery).unwrap();
+        assert!(matches!(
+            BridgeLedger::open(dir.path()),
+            Err(LedgerOpenError::Delivery {
+                error: LedgerError::Corrupt,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&delivery).unwrap(), before);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = BridgeLedger::open(dir.path()).unwrap();
+        ledger.join().unwrap();
+        let exclusion = ledger_path(&dir, EXCLUSION_FILE);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&exclusion)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let oversized_len = std::fs::metadata(&exclusion).unwrap().len();
+        assert!(matches!(
+            BridgeLedger::open(dir.path()),
+            Err(LedgerOpenError::Exclusion(LedgerError::Capacity))
+        ));
+        assert_eq!(std::fs::metadata(&exclusion).unwrap().len(), oversized_len);
+    }
+
+    #[test]
+    fn unique_cap_is_non_evicting_and_compaction_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+        for index in 0..MAX_UNIQUE_ENTRIES {
+            let mut digest = [0_u8; 32];
+            digest[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            journal
+                .index
+                .insert(LedgerDigest(digest), RecordState::Reserved);
+        }
+        assert_eq!(
+            journal.record(document_digest("frames", "overflow"), RecordState::Reserved),
+            Err(LedgerError::Capacity)
+        );
+        assert_eq!(journal.index.len(), MAX_UNIQUE_ENTRIES);
+
+        journal.index.clear();
+        let first = document_digest("frames", "one");
+        journal.index.insert(first, RecordState::Reserved);
+        journal.records = MAX_RECORDS;
+        journal.sequence = MAX_RECORDS as u64;
+        let second = document_digest("frames", "two");
+        assert!(journal.record(second, RecordState::Reserved).unwrap());
+        drop(journal);
+        let reopened = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+        assert_eq!(reopened.index.get(&first), Some(&RecordState::Reserved));
+        assert_eq!(reopened.index.get(&second), Some(&RecordState::Reserved));
+        assert_eq!(reopened.records, 2);
+        reopened.file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn cooperative_block_observes_stop_and_worker_joins() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = BridgeLedger::open(dir.path()).unwrap();
+        let exclusion = ledger.exclusion();
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        exclusion.cooperative_block_for_test(entered_tx, Arc::clone(&release));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker reaches injected cooperative block");
+        exclusion.stop_for_test();
+        exclusion.join_for_test().unwrap();
+        ledger.delivery.worker.join().unwrap();
     }
 
     #[cfg(unix)]

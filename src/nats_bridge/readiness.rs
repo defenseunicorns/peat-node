@@ -14,6 +14,12 @@ use tokio::sync::watch;
 pub struct BridgeStatus {
     /// Whether this status belongs to a configured bridge runtime.
     pub enabled: bool,
+    /// Whether the runtime still accepts new bridge work.
+    pub accepting: bool,
+    /// Whether remote-delivery suppression state is usable.
+    pub delivery_healthy: bool,
+    /// Whether local-authorship exclusion state is usable.
+    pub exclusion_healthy: bool,
     /// Whether a Core NATS connection is currently active.
     pub connected: bool,
     /// Number of configured literal subjects that must be established.
@@ -26,7 +32,12 @@ pub struct BridgeStatus {
 impl BridgeStatus {
     /// True only when connected and every configured literal subject is established.
     pub fn is_ready(&self) -> bool {
-        self.enabled && self.connected && self.established_subjects == self.configured_subjects
+        self.enabled
+            && self.accepting
+            && self.delivery_healthy
+            && self.exclusion_healthy
+            && self.connected
+            && self.established_subjects == self.configured_subjects
     }
 }
 
@@ -63,6 +74,9 @@ impl BridgeReadiness {
         let configured_subjects: BTreeSet<_> = subjects.into_iter().collect();
         let status = BridgeStatus {
             enabled: true,
+            accepting: true,
+            delivery_healthy: true,
+            exclusion_healthy: true,
             connected: false,
             expected_subscriptions: configured_subjects.len(),
             established_subjects: BTreeSet::new(),
@@ -108,6 +122,22 @@ impl BridgeReadiness {
         })
     }
 
+    /// Change only delivery-journal health, preserving connection,
+    /// subscriptions, and the independently owned exclusion writer.
+    pub fn set_delivery_healthy(&self, healthy: bool) -> ReadinessTransition {
+        self.update(|status| status.delivery_healthy = healthy)
+    }
+
+    /// Change only local-exclusion health.
+    pub fn set_exclusion_healthy(&self, healthy: bool) -> ReadinessTransition {
+        self.update(|status| status.exclusion_healthy = healthy)
+    }
+
+    /// Stop new admission immediately without falsifying any other fact.
+    pub fn begin_shutdown(&self) -> ReadinessTransition {
+        self.update(|status| status.accepting = false)
+    }
+
     fn update(&self, mutate: impl FnOnce(&mut BridgeStatus)) -> ReadinessTransition {
         let mut transition = None;
         self.tx.send_modify(|status| {
@@ -140,6 +170,9 @@ mod tests {
     fn enabled_starts_disconnected_and_not_ready() {
         let status = readiness().snapshot();
         assert!(status.enabled);
+        assert!(status.accepting);
+        assert!(status.delivery_healthy);
+        assert!(status.exclusion_healthy);
         assert!(!status.connected);
         assert_eq!(status.expected_subscriptions, 2);
         assert!(status.established_subjects.is_empty());
@@ -226,5 +259,35 @@ mod tests {
         assert!(readiness
             .mark_all_subscriptions_established()
             .became_ready());
+    }
+
+    #[test]
+    fn independent_health_and_admission_inputs_clear_only_readiness() {
+        let readiness = readiness();
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        assert!(readiness.snapshot().is_ready());
+
+        readiness.set_delivery_healthy(false);
+        let delivery_bad = readiness.snapshot();
+        assert!(!delivery_bad.is_ready());
+        assert!(delivery_bad.connected);
+        assert_eq!(delivery_bad.established_subjects.len(), 2);
+        assert!(delivery_bad.exclusion_healthy);
+
+        readiness.set_delivery_healthy(true);
+        assert!(readiness.snapshot().is_ready());
+        readiness.set_exclusion_healthy(false);
+        assert!(!readiness.snapshot().is_ready());
+        readiness.set_exclusion_healthy(true);
+        assert!(readiness.snapshot().is_ready());
+
+        readiness.begin_shutdown();
+        let shutdown = readiness.snapshot();
+        assert!(!shutdown.is_ready());
+        assert!(!shutdown.accepting);
+        assert!(shutdown.connected);
+        assert!(shutdown.delivery_healthy);
+        assert!(shutdown.exclusion_healthy);
     }
 }
