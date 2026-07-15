@@ -88,13 +88,25 @@ impl BridgeReadiness {
         self.update(|status| status.connected = true)
     }
 
-    /// Mark one configured subject established. Duplicate and unknown subjects are inert.
-    pub fn mark_subscription_established(&self, subject: &Subject) -> ReadinessTransition {
+    /// Atomically mark the complete configured subscription batch established.
+    pub fn mark_all_subscriptions_established(&self) -> ReadinessTransition {
+        self.update(|status| {
+            status.established_subjects = status.configured_subjects.clone();
+        })
+    }
+
+    /// Legacy per-subject transition retained until the runtime batch seam is replaced.
+    pub(crate) fn mark_subscription_established(&self, subject: &Subject) -> ReadinessTransition {
         self.update(|status| {
             if status.configured_subjects.contains(subject) {
                 status.established_subjects.insert(subject.clone());
             }
         })
+    }
+
+    /// Invalidate the complete subscription generation without claiming disconnect.
+    pub fn invalidate_subscription_generation(&self) -> ReadinessTransition {
+        self.update(|status| status.established_subjects.clear())
     }
 
     /// Atomically clear connection and subscription-generation state.
@@ -152,38 +164,26 @@ mod tests {
     }
 
     #[test]
-    fn final_distinct_configured_subject_becomes_ready_once() {
+    fn establish_all_publishes_one_complete_ready_snapshot() {
         let readiness = readiness();
+        let mut snapshots = readiness.subscribe();
         readiness.set_connected();
-        let first = readiness.mark_subscription_established(&subject("vision.summary"));
-        let final_subject = readiness.mark_subscription_established(&subject("node.health"));
-        assert!(!first.became_ready());
-        assert!(final_subject.became_ready());
-        assert!(readiness.snapshot().is_ready());
-        assert!(!readiness
-            .mark_subscription_established(&subject("node.health"))
-            .became_ready());
-    }
+        let connected = snapshots.borrow_and_update().clone();
+        assert!(connected.connected);
+        assert_eq!(connected.established_subjects.len(), 0);
+        assert!(!connected.is_ready());
 
-    #[test]
-    fn duplicate_establishment_is_idempotent() {
-        let readiness = readiness();
-        readiness.set_connected();
-        let first = readiness.mark_subscription_established(&subject("vision.summary"));
-        let duplicate = readiness.mark_subscription_established(&subject("vision.summary"));
-        assert!(first.changed);
+        let transition = readiness.mark_all_subscriptions_established();
+        assert!(transition.became_ready());
+        assert!(snapshots.has_changed().expect("sender remains alive"));
+        let established = snapshots.borrow_and_update().clone();
+        assert_eq!(established.established_subjects.len(), 2);
+        assert!(established.is_ready());
+        assert!(!snapshots.has_changed().expect("sender remains alive"));
+
+        let duplicate = readiness.mark_all_subscriptions_established();
         assert!(!duplicate.changed);
-        assert_eq!(readiness.snapshot().established_subjects.len(), 1);
         assert!(!duplicate.became_ready());
-    }
-
-    #[test]
-    fn unknown_subject_cannot_satisfy_readiness() {
-        let readiness = readiness();
-        readiness.set_connected();
-        let transition = readiness.mark_subscription_established(&subject("other.subject"));
-        assert!(!transition.changed);
-        assert!(!readiness.snapshot().is_ready());
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
         let readiness = readiness();
         let mut snapshots = readiness.subscribe();
         readiness.set_connected();
-        readiness.mark_subscription_established(&subject("vision.summary"));
+        readiness.mark_all_subscriptions_established();
         let transition = readiness.mark_disconnected();
         assert!(transition.changed);
 
@@ -202,20 +202,38 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_requires_every_subject_to_be_reestablished() {
+    fn generation_invalidation_preserves_connection_but_clears_readiness() {
         let readiness = readiness();
         readiness.set_connected();
-        readiness.mark_subscription_established(&subject("vision.summary"));
-        readiness.mark_subscription_established(&subject("node.health"));
+        readiness.mark_all_subscriptions_established();
+        assert!(readiness.snapshot().is_ready());
+
+        let transition = readiness.invalidate_subscription_generation();
+        assert!(transition.changed);
+        assert!(transition.status().connected);
+        assert!(transition.status().established_subjects.is_empty());
+        assert!(!transition.status().is_ready());
+    }
+
+    #[test]
+    fn reconnect_and_generation_restore_require_establish_all() {
+        let readiness = readiness();
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
         assert!(readiness.snapshot().is_ready());
 
         readiness.mark_disconnected();
         readiness.set_connected();
         assert!(!readiness.snapshot().is_ready());
-        readiness.mark_subscription_established(&subject("vision.summary"));
+        assert!(readiness
+            .mark_all_subscriptions_established()
+            .became_ready());
+
+        readiness.invalidate_subscription_generation();
+        assert!(readiness.snapshot().connected);
         assert!(!readiness.snapshot().is_ready());
         assert!(readiness
-            .mark_subscription_established(&subject("node.health"))
+            .mark_all_subscriptions_established()
             .became_ready());
     }
 }
