@@ -470,9 +470,27 @@ struct Journal {
     index: HashMap<LedgerDigest, RecordState>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum RecordFailpoint {
+    BeforeAppend,
+    AfterAppendBeforeSync,
+    AfterSyncBeforeIndex,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CompactFailpoint {
+    BeforeTempSync,
+    AfterTempSync,
+    AfterRename,
+    AfterDirectorySync,
+}
+
 impl Journal {
     fn open(data_dir: &Path, kind: JournalKind) -> Result<Self, LedgerError> {
         let dir = AnchoredDir::open(data_dir)?;
+        dir.cleanup_temp(kind.file_name())?;
         let mut file = dir.open_active(kind.file_name())?;
         let len = file.metadata().map_err(|_| LedgerError::Unavailable)?.len();
         if len == 0 {
@@ -492,6 +510,16 @@ impl Journal {
     }
 
     fn record(&mut self, digest: LedgerDigest, state: RecordState) -> Result<bool, LedgerError> {
+        self.record_inner(digest, state, None)
+    }
+
+    fn record_inner(
+        &mut self,
+        digest: LedgerDigest,
+        state: RecordState,
+        #[cfg(test)] failpoint: Option<RecordFailpoint>,
+        #[cfg(not(test))] _failpoint: Option<()>,
+    ) -> Result<bool, LedgerError> {
         if !self.kind.permits(state) {
             return Err(LedgerError::Corrupt);
         }
@@ -508,19 +536,39 @@ impl Journal {
         if self.records >= MAX_RECORDS {
             self.compact()?;
         }
+        #[cfg(test)]
+        if matches!(failpoint, Some(RecordFailpoint::BeforeAppend)) {
+            return Err(LedgerError::Unavailable);
+        }
         self.sequence = self.sequence.checked_add(1).ok_or(LedgerError::Capacity)?;
         let record = encode_record(self.sequence, state, digest);
         self.file
             .seek(SeekFrom::End(0))
             .and_then(|_| self.file.write_all(&record))
-            .and_then(|_| self.file.sync_all())
             .map_err(|_| LedgerError::Unavailable)?;
+        #[cfg(test)]
+        if matches!(failpoint, Some(RecordFailpoint::AfterAppendBeforeSync)) {
+            return Err(LedgerError::Unavailable);
+        }
+        self.file.sync_all().map_err(|_| LedgerError::Unavailable)?;
+        #[cfg(test)]
+        if matches!(failpoint, Some(RecordFailpoint::AfterSyncBeforeIndex)) {
+            return Err(LedgerError::Unavailable);
+        }
         self.index.insert(digest, state);
         self.records += 1;
         Ok(true)
     }
 
     fn compact(&mut self) -> Result<(), LedgerError> {
+        self.compact_inner(None)
+    }
+
+    fn compact_inner(
+        &mut self,
+        #[cfg(test)] failpoint: Option<CompactFailpoint>,
+        #[cfg(not(test))] _failpoint: Option<()>,
+    ) -> Result<(), LedgerError> {
         let mut temp = self.dir.create_temp(self.kind.file_name())?;
         write_header(&mut temp, self.kind)?;
         let mut entries: Vec<_> = self.index.iter().map(|(k, v)| (*k, *v)).collect();
@@ -531,9 +579,26 @@ impl Journal {
             temp.write_all(&encode_record(sequence, state, digest))
                 .map_err(|_| LedgerError::Unavailable)?;
         }
+        #[cfg(test)]
+        if matches!(failpoint, Some(CompactFailpoint::BeforeTempSync)) {
+            return Err(LedgerError::Unavailable);
+        }
         temp.sync_all().map_err(|_| LedgerError::Unavailable)?;
+        #[cfg(test)]
+        if matches!(failpoint, Some(CompactFailpoint::AfterTempSync)) {
+            return Err(LedgerError::Unavailable);
+        }
         drop(temp);
-        self.dir.replace_from_temp(self.kind.file_name())?;
+        self.dir.rename_temp(self.kind.file_name())?;
+        #[cfg(test)]
+        if matches!(failpoint, Some(CompactFailpoint::AfterRename)) {
+            return Err(LedgerError::Unavailable);
+        }
+        self.dir.sync_directory()?;
+        #[cfg(test)]
+        if matches!(failpoint, Some(CompactFailpoint::AfterDirectorySync)) {
+            return Err(LedgerError::Unavailable);
+        }
         self.file = self.dir.open_active(self.kind.file_name())?;
         self.sequence = sequence;
         self.records = self.index.len();
@@ -745,6 +810,39 @@ impl AnchoredDir {
         Ok(file)
     }
 
+    fn cleanup_temp(&self, active: &str) -> Result<(), LedgerError> {
+        use std::ffi::CString;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let name = CString::new(format!(".{active}.compact")).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+                Ok(())
+            } else {
+                Err(LedgerError::Unavailable)
+            };
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        if !file
+            .metadata()
+            .map_err(|_| LedgerError::Unavailable)?
+            .is_file()
+        {
+            return Err(LedgerError::Unavailable);
+        }
+        drop(file);
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+            return Err(LedgerError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn create_temp(&self, active: &str) -> Result<File, LedgerError> {
         use std::ffi::CString;
         use std::os::fd::{AsRawFd, FromRawFd};
@@ -763,7 +861,7 @@ impl AnchoredDir {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    fn replace_from_temp(&self, active: &str) -> Result<(), LedgerError> {
+    fn rename_temp(&self, active: &str) -> Result<(), LedgerError> {
         use std::ffi::CString;
         use std::os::fd::AsRawFd;
         let temp = CString::new(format!(".{active}.compact")).unwrap();
@@ -779,6 +877,10 @@ impl AnchoredDir {
         {
             return Err(LedgerError::Unavailable);
         }
+        Ok(())
+    }
+
+    fn sync_directory(&self) -> Result<(), LedgerError> {
         self.fd.sync_all().map_err(|_| LedgerError::Unavailable)
     }
 }
@@ -824,6 +926,18 @@ impl AnchoredDir {
             .map_err(|_| LedgerError::Unavailable)
     }
 
+    fn cleanup_temp(&self, active: &str) -> Result<(), LedgerError> {
+        let path = self.path.join(format!(".{active}.compact"));
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => {
+                std::fs::remove_file(path).map_err(|_| LedgerError::Unavailable)
+            }
+            Ok(_) => Err(LedgerError::Unavailable),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(LedgerError::Unavailable),
+        }
+    }
+
     fn create_temp(&self, active: &str) -> Result<File, LedgerError> {
         std::fs::OpenOptions::new()
             .read(true)
@@ -833,12 +947,18 @@ impl AnchoredDir {
             .map_err(|_| LedgerError::Unavailable)
     }
 
-    fn replace_from_temp(&self, active: &str) -> Result<(), LedgerError> {
+    fn rename_temp(&self, active: &str) -> Result<(), LedgerError> {
         std::fs::rename(
             self.path.join(format!(".{active}.compact")),
             self.path.join(active),
         )
         .map_err(|_| LedgerError::Unavailable)
+    }
+
+    fn sync_directory(&self) -> Result<(), LedgerError> {
+        File::open(&self.path)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| LedgerError::Unavailable)
     }
 }
 
@@ -1031,6 +1151,87 @@ mod tests {
         exclusion.stop_for_test();
         exclusion.join_for_test().unwrap();
         ledger.delivery.worker.join().unwrap();
+    }
+
+    #[test]
+    fn append_failpoints_reopen_as_old_or_durably_suppressing_state() {
+        for failpoint in [
+            RecordFailpoint::BeforeAppend,
+            RecordFailpoint::AfterAppendBeforeSync,
+            RecordFailpoint::AfterSyncBeforeIndex,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let digest = document_digest("frames", "crash-window");
+            let mut journal = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+            assert_eq!(
+                journal.record_inner(digest, RecordState::Reserved, Some(failpoint)),
+                Err(LedgerError::Unavailable)
+            );
+            drop(journal);
+            let reopened = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+            let state = reopened.index.get(&digest).copied();
+            match failpoint {
+                RecordFailpoint::BeforeAppend => assert_eq!(state, None),
+                RecordFailpoint::AfterAppendBeforeSync | RecordFailpoint::AfterSyncBeforeIndex => {
+                    assert_eq!(state, Some(RecordState::Reserved));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_compaction_failpoint_reopens_complete_old_or_new_state() {
+        for failpoint in [
+            CompactFailpoint::BeforeTempSync,
+            CompactFailpoint::AfterTempSync,
+            CompactFailpoint::AfterRename,
+            CompactFailpoint::AfterDirectorySync,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let digest = document_digest("frames", "compacted");
+            let mut journal = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+            journal.record(digest, RecordState::Reserved).unwrap();
+            assert_eq!(
+                journal.compact_inner(Some(failpoint)),
+                Err(LedgerError::Unavailable)
+            );
+            drop(journal);
+            let reopened = Journal::open(dir.path(), JournalKind::Delivery).unwrap();
+            assert_eq!(reopened.index.get(&digest), Some(&RecordState::Reserved));
+            assert!(!dir
+                .path()
+                .join(LEDGER_DIR)
+                .join(format!(".{DELIVERY_FILE}.compact"))
+                .exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn substituted_compaction_temp_is_preserved_and_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = BridgeLedger::open(dir.path()).unwrap();
+        ledger.join().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"operator evidence").unwrap();
+        let temp = dir
+            .path()
+            .join(LEDGER_DIR)
+            .join(format!(".{DELIVERY_FILE}.compact"));
+        symlink(&victim, &temp).unwrap();
+        assert!(matches!(
+            BridgeLedger::open(dir.path()),
+            Err(LedgerOpenError::Delivery {
+                error: LedgerError::Unavailable,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"operator evidence");
+        assert!(std::fs::symlink_metadata(&temp)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]
