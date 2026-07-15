@@ -397,27 +397,31 @@ fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
     redacted
 }
 
-fn start_bridge_runtime_with<N, T>(
+async fn start_bridge_runtime_with<N, T, F, Fut>(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<N>,
-    spawn: impl FnOnce(EnabledBridgeConfig, String, Arc<N>) -> anyhow::Result<T>,
-) -> anyhow::Result<Option<T>> {
+    spawn: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce(EnabledBridgeConfig, String, Arc<N>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
     match bridge_config {
         BridgeConfig::Disabled => {
             info!("NATS bridge disabled — no --nats-mapping configured");
             Ok(None)
         }
-        BridgeConfig::Enabled(config) => spawn(config, node_id, node).map(Some),
+        BridgeConfig::Enabled(config) => spawn(config, node_id, node).await.map(Some),
     }
 }
 
-fn start_bridge_runtime(
+async fn start_bridge_runtime(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<SidecarNode>,
 ) -> anyhow::Result<Option<BridgeRuntimeHandle>> {
-    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::try_spawn)
+    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::try_spawn).await
 }
 
 #[tokio::main]
@@ -588,7 +592,8 @@ async fn main() -> anyhow::Result<()> {
     // The disabled branch constructs no NATS state. The enabled constructor
     // spawns one supervisor and returns before its first broker dial, keeping
     // Peat/RPC startup independent of local broker availability.
-    let _bridge_runtime = start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node))?;
+    let _bridge_runtime =
+        start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node)).await?;
 
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
@@ -906,8 +911,8 @@ mod tests {
         assert!(node_identity_validation < mesh);
     }
 
-    #[test]
-    fn start_bridge_runtime_disabled_does_not_invoke_factory() {
+    #[tokio::test]
+    async fn start_bridge_runtime_disabled_does_not_invoke_factory() {
         let config = BridgeConfig::from_raw(None, &[]).expect("empty config should be valid");
         let calls = std::cell::Cell::new(0usize);
         let node = Arc::new(());
@@ -917,9 +922,10 @@ mod tests {
             Arc::clone(&node),
             |_, _, _| {
                 calls.set(calls.get() + 1);
-                Ok(())
+                std::future::ready(Ok(()))
             },
         )
+        .await
         .unwrap();
         assert!(handle.is_none());
         assert_eq!(calls.get(), 0);
@@ -936,8 +942,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn start_bridge_runtime_enabled_passes_inputs_once() {
+    #[tokio::test]
+    async fn start_bridge_runtime_enabled_passes_inputs_once() {
         let mappings = vec!["vision.summary=frames".to_owned()];
         let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
             .expect("enabled config should be valid");
@@ -959,11 +965,37 @@ mod tests {
                 assert_eq!(actual_config.mappings()[0].collection(), "frames");
                 assert_eq!(actual_node_id, expected_node_id);
                 assert!(Arc::ptr_eq(&actual_node, &node));
-                Ok("spawned")
+                std::future::ready(Ok("spawned"))
             },
         )
+        .await
         .unwrap();
         assert_eq!(handle, Some("spawned"));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_bridge_runtime_awaits_enabled_factory_completion() {
+        let mappings = vec!["vision.summary=frames".to_owned()];
+        let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
+            .expect("enabled config should be valid");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let startup = tokio::spawn(start_bridge_runtime_with(
+            config,
+            "awaited-node".to_owned(),
+            Arc::new(()),
+            move |_, _, _| async move {
+                entered_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok("spawned")
+            },
+        ));
+
+        entered_rx.await.unwrap();
+        assert!(!startup.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(startup.await.unwrap().unwrap(), Some("spawned"));
     }
 }

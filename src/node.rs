@@ -203,7 +203,7 @@ fn mutation_guard_stripe(collection: &str, doc_id: &str) -> usize {
 
 struct InstalledBridgeLedger {
     collections: BTreeSet<String>,
-    exclusion: LocalExclusionLedger,
+    exclusion: Option<LocalExclusionLedger>,
     delivery: Option<DeliveryLedger>,
 }
 
@@ -2455,40 +2455,55 @@ impl SidecarNode {
     /// Install the validated mapped-collection set and its journals exactly
     /// once. An identical second call is idempotent; conflicting mappings are
     /// rejected before any bridge subscription can be started.
-    pub(crate) fn install_bridge_ledger(
+    pub(crate) async fn install_bridge_ledger(
         &self,
         collections: impl IntoIterator<Item = String>,
     ) -> Result<BridgeLedgerHealth, LedgerError> {
         let collections: BTreeSet<_> = collections.into_iter().collect();
+        {
+            let installed = self
+                .bridge_ledger
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(installed) = installed.as_ref() {
+                if installed.collections != collections {
+                    return Err(LedgerError::Corrupt);
+                }
+                return Ok(BridgeLedgerHealth {
+                    exclusion_healthy: installed
+                        .exclusion
+                        .as_ref()
+                        .is_some_and(LocalExclusionLedger::is_healthy),
+                    delivery_healthy: installed
+                        .delivery
+                        .as_ref()
+                        .is_some_and(DeliveryLedger::is_healthy),
+                });
+            }
+        }
+
+        let data_dir = self.bridge_ledger_data_dir.clone();
+        let opened = tokio::task::spawn_blocking(move || BridgeLedger::open(&data_dir))
+            .await
+            .map_err(|_| LedgerError::Unavailable)?;
+        let (exclusion, delivery) = match opened {
+            Ok(ledger) => (Some(ledger.exclusion()), Some(ledger.delivery())),
+            Err(LedgerOpenError::Delivery {
+                error: _,
+                exclusion,
+            }) => (Some(exclusion), None),
+            Err(LedgerOpenError::Exclusion(_)) => (None, None),
+        };
+        let health = BridgeLedgerHealth {
+            exclusion_healthy: exclusion
+                .as_ref()
+                .is_some_and(LocalExclusionLedger::is_healthy),
+            delivery_healthy: delivery.as_ref().is_some_and(DeliveryLedger::is_healthy),
+        };
         let mut installed = self
             .bridge_ledger
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(installed) = installed.as_ref() {
-            if installed.collections != collections {
-                return Err(LedgerError::Corrupt);
-            }
-            return Ok(BridgeLedgerHealth {
-                exclusion_healthy: installed.exclusion.is_healthy(),
-                delivery_healthy: installed
-                    .delivery
-                    .as_ref()
-                    .is_some_and(DeliveryLedger::is_healthy),
-            });
-        }
-
-        let (exclusion, delivery) = match BridgeLedger::open(&self.bridge_ledger_data_dir) {
-            Ok(ledger) => (ledger.exclusion(), Some(ledger.delivery())),
-            Err(LedgerOpenError::Delivery {
-                error: _,
-                exclusion,
-            }) => (exclusion, None),
-            Err(LedgerOpenError::Exclusion(error)) => return Err(error),
-        };
-        let health = BridgeLedgerHealth {
-            exclusion_healthy: exclusion.is_healthy(),
-            delivery_healthy: delivery.as_ref().is_some_and(DeliveryLedger::is_healthy),
-        };
         *installed = Some(InstalledBridgeLedger {
             collections,
             exclusion,
@@ -2498,7 +2513,9 @@ impl SidecarNode {
     }
 
     /// Cloned journal facades for the runtime coordinator and reconciler.
-    pub(crate) fn bridge_ledgers(&self) -> Option<(LocalExclusionLedger, Option<DeliveryLedger>)> {
+    pub(crate) fn bridge_ledgers(
+        &self,
+    ) -> Option<(Option<LocalExclusionLedger>, Option<DeliveryLedger>)> {
         self.bridge_ledger
             .read()
             .unwrap_or_else(|error| error.into_inner())
@@ -2524,11 +2541,12 @@ impl SidecarNode {
             })
         };
         match exclusion {
-            Some(exclusion) => {
+            Some(Some(exclusion)) => {
                 exclusion
                     .record_local_excluded(document_digest(collection, doc_id))
                     .await
             }
+            Some(None) => Err(LedgerError::Unavailable),
             None => Ok(()),
         }
     }
@@ -2761,6 +2779,7 @@ mod tests {
         let (_dir, node) = test_node(false).await;
         let health = node
             .install_bridge_ledger(["frames".to_owned()])
+            .await
             .expect("healthy journals install");
         assert_eq!(
             health,
@@ -2796,6 +2815,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .exclusion
+            .as_ref()
+            .unwrap()
             .clone();
         for doc_id in ["rpc-put", "nats-create", "delete-target"] {
             assert!(exclusion
@@ -2812,7 +2833,9 @@ mod tests {
     #[tokio::test]
     async fn bridge_ledger_exclusion_failure_rejects_before_store_mutation() {
         let (_dir, node) = test_node(false).await;
-        node.install_bridge_ledger(["frames".to_owned()]).unwrap();
+        node.install_bridge_ledger(["frames".to_owned()])
+            .await
+            .unwrap();
         let exclusion = node
             .bridge_ledger
             .read()
@@ -2820,6 +2843,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .exclusion
+            .as_ref()
+            .unwrap()
             .clone();
         exclusion.stop_for_test();
 
@@ -2853,6 +2878,7 @@ mod tests {
 
         let health = node
             .install_bridge_ledger(["frames".to_owned()])
+            .await
             .expect("delivery corruption preserves exclusion installation");
         assert!(health.exclusion_healthy);
         assert!(!health.delivery_healthy);
@@ -2871,6 +2897,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .exclusion
+            .as_ref()
+            .unwrap()
             .clone();
         assert!(exclusion
             .contains(document_digest("frames", "after-corruption"))
@@ -2879,15 +2907,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_ledger_exclusion_open_failure_rejects_mapped_mutation() {
+        let (_dir, node) = test_node(false).await;
+        let ledger = BridgeLedger::open(&node.bridge_ledger_data_dir).unwrap();
+        ledger.join().unwrap();
+        let exclusion_path = node
+            .bridge_ledger_data_dir
+            .join("nats-bridge-ledger-v1")
+            .join("local-exclusion-v1");
+        let mut bytes = std::fs::read(&exclusion_path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&exclusion_path, bytes).unwrap();
+
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .expect("corrupt exclusion installs an explicitly unhealthy facade");
+        assert!(!health.exclusion_healthy);
+        assert!(!health.delivery_healthy);
+
+        let error = node
+            .put_document("frames", "rejected", r#"{"local":true}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bridge local-exclusion persistence failed"
+        );
+        assert!(node
+            .get_document("frames", "rejected")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn bridge_ledger_install_is_idempotent_but_rejects_conflicting_routes() {
         let (_dir, node) = test_node(false).await;
-        let first = node.install_bridge_ledger(["frames".to_owned()]).unwrap();
+        let first = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .unwrap();
         assert_eq!(
-            node.install_bridge_ledger(["frames".to_owned()]).unwrap(),
+            node.install_bridge_ledger(["frames".to_owned()])
+                .await
+                .unwrap(),
             first
         );
         assert_eq!(
-            node.install_bridge_ledger(["other".to_owned()]),
+            node.install_bridge_ledger(["other".to_owned()]).await,
             Err(LedgerError::Corrupt)
         );
     }

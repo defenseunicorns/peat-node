@@ -4,9 +4,6 @@
 //! inherited transient is explicit; bridge-owned retained work is limited to
 //! 64-key processing batches, one hydrated body, and 16 hydrations per second.
 
-// Task 3 wires the complete private trigger surface into runtime ownership.
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,6 +43,7 @@ struct ReconcileStatsInner {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct ReconcileSnapshot {
     pub triggers: u64,
     pub coalesced: u64,
@@ -56,6 +54,7 @@ pub(crate) struct ReconcileSnapshot {
 }
 
 impl ReconcileStats {
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ReconcileSnapshot {
         ReconcileSnapshot {
             triggers: self.0.triggers.load(Ordering::Relaxed),
@@ -87,6 +86,7 @@ impl ReconcileTrigger {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.pending.store(false, Ordering::Release);

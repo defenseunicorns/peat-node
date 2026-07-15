@@ -631,6 +631,7 @@ pub(crate) async fn run_bridge_event_router(
     coordinator: DeliveryCoordinator,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
+    reconcile: Option<super::reconcile::ReconcileTrigger>,
 ) {
     loop {
         match events.recv().await {
@@ -639,6 +640,9 @@ pub(crate) async fn run_bridge_event_router(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                 stats.record_event_lagged(dropped);
+                if let Some(trigger) = &reconcile {
+                    trigger.trigger(super::reconcile::ReconcileReason::EventLagged);
+                }
                 diagnostics.record(EgressAction {
                     kind: EgressActionKind::Lost(EgressFailureKind::EventLagged),
                     route_index: None,

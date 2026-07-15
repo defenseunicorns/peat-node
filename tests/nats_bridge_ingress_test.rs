@@ -742,7 +742,8 @@ async fn connect_uses_no_echo_on_the_shared_bridge_connection() {
             enabled_config(&peer.url),
             "divergent-caller-id".to_owned(),
             node,
-        );
+        )
+        .await;
 
         loop {
             match peer.event().await {
@@ -773,7 +774,8 @@ async fn origin_marker_only_exact_single_own_value_is_suppressed() {
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             Arc::clone(&node),
-        );
+        )
+        .await;
         loop {
             if matches!(peer.event().await, PeerEvent::Barrier { .. }) {
                 break;
@@ -867,7 +869,8 @@ async fn egress_remote_acceptance_continues_after_header_aware_max_payload() {
             enabled_config(&peer.url),
             "egress-node-b".to_owned(),
             Arc::clone(&node_b),
-        );
+        )
+        .await;
 
         loop {
             if matches!(peer.event().await, PeerEvent::Barrier { .. }) {
@@ -998,7 +1001,8 @@ async fn real_core_nats_ingress_preserves_payload_identity_and_atomic_readiness(
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             Arc::clone(&node),
-        );
+        )
+        .await;
 
         let mut traffic = Vec::new();
         loop {
@@ -1181,7 +1185,8 @@ async fn reconnect_replays_the_complete_literal_subscription_set_before_readines
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             Arc::clone(&node),
-        );
+        )
+        .await;
 
         for connection in 0..2 {
             loop {
@@ -1242,7 +1247,8 @@ async fn readiness_barrier_timeout_leaves_the_complete_generation_not_ready() {
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             node,
-        );
+        )
+        .await;
 
         loop {
             if let PeerEvent::Barrier { subjects: seen, .. } = peer.event().await {
@@ -1273,7 +1279,8 @@ async fn readiness_permission_error_delivered_before_503_invalidates_the_barrier
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             node,
-        );
+        )
+        .await;
 
         loop {
             if let PeerEvent::Barrier { subjects: seen, .. } = peer.event().await {
@@ -1316,7 +1323,8 @@ async fn readiness_disconnect_cancels_withheld_barrier_before_timeout() {
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             node,
-        );
+        )
+        .await;
 
         loop {
             if let PeerEvent::Barrier { connection: 0, .. } = peer.event().await {
@@ -1363,7 +1371,8 @@ async fn oversized_message_is_rejected_before_ingress_and_later_json_is_stored()
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
             Arc::clone(&node),
-        );
+        )
+        .await;
 
         loop {
             if let PeerEvent::Barrier { subjects: seen, .. } = peer.event().await {

@@ -386,12 +386,14 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             enabled_config(&nats_a.url),
             "node-a".to_owned(),
             Arc::clone(&node_a),
-        );
+        )
+        .await;
         let runtime_b = BridgeRuntime::spawn(
             enabled_config(&nats_b.url),
             "node-b".to_owned(),
             Arc::clone(&node_b),
-        );
+        )
+        .await;
         nats_a.wait_ready().await;
         nats_b.wait_ready().await;
         wait_runtime_ready(&runtime_a).await;

@@ -27,7 +27,8 @@ use super::ingress::{
     IngressSender, IngressStats,
 };
 use super::readiness::{BridgeReadiness, BridgeStatus};
-use crate::node::SidecarNode;
+use super::reconcile::{spawn_reconciler, ReconcileReason, ReconcileStats, ReconcileTrigger};
+use crate::node::{BridgeLedgerHealth, SidecarNode};
 
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
@@ -282,6 +283,7 @@ pub struct BridgeRuntimeHandle {
     support_tasks: Vec<JoinHandle<()>>,
     stats: IngressStats,
     _egress_stats: EgressStats,
+    _reconcile_stats: ReconcileStats,
 }
 
 /// Public, label-free subset of remote publication outcomes.
@@ -336,21 +338,32 @@ impl BridgeRuntime {
     /// owns the Phase 2 subscription and ingress generation.
     pub fn spawn_connection_only(config: EnabledBridgeConfig) -> BridgeRuntimeHandle {
         let stats = IngressStats::default();
-        Self::spawn_supervisor(config, stats, None, None, Vec::new())
+        Self::spawn_supervisor(
+            config,
+            stats,
+            None,
+            None,
+            Vec::new(),
+            BridgeLedgerHealth {
+                exclusion_healthy: true,
+                delivery_healthy: true,
+            },
+        )
     }
 
     /// Spawn the complete subscription-aware ingress runtime.
-    pub fn spawn(
+    pub async fn spawn(
         config: EnabledBridgeConfig,
         source_node_id: String,
         node: Arc<SidecarNode>,
     ) -> BridgeRuntimeHandle {
         Self::try_spawn(config, source_node_id, node)
+            .await
             .expect("bridge runtime requires startup-validated node identity")
     }
 
     /// Fallible startup boundary used by the process before any NATS task starts.
-    pub fn try_spawn(
+    pub async fn try_spawn(
         config: EnabledBridgeConfig,
         source_node_id: String,
         node: Arc<SidecarNode>,
@@ -371,6 +384,7 @@ impl BridgeRuntime {
                     .iter()
                     .map(|mapping| mapping.collection().to_owned()),
             )
+            .await
             .map_err(|_| anyhow::anyhow!("NATS bridge local-exclusion ledger unavailable"))?;
         let stats = IngressStats::default();
         let diagnostics = IngressDiagnostics::new(
@@ -381,7 +395,7 @@ impl BridgeRuntime {
         );
         let (ingress_tx, ingress_rx) = ingress_channel();
         let egress_stats = EgressStats::default();
-        let (_exclusion, delivery) = node
+        let (exclusion, delivery) = node
             .bridge_ledgers()
             .expect("successful installation retains journal facades");
         let configured_subjects = config
@@ -400,21 +414,20 @@ impl BridgeRuntime {
             config,
             stats,
             Some((ingress_tx, diagnostics, local_node_id.clone())),
-            delivery.map(|delivery| EgressSetup {
-                delivery,
-                origin_header_value,
-                stats: egress_stats,
-                events: node.subscribe_bridge_changes(),
-                local_node_id: local_node_id.clone(),
-            }),
+            delivery
+                .zip(exclusion)
+                .map(|(delivery, exclusion)| EgressSetup {
+                    delivery,
+                    exclusion,
+                    origin_header_value,
+                    stats: egress_stats,
+                    events: node.subscribe_bridge_changes(),
+                    node: Arc::clone(&node),
+                    local_node_id: local_node_id.clone(),
+                }),
             vec![ingress_task],
+            ledger_health,
         );
-        handle
-            .readiness
-            .set_exclusion_healthy(ledger_health.exclusion_healthy);
-        handle
-            .readiness
-            .set_delivery_healthy(ledger_health.delivery_healthy);
         Ok(handle)
     }
 
@@ -424,6 +437,7 @@ impl BridgeRuntime {
         ingress: Option<(IngressSender, IngressDiagnostics, String)>,
         egress: Option<EgressSetup>,
         mut support_tasks: Vec<JoinHandle<()>>,
+        ledger_health: BridgeLedgerHealth,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -434,6 +448,8 @@ impl BridgeRuntime {
                 .iter()
                 .map(|mapping| mapping.subject().clone()),
         );
+        readiness.set_exclusion_healthy(ledger_health.exclusion_healthy);
+        readiness.set_delivery_healthy(ledger_health.delivery_healthy);
         let lifecycle = LifecycleControl::new(readiness.clone());
 
         LifecycleAction::status(
@@ -452,6 +468,8 @@ impl BridgeRuntime {
             .as_ref()
             .map(|state| state.stats.clone())
             .unwrap_or_default();
+        let mut reconcile_stats = ReconcileStats::default();
+        let mut reconcile_trigger = None;
         let egress = egress.map(|setup| {
             let (coordinator, rx) = DeliveryCoordinator::new(
                 config.mappings(),
@@ -461,11 +479,23 @@ impl BridgeRuntime {
                 readiness.clone(),
             );
             let diagnostics = coordinator.diagnostics();
+            let (trigger, stats, reconcile_task) = spawn_reconciler(
+                Arc::clone(&setup.node),
+                config.mappings().to_vec(),
+                setup.exclusion,
+                setup.delivery.clone(),
+                coordinator.clone(),
+                readiness.clone(),
+            );
+            reconcile_stats = stats;
+            reconcile_trigger = Some(trigger.clone());
+            support_tasks.push(reconcile_task);
             support_tasks.push(tokio::spawn(run_bridge_event_router(
                 setup.events,
                 coordinator,
                 setup.stats.clone(),
                 diagnostics.clone(),
+                Some(trigger),
             )));
             EgressSupervisor {
                 rx,
@@ -484,6 +514,7 @@ impl BridgeRuntime {
                     readiness: task_readiness,
                     lifecycle: task_lifecycle,
                     stats: task_stats,
+                    reconcile: reconcile_trigger,
                 },
                 config,
                 ingress,
@@ -499,6 +530,7 @@ impl BridgeRuntime {
             support_tasks,
             stats,
             _egress_stats: handle_egress_stats,
+            _reconcile_stats: reconcile_stats,
         }
     }
 }
@@ -526,6 +558,7 @@ struct SupervisorRuntime {
     readiness: BridgeReadiness,
     lifecycle: LifecycleControl,
     stats: IngressStats,
+    reconcile: Option<ReconcileTrigger>,
 }
 
 struct EgressSupervisor {
@@ -538,9 +571,11 @@ struct EgressSupervisor {
 
 struct EgressSetup {
     delivery: super::ledger::DeliveryLedger,
+    exclusion: super::ledger::LocalExclusionLedger,
     origin_header_value: HeaderValue,
     stats: EgressStats,
     events: tokio::sync::broadcast::Receiver<crate::node::BridgeChangeEvent>,
+    node: Arc<SidecarNode>,
     local_node_id: String,
 }
 
@@ -584,6 +619,14 @@ fn barrier_tags_match(
 
 fn barrier_allowed_after_latest_delivery(lifecycle: LifecycleSnapshot) -> bool {
     lifecycle.connected && lifecycle.connected_sequence > lifecycle.invalidation_sequence
+}
+
+fn reconcile_reason_for_ready_generation(ready_generations: u64) -> ReconcileReason {
+    if ready_generations == 0 {
+        ReconcileReason::StartupReady
+    } else {
+        ReconcileReason::ReconnectReady
+    }
 }
 
 fn disconnected_reason(lifecycle: LifecycleSnapshot) -> LifecycleReason {
@@ -665,6 +708,7 @@ async fn run_client_supervisor(
         readiness,
         lifecycle,
         stats,
+        reconcile,
     } = runtime;
     let (signal_tx, mut signal_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
     let (slow_consumer_tx, mut slow_consumer_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
@@ -735,6 +779,7 @@ async fn run_client_supervisor(
     let mut next_generation_id = 1_u64;
     let mut handled_connection_epoch = 0_u64;
     let mut handled_invalidation_epoch = 0_u64;
+    let mut ready_generations = 0_u64;
     let mut barrier: Option<BarrierAttempt> = None;
     loop {
         let warning_deadline = outage.deadline();
@@ -909,6 +954,10 @@ async fn run_client_supervisor(
                         generation.as_ref().map(|current| current.id),
                     )
                 {
+                    if let Some(trigger) = &reconcile {
+                        trigger.trigger(reconcile_reason_for_ready_generation(ready_generations));
+                    }
+                    ready_generations = ready_generations.saturating_add(1);
                     LifecycleAction::status(
                         LifecycleReason::Ready,
                         &nats_host,
@@ -1189,7 +1238,8 @@ mod tests {
             enabled_config(),
             "invalid\norigin".to_owned(),
             Arc::clone(&node),
-        );
+        )
+        .await;
         let Err(error) = result else {
             panic!("invalid header identity must reject runtime startup");
         };
@@ -1238,6 +1288,22 @@ mod tests {
         repeated.append(BRIDGE_ORIGIN_HEADER, local);
         repeated.append(BRIDGE_ORIGIN_HEADER, local);
         assert!(!has_exact_own_origin(&Some(repeated), local));
+    }
+
+    #[test]
+    fn only_a_ready_generation_after_initial_readiness_is_reconnect() {
+        assert_eq!(
+            reconcile_reason_for_ready_generation(0),
+            ReconcileReason::StartupReady
+        );
+        assert_eq!(
+            reconcile_reason_for_ready_generation(1),
+            ReconcileReason::ReconnectReady
+        );
+        assert_eq!(
+            reconcile_reason_for_ready_generation(u64::MAX),
+            ReconcileReason::ReconnectReady
+        );
     }
 
     fn generation(id: u64) -> SubscriptionGeneration {
