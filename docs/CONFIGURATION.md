@@ -259,7 +259,13 @@ cause that local message to be dropped. The shared async-nats connection also
 uses `no_echo` (`CONNECT echo=false`) as defense in depth; `no_echo` alone does
 not protect another connection and does not replace the exact marker check.
 
-The remote event broadcast retains at most 256 pending events and the egress
+The remote event broadcast retains at most 256 pending events. Before an event
+enters that ring, its serialized document is capped at 2,101,248 bytes and
+each retained collection, document, and immediate-peer identity is capped at
+1,024 bytes; an over-limit remote document is skipped and later valid changes
+continue. The allowance preserves a 1,048,576-byte ingress payload even when
+its JSON string needs escaping in the durable envelope while preventing the
+broadcast from retaining attacker-sized documents or identities. The egress
 FIFO retains at most 256 eligible payloads of at most 1,048,576 bytes each.
 Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
 queue-closed, unavailable-client, publish, and negotiated `max_payload`
@@ -273,6 +279,15 @@ shared ingress FIFO holds 256, the private and public node broadcasts each
 hold 256, and lifecycle/readiness use watch channels that retain only their
 latest snapshot. The pinned async-nats client separately uses its bounded
 128-event callback queue described above.
+
+Egress classification and delivery counters remain label-free monotonic
+counters. Diagnostic emission uses exactly 16 fixed classification buckets:
+the first event is emitted, subsequent events in the same classification are
+aggregated for 60 seconds, and the next periodic event reports the suppressed
+count. No document, peer, payload, marker, credential, parser text, or source
+error becomes a diagnostic label. A delivery diagnostic carries the finite
+validated startup route index preserved with its FIFO item; it does not infer
+or default the route after publication.
 
 The required origin header counts toward the broker's negotiated
 `max_payload`. Consequently an exact 1,048,576-byte message accepted on

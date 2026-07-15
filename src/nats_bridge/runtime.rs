@@ -17,8 +17,8 @@ use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
 use super::egress::{
-    run_bridge_event_router, run_egress_worker, EgressRouter, EgressStats, NatsBridgePublisher,
-    BRIDGE_ORIGIN_HEADER,
+    run_bridge_event_router, run_egress_worker, EgressDiagnostics, EgressRouter, EgressStats,
+    NatsBridgePublisher, BRIDGE_ORIGIN_HEADER,
 };
 use super::ingress::{
     ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
@@ -362,6 +362,7 @@ impl BridgeRuntime {
         let egress_stats = EgressStats::default();
         let (egress_router, egress_rx) =
             EgressRouter::new(config.mappings(), &local_node_id, egress_stats.clone());
+        let egress_diagnostics = egress_router.diagnostics();
         let configured_subjects = config
             .mappings()
             .iter()
@@ -375,8 +376,15 @@ impl BridgeRuntime {
             configured_subjects,
         ));
         let router_stats = egress_stats.clone();
+        let router_diagnostics = egress_diagnostics.clone();
         let router_task = tokio::spawn(async move {
-            run_bridge_event_router(bridge_events, egress_router, router_stats).await;
+            run_bridge_event_router(
+                bridge_events,
+                egress_router,
+                router_stats,
+                router_diagnostics,
+            )
+            .await;
         });
         Self::spawn_supervisor(
             config,
@@ -386,6 +394,7 @@ impl BridgeRuntime {
                 rx: egress_rx,
                 local_node_id: node.node_id().to_owned(),
                 stats: egress_stats,
+                diagnostics: egress_diagnostics,
             }),
             vec![ingress_task, router_task],
         )
@@ -482,6 +491,7 @@ struct EgressSupervisor {
     rx: mpsc::Receiver<super::egress::EgressItem>,
     local_node_id: String,
     stats: EgressStats,
+    diagnostics: EgressDiagnostics,
 }
 
 struct AbortTaskOnDrop(JoinHandle<()>);
@@ -663,6 +673,7 @@ async fn run_client_supervisor(
             state.local_node_id,
             publisher,
             state.stats,
+            state.diagnostics,
         )))
     });
 

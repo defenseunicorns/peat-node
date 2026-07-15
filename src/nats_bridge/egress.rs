@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_nats::connection::State;
 use async_nats::{Client, HeaderMap, HeaderValue, PublishErrorKind, Subject};
@@ -33,6 +34,11 @@ pub(crate) const EGRESS_QUEUE_CAPACITY: usize = 256;
 /// Exact count of process-lifetime document digests retained for deduplication.
 pub(crate) const EGRESS_DEDUP_CAPACITY: usize = 4096;
 
+/// Minimum interval between diagnostics in one fixed egress classification.
+pub(crate) const EGRESS_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
+
+const EGRESS_DIAGNOSTIC_BUCKETS: usize = 16;
+
 const EGRESS_DOCUMENT_DIGEST_DOMAIN: &[u8] = b"peat-node/egress-document/v1\0";
 
 /// Fixed, payload-safe reason that a remote Peat upsert is ineligible.
@@ -54,6 +60,8 @@ pub(crate) enum EgressSkipKind {
 pub(crate) struct EgressItem {
     pub subject: Subject,
     pub payload: Bytes,
+    /// Index in the validated finite startup mapping list.
+    pub route_index: usize,
 }
 
 /// Fixed terminal delivery failure; source error text is deliberately discarded.
@@ -81,26 +89,31 @@ pub(crate) struct EgressAction {
     /// Index in the finite startup mapping list, never event-derived text.
     pub route_index: Option<usize>,
     pub payload_bytes: Option<usize>,
+    /// Events suppressed in this fixed classification since its prior emit.
+    pub suppressed_count: u64,
 }
 
 impl EgressAction {
     fn emit(&self) {
         let route_index = self.route_index.unwrap_or_default();
         let payload_bytes = self.payload_bytes.unwrap_or_default();
+        let suppressed_count = self.suppressed_count;
         match self.kind {
             EgressActionKind::Published => debug!(
                 route_index,
-                payload_bytes, "NATS bridge egress publish enqueued"
+                payload_bytes, suppressed_count, "NATS bridge egress publish enqueued"
             ),
             EgressActionKind::Skipped(kind) => debug!(
                 route_index,
                 payload_bytes,
+                suppressed_count,
                 reason = ?kind,
                 "NATS bridge egress skipped"
             ),
             EgressActionKind::Lost(kind) => warn!(
                 route_index,
                 payload_bytes,
+                suppressed_count,
                 reason = ?kind,
                 "NATS bridge egress terminal loss"
             ),
@@ -118,6 +131,82 @@ struct TracingEgressEmitter;
 impl EgressActionEmitter for TracingEgressEmitter {
     fn emit(&self, action: EgressAction) {
         action.emit();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiagnosticBucket {
+    next_emit: Option<Instant>,
+    suppressed: u64,
+}
+
+/// Fixed-size, label-free rate limiter shared by every egress producer.
+#[derive(Clone)]
+pub(crate) struct EgressDiagnostics {
+    buckets: Arc<Mutex<[DiagnosticBucket; EGRESS_DIAGNOSTIC_BUCKETS]>>,
+    emitter: Arc<dyn EgressActionEmitter>,
+}
+
+impl Default for EgressDiagnostics {
+    fn default() -> Self {
+        Self::with_emitter(TracingEgressEmitter)
+    }
+}
+
+impl EgressDiagnostics {
+    fn with_emitter<E: EgressActionEmitter>(emitter: E) -> Self {
+        Self {
+            buckets: Arc::new(Mutex::new(
+                [DiagnosticBucket::default(); EGRESS_DIAGNOSTIC_BUCKETS],
+            )),
+            emitter: Arc::new(emitter),
+        }
+    }
+
+    fn record(&self, action: EgressAction) {
+        self.record_at(action, Instant::now());
+    }
+
+    fn record_at(&self, mut action: EgressAction, now: Instant) {
+        let index = diagnostic_bucket(action.kind);
+        let suppressed = {
+            let mut buckets = self
+                .buckets
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let bucket = &mut buckets[index];
+            if bucket.next_emit.is_some_and(|deadline| now < deadline) {
+                bucket.suppressed = bucket.suppressed.saturating_add(1);
+                return;
+            }
+            let suppressed = bucket.suppressed;
+            bucket.suppressed = 0;
+            bucket.next_emit = Some(now + EGRESS_DIAGNOSTIC_INTERVAL);
+            suppressed
+        };
+        action.suppressed_count = suppressed;
+        self.emitter.emit(action);
+    }
+}
+
+fn diagnostic_bucket(kind: EgressActionKind) -> usize {
+    match kind {
+        EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope) => 0,
+        EgressActionKind::Skipped(EgressSkipKind::UnsupportedKind) => 1,
+        EgressActionKind::Skipped(EgressSkipKind::UnsupportedVersion) => 2,
+        EgressActionKind::Skipped(EgressSkipKind::UnmappedCollection) => 3,
+        EgressActionKind::Skipped(EgressSkipKind::RouteMismatch) => 4,
+        EgressActionKind::Skipped(EgressSkipKind::ReturnedLocal) => 5,
+        EgressActionKind::Skipped(EgressSkipKind::OversizedPayload) => 6,
+        EgressActionKind::Skipped(EgressSkipKind::Duplicate) => 7,
+        EgressActionKind::Skipped(EgressSkipKind::DedupExhausted) => 8,
+        EgressActionKind::Lost(EgressFailureKind::EventLagged) => 9,
+        EgressActionKind::Lost(EgressFailureKind::QueueFull) => 10,
+        EgressActionKind::Lost(EgressFailureKind::QueueClosed) => 11,
+        EgressActionKind::Lost(EgressFailureKind::Unavailable) => 12,
+        EgressActionKind::Lost(EgressFailureKind::PublishFailed) => 13,
+        EgressActionKind::Lost(EgressFailureKind::MaxPayloadExceeded) => 14,
+        EgressActionKind::Published => 15,
     }
 }
 
@@ -264,6 +353,9 @@ impl EgressClassifier {
             .routes
             .get(&event.collection)
             .ok_or(EgressSkipKind::UnmappedCollection)?;
+        let route_index = self
+            .route_index(&event.collection)
+            .ok_or(EgressSkipKind::UnmappedCollection)?;
         if envelope.subject != subject.as_str() {
             return Err(EgressSkipKind::RouteMismatch);
         }
@@ -277,6 +369,7 @@ impl EgressClassifier {
         Ok(EgressItem {
             subject: subject.clone(),
             payload: Bytes::from(envelope.payload),
+            route_index,
         })
     }
 
@@ -357,7 +450,7 @@ pub(crate) struct EgressRouter {
     dedup: Mutex<EgressDedup>,
     tx: mpsc::Sender<EgressItem>,
     stats: EgressStats,
-    emitter: Arc<dyn EgressActionEmitter>,
+    diagnostics: EgressDiagnostics,
 }
 
 impl EgressRouter {
@@ -394,7 +487,7 @@ impl EgressRouter {
                 dedup: Mutex::new(EgressDedup::with_digest_fn(digest_fn)),
                 tx,
                 stats,
-                emitter: Arc::new(emitter),
+                diagnostics: EgressDiagnostics::with_emitter(emitter),
             },
             rx,
         )
@@ -470,11 +563,16 @@ impl EgressRouter {
                 self.stats.inner.published.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.emitter.emit(EgressAction {
+        self.diagnostics.record(EgressAction {
             kind,
             route_index,
             payload_bytes,
+            suppressed_count: 0,
         });
+    }
+
+    pub(crate) fn diagnostics(&self) -> EgressDiagnostics {
+        self.diagnostics.clone()
     }
 }
 
@@ -543,6 +641,7 @@ pub(crate) async fn run_bridge_event_router(
     mut events: tokio::sync::broadcast::Receiver<BridgeChangeEvent>,
     router: EgressRouter,
     stats: EgressStats,
+    diagnostics: EgressDiagnostics,
 ) {
     loop {
         match events.recv().await {
@@ -551,12 +650,12 @@ pub(crate) async fn run_bridge_event_router(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                 stats.record_event_lagged(dropped);
-                EgressAction {
+                diagnostics.record(EgressAction {
                     kind: EgressActionKind::Lost(EgressFailureKind::EventLagged),
                     route_index: None,
                     payload_bytes: None,
-                }
-                .emit();
+                    suppressed_count: 0,
+                });
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
@@ -569,18 +668,20 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
     local_node_id: String,
     publisher: P,
     stats: EgressStats,
+    diagnostics: EgressDiagnostics,
 ) {
     let origin_header_value = local_node_id.parse::<HeaderValue>().ok();
     while let Some(item) = rx.recv().await {
         let payload_bytes = item.payload.len();
+        let route_index = Some(item.route_index);
         let Some(origin_header_value) = origin_header_value.clone() else {
             stats.record_failure(EgressFailureKind::PublishFailed);
-            EgressAction {
+            diagnostics.record(EgressAction {
                 kind: EgressActionKind::Lost(EgressFailureKind::PublishFailed),
-                route_index: None,
+                route_index,
                 payload_bytes: Some(payload_bytes),
-            }
-            .emit();
+                suppressed_count: 0,
+            });
             continue;
         };
         let mut headers = HeaderMap::new();
@@ -588,23 +689,23 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
         match publisher.publish(item.subject, headers, item.payload).await {
             Ok(()) => {
                 stats.inner.published.fetch_add(1, Ordering::Relaxed);
-                EgressAction {
+                diagnostics.record(EgressAction {
                     kind: EgressActionKind::Published,
-                    route_index: None,
+                    route_index,
                     payload_bytes: Some(payload_bytes),
-                }
-                .emit();
+                    suppressed_count: 0,
+                });
             }
             Err(kind @ EgressFailureKind::Unavailable)
             | Err(kind @ EgressFailureKind::PublishFailed)
             | Err(kind @ EgressFailureKind::MaxPayloadExceeded) => {
                 stats.record_failure(kind);
-                EgressAction {
+                diagnostics.record(EgressAction {
                     kind: EgressActionKind::Lost(kind),
-                    route_index: None,
+                    route_index,
                     payload_bytes: Some(payload_bytes),
-                }
-                .emit();
+                    suppressed_count: 0,
+                });
             }
             Err(
                 EgressFailureKind::EventLagged
@@ -675,6 +776,7 @@ mod tests {
             Ok(EgressItem {
                 subject: Subject::from("Vision.Summary"),
                 payload: Bytes::from_static(br#"{"ok":true}"#),
+                route_index: 0,
             })
         );
 
@@ -1025,6 +1127,7 @@ mod tests {
             "local-node".to_owned(),
             publisher.clone(),
             stats.clone(),
+            router.diagnostics(),
         ));
         let payloads = ["1", "2", "3", "4", "5"];
         for (sequence, payload) in payloads.into_iter().enumerate() {
@@ -1065,6 +1168,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serial_worker_preserves_each_validated_route_index_in_diagnostics() {
+        let stats = EgressStats::default();
+        let emitter = RecordingEmitter::default();
+        let diagnostics = EgressDiagnostics::with_emitter(emitter.clone());
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(EgressItem {
+            subject: Subject::from("Vision.Summary"),
+            payload: Bytes::from_static(b"1"),
+            route_index: 0,
+        })
+        .await
+        .unwrap();
+        tx.send(EgressItem {
+            subject: Subject::from("telemetry.reading"),
+            payload: Bytes::from_static(b"2"),
+            route_index: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        run_egress_worker(
+            rx,
+            "local-node".to_owned(),
+            FakePublisher::with_results([
+                Err(EgressFailureKind::Unavailable),
+                Err(EgressFailureKind::PublishFailed),
+            ]),
+            stats,
+            diagnostics,
+        )
+        .await;
+
+        assert_eq!(
+            emitter
+                .actions()
+                .iter()
+                .map(|action| (action.kind, action.route_index))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    EgressActionKind::Lost(EgressFailureKind::Unavailable),
+                    Some(0)
+                ),
+                (
+                    EgressActionKind::Lost(EgressFailureKind::PublishFailed),
+                    Some(1)
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_origin_header_value_fails_safely_without_panicking_or_publishing() {
         let stats = EgressStats::default();
         let (router, rx) = EgressRouter::new(&mappings(), "local\nnode", stats.clone());
@@ -1074,6 +1229,7 @@ mod tests {
             "local\nnode".to_owned(),
             publisher.clone(),
             stats.clone(),
+            router.diagnostics(),
         ));
         for sequence in 0..2 {
             let valid = envelope("Vision.Summary", "remote-node", "true");
@@ -1129,7 +1285,50 @@ mod tests {
                 kind: EgressActionKind::Lost(EgressFailureKind::QueueClosed),
                 route_index: Some(0),
                 payload_bytes: Some(secret_payload.len()),
+                suppressed_count: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn diagnostics_rate_limit_and_periodically_aggregate_fixed_classifications() {
+        let emitter = RecordingEmitter::default();
+        let diagnostics = EgressDiagnostics::with_emitter(emitter.clone());
+        let start = Instant::now();
+        let kinds = [
+            EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope),
+            EgressActionKind::Lost(EgressFailureKind::QueueFull),
+            EgressActionKind::Lost(EgressFailureKind::Unavailable),
+            EgressActionKind::Lost(EgressFailureKind::EventLagged),
+        ];
+
+        for kind in kinds {
+            let action = EgressAction {
+                kind,
+                route_index: Some(1),
+                payload_bytes: Some(17),
+                suppressed_count: 0,
+            };
+            diagnostics.record_at(action.clone(), start);
+            for _ in 0..100 {
+                diagnostics.record_at(action.clone(), start + Duration::from_secs(59));
+            }
+            diagnostics.record_at(action, start + EGRESS_DIAGNOSTIC_INTERVAL);
+        }
+
+        let actions = emitter.actions();
+        assert_eq!(actions.len(), kinds.len() * 2);
+        for (pair, kind) in actions.chunks_exact(2).zip(kinds) {
+            assert_eq!(pair[0].kind, kind);
+            assert_eq!(pair[0].suppressed_count, 0);
+            assert_eq!(pair[1].kind, kind);
+            assert_eq!(pair[1].suppressed_count, 100);
+            assert_eq!(pair[1].route_index, Some(1));
+            assert_eq!(pair[1].payload_bytes, Some(17));
+        }
+        assert_eq!(
+            diagnostics.buckets.lock().unwrap().len(),
+            EGRESS_DIAGNOSTIC_BUCKETS
         );
     }
 
