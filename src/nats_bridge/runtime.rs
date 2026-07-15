@@ -26,6 +26,7 @@ use super::ingress::{
     ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
     IngressSender, IngressStats,
 };
+use super::ledger::{DeliveryLedger, LedgerError, LocalExclusionLedger};
 use super::readiness::{BridgeReadiness, BridgeStatus};
 use super::reconcile::{spawn_reconciler, ReconcileReason, ReconcileStats, ReconcileTrigger};
 use crate::node::{BridgeLedgerHealth, SidecarNode};
@@ -275,12 +276,101 @@ impl LifecycleAction {
     }
 }
 
+/// Fixed lifecycle phase used by the root runtime owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeShutdownPhase {
+    Running,
+    Quiescing,
+    Aborting,
+    Complete,
+}
+
+/// Fixed stage names safe for process logs and operator diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeShutdownStage {
+    Producers,
+    Consumers,
+    ClientFlush,
+    ClientDrain,
+    LedgerExclusion,
+    LedgerDelivery,
+    Complete,
+}
+
+/// One worker that can remain blocked in an unavoidable kernel filesystem call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LedgerWorkerKind {
+    Exclusion,
+    Delivery,
+}
+
+/// Payload-safe reason for a non-clean shutdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeShutdownFailure {
+    DeadlineExceeded,
+    TaskPanicked,
+    ClientFailure,
+    LedgerIoUnjoined(LedgerWorkerKind),
+}
+
+/// Complete fixed-cardinality outcome for one bridge shutdown attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeShutdownReport {
+    pub phase: BridgeShutdownPhase,
+    pub stage: BridgeShutdownStage,
+    pub joined_tasks: usize,
+    pub aborted_tasks: usize,
+    pub failure: Option<BridgeShutdownFailure>,
+}
+
+impl BridgeShutdownReport {
+    fn clean(joined_tasks: usize) -> Self {
+        Self {
+            phase: BridgeShutdownPhase::Complete,
+            stage: BridgeShutdownStage::Complete,
+            joined_tasks,
+            aborted_tasks: 0,
+            failure: None,
+        }
+    }
+
+    /// True only when all controlled tasks and both ledger workers joined.
+    pub fn is_clean(&self) -> bool {
+        self.failure.is_none() && self.phase == BridgeShutdownPhase::Complete
+    }
+}
+
+/// Typed shutdown error that never retains a broker, payload, or source error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeShutdownError {
+    pub report: BridgeShutdownReport,
+}
+
+impl std::fmt::Display for BridgeShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NATS bridge shutdown did not complete cleanly")
+    }
+}
+
+impl std::error::Error for BridgeShutdownError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SupervisorShutdown {
+    stage: BridgeShutdownStage,
+    failure: Option<BridgeShutdownFailure>,
+}
+
 /// Process-lifetime handle to the single bridge supervisor task.
 pub struct BridgeRuntimeHandle {
     readiness: BridgeReadiness,
     lifecycle: LifecycleControl,
-    task: JoinHandle<()>,
-    support_tasks: Vec<JoinHandle<()>>,
+    task: Option<JoinHandle<SupervisorShutdown>>,
+    producer_tasks: Vec<JoinHandle<()>>,
+    consumer_tasks: Vec<JoinHandle<()>>,
+    shutdown_tx: watch::Sender<Option<Instant>>,
+    reconcile_trigger: Option<ReconcileTrigger>,
+    exclusion: Option<LocalExclusionLedger>,
+    delivery: Option<DeliveryLedger>,
     stats: IngressStats,
     _egress_stats: EgressStats,
     _reconcile_stats: ReconcileStats,
@@ -325,12 +415,159 @@ impl BridgeRuntimeHandle {
 
     /// Whether the supervisor has unexpectedly terminated.
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished() || self.support_tasks.iter().any(JoinHandle::is_finished)
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+            || self.producer_tasks.iter().any(JoinHandle::is_finished)
+            || self.consumer_tasks.iter().any(JoinHandle::is_finished)
     }
 
     /// One total budget shared by every shutdown stage.
     pub fn shutdown_timeout(&self) -> Duration {
         self.shutdown_timeout
+    }
+
+    /// Quiesce immediately, drain admitted work, and join all owned work under
+    /// one absolute deadline.
+    pub async fn shutdown(&mut self) -> Result<BridgeShutdownReport, BridgeShutdownError> {
+        let deadline = Instant::now() + self.shutdown_timeout;
+        self.readiness.begin_shutdown();
+        if let Some(trigger) = &self.reconcile_trigger {
+            trigger.close();
+        }
+        let _ = self.shutdown_tx.send(Some(deadline));
+
+        let mut joined = 0usize;
+        let mut aborted = 0usize;
+        for task in &self.producer_tasks {
+            task.abort();
+        }
+        for task in &mut self.producer_tasks {
+            let _ = task.await;
+            joined = joined.saturating_add(1);
+        }
+        self.producer_tasks.clear();
+
+        let supervisor = self.task.as_mut().expect("shutdown is called once");
+        let supervisor_result = tokio::time::timeout_at(deadline, &mut *supervisor).await;
+        let supervisor_outcome = match supervisor_result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => SupervisorShutdown {
+                stage: BridgeShutdownStage::Consumers,
+                failure: Some(BridgeShutdownFailure::TaskPanicked),
+            },
+            Err(_) => {
+                supervisor.abort();
+                let _ = supervisor.await;
+                aborted = aborted.saturating_add(1);
+                SupervisorShutdown {
+                    stage: BridgeShutdownStage::Consumers,
+                    failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                }
+            }
+        };
+        self.task.take();
+        joined = joined.saturating_add(1);
+
+        for task in &mut self.consumer_tasks {
+            match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(_) => joined = joined.saturating_add(1),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    joined = joined.saturating_add(1);
+                    aborted = aborted.saturating_add(1);
+                }
+            }
+        }
+        self.consumer_tasks.clear();
+
+        if let Some(exclusion) = &self.exclusion {
+            exclusion.request_stop();
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.request_stop();
+        }
+        let exclusion_failure =
+            join_ledger_worker(self.exclusion.take(), LedgerWorkerKind::Exclusion, deadline).await;
+        let delivery_failure =
+            join_ledger_worker(self.delivery.take(), LedgerWorkerKind::Delivery, deadline).await;
+
+        let failure = supervisor_outcome
+            .failure
+            .or(exclusion_failure)
+            .or(delivery_failure)
+            .or_else(|| (aborted > 0).then_some(BridgeShutdownFailure::DeadlineExceeded));
+        let report = if let Some(failure) = failure {
+            BridgeShutdownReport {
+                phase: BridgeShutdownPhase::Aborting,
+                stage: supervisor_outcome.stage,
+                joined_tasks: joined,
+                aborted_tasks: aborted,
+                failure: Some(failure),
+            }
+        } else {
+            BridgeShutdownReport::clean(joined)
+        };
+        if report.is_clean() {
+            Ok(report)
+        } else {
+            Err(BridgeShutdownError { report })
+        }
+    }
+}
+
+impl Drop for BridgeRuntimeHandle {
+    fn drop(&mut self) {
+        self.readiness.begin_shutdown();
+        if let Some(trigger) = &self.reconcile_trigger {
+            trigger.close();
+        }
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        for task in self.producer_tasks.iter().chain(self.consumer_tasks.iter()) {
+            task.abort();
+        }
+        if let Some(exclusion) = &self.exclusion {
+            exclusion.request_stop();
+        }
+        if let Some(delivery) = &self.delivery {
+            delivery.request_stop();
+        }
+    }
+}
+
+async fn join_ledger_worker<T>(
+    ledger: Option<T>,
+    kind: LedgerWorkerKind,
+    deadline: Instant,
+) -> Option<BridgeShutdownFailure>
+where
+    T: LedgerJoin,
+{
+    let ledger = ledger?;
+    let join = tokio::task::spawn_blocking(move || ledger.join_worker());
+    match tokio::time::timeout_at(deadline, join).await {
+        Ok(Ok(Ok(()))) => None,
+        Ok(Ok(Err(LedgerError::IoUnjoined))) | Ok(Err(_)) | Err(_) => {
+            Some(BridgeShutdownFailure::LedgerIoUnjoined(kind))
+        }
+        Ok(Ok(Err(_))) => Some(BridgeShutdownFailure::LedgerIoUnjoined(kind)),
+    }
+}
+
+trait LedgerJoin: Send + 'static {
+    fn join_worker(self) -> Result<(), LedgerError>;
+}
+
+impl LedgerJoin for LocalExclusionLedger {
+    fn join_worker(self) -> Result<(), LedgerError> {
+        self.join()
+    }
+}
+
+impl LedgerJoin for DeliveryLedger {
+    fn join_worker(self) -> Result<(), LedgerError> {
+        self.join()
     }
 }
 
@@ -445,7 +682,7 @@ impl BridgeRuntime {
         stats: IngressStats,
         ingress: Option<(IngressSender, IngressDiagnostics, String)>,
         egress: Option<EgressSetup>,
-        mut support_tasks: Vec<JoinHandle<()>>,
+        support_tasks: Vec<JoinHandle<()>>,
         ledger_health: BridgeLedgerHealth,
         shutdown_timeout: Duration,
     ) -> BridgeRuntimeHandle {
@@ -480,6 +717,10 @@ impl BridgeRuntime {
             .unwrap_or_default();
         let mut reconcile_stats = ReconcileStats::default();
         let mut reconcile_trigger = None;
+        let mut producer_tasks = Vec::new();
+        let consumer_tasks = support_tasks;
+        let handle_exclusion = egress.as_ref().map(|state| state.exclusion.clone());
+        let handle_delivery = egress.as_ref().map(|state| state.delivery.clone());
         let egress = egress.map(|setup| {
             let (coordinator, rx) = DeliveryCoordinator::new(
                 config.mappings(),
@@ -499,8 +740,8 @@ impl BridgeRuntime {
             );
             reconcile_stats = stats;
             reconcile_trigger = Some(trigger.clone());
-            support_tasks.push(reconcile_task);
-            support_tasks.push(tokio::spawn(run_bridge_event_router(
+            producer_tasks.push(reconcile_task);
+            producer_tasks.push(tokio::spawn(run_bridge_event_router(
                 setup.events,
                 coordinator,
                 setup.stats.clone(),
@@ -515,6 +756,8 @@ impl BridgeRuntime {
                 diagnostics,
             }
         });
+        let handle_reconcile_trigger = reconcile_trigger.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
         let task = tokio::spawn(async move {
             run_client_supervisor(
                 server_addr,
@@ -525,19 +768,25 @@ impl BridgeRuntime {
                     lifecycle: task_lifecycle,
                     stats: task_stats,
                     reconcile: reconcile_trigger,
+                    shutdown_rx,
                 },
                 config,
                 ingress,
                 egress,
             )
-            .await;
+            .await
         });
 
         BridgeRuntimeHandle {
             readiness,
             lifecycle,
-            task,
-            support_tasks,
+            task: Some(task),
+            producer_tasks,
+            consumer_tasks,
+            shutdown_tx,
+            reconcile_trigger: handle_reconcile_trigger,
+            exclusion: handle_exclusion,
+            delivery: handle_delivery,
             stats,
             _egress_stats: handle_egress_stats,
             _reconcile_stats: reconcile_stats,
@@ -563,6 +812,7 @@ struct SubscriptionInputs {
     diagnostics: IngressDiagnostics,
     local_node_id: String,
     signal_tx: mpsc::Sender<ClientSignal>,
+    readiness: BridgeReadiness,
 }
 
 struct SupervisorRuntime {
@@ -570,6 +820,7 @@ struct SupervisorRuntime {
     lifecycle: LifecycleControl,
     stats: IngressStats,
     reconcile: Option<ReconcileTrigger>,
+    shutdown_rx: watch::Receiver<Option<Instant>>,
 }
 
 struct EgressSupervisor {
@@ -588,14 +839,6 @@ struct EgressSetup {
     events: tokio::sync::broadcast::Receiver<crate::node::BridgeChangeEvent>,
     node: Arc<SidecarNode>,
     local_node_id: String,
-}
-
-struct AbortTaskOnDrop(JoinHandle<()>);
-
-impl Drop for AbortTaskOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -712,14 +955,15 @@ async fn run_client_supervisor(
     nats_port: u16,
     runtime: SupervisorRuntime,
     config: EnabledBridgeConfig,
-    ingress: Option<(IngressSender, IngressDiagnostics, String)>,
+    mut ingress: Option<(IngressSender, IngressDiagnostics, String)>,
     egress: Option<EgressSupervisor>,
-) {
+) -> SupervisorShutdown {
     let SupervisorRuntime {
         readiness,
         lifecycle,
         stats,
         reconcile,
+        mut shutdown_rx,
     } = runtime;
     let (signal_tx, mut signal_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
     let (slow_consumer_tx, mut slow_consumer_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
@@ -767,13 +1011,16 @@ async fn run_client_supervisor(
         Err(_) => {
             let status = readiness.snapshot();
             LifecycleAction::unavailable(&nats_host, nats_port, &status).emit();
-            return;
+            return SupervisorShutdown {
+                stage: BridgeShutdownStage::Consumers,
+                failure: None,
+            };
         }
     };
 
-    let _egress_task = egress.map(|state| {
+    let mut egress_task = egress.map(|state| {
         let publisher = NatsBridgePublisher::new(client.clone(), readiness.clone());
-        AbortTaskOnDrop(tokio::spawn(run_egress_worker(
+        tokio::spawn(run_egress_worker(
             state.rx,
             state.origin_header_value,
             publisher,
@@ -781,12 +1028,12 @@ async fn run_client_supervisor(
             readiness.clone(),
             state.stats,
             state.diagnostics,
-        )))
+        ))
     });
 
     let mut outage = OutageLogState::default();
     let mut slow_consumers = SlowConsumerLogState::default();
-    let mut generation = None;
+    let mut generation: Option<SubscriptionGeneration> = None;
     let mut next_generation_id = 1_u64;
     let mut handled_connection_epoch = 0_u64;
     let mut handled_invalidation_epoch = 0_u64;
@@ -795,9 +1042,88 @@ async fn run_client_supervisor(
     loop {
         let warning_deadline = outage.deadline();
         tokio::select! {
+            changed = shutdown_rx.changed() => {
+                let deadline = changed
+                    .ok()
+                    .and_then(|_| *shutdown_rx.borrow_and_update());
+                let Some(deadline) = deadline else {
+                    continue;
+                };
+                readiness.begin_shutdown();
+                if let Some(trigger) = &reconcile {
+                    trigger.close();
+                }
+                if let Some(attempt) = barrier.take() {
+                    attempt.stop().await;
+                }
+                if let Some(active) = generation.take() {
+                    active.stop().await;
+                }
+                drop(ingress.take());
+
+                if let Some(task) = egress_task.as_mut() {
+                    match tokio::time::timeout_at(deadline, &mut *task).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => return SupervisorShutdown {
+                            stage: BridgeShutdownStage::Consumers,
+                            failure: Some(BridgeShutdownFailure::TaskPanicked),
+                        },
+                        Err(_) => {
+                            task.abort();
+                            let _ = task.await;
+                            return SupervisorShutdown {
+                                stage: BridgeShutdownStage::Consumers,
+                                failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                            };
+                        }
+                    }
+                }
+
+                match tokio::time::timeout_at(deadline, client.flush()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return SupervisorShutdown {
+                        stage: BridgeShutdownStage::ClientFlush,
+                        failure: Some(BridgeShutdownFailure::ClientFailure),
+                    },
+                    Err(_) => return SupervisorShutdown {
+                        stage: BridgeShutdownStage::ClientFlush,
+                        failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                    },
+                }
+                match tokio::time::timeout_at(deadline, client.drain()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return SupervisorShutdown {
+                        stage: BridgeShutdownStage::ClientDrain,
+                        failure: Some(BridgeShutdownFailure::ClientFailure),
+                    },
+                    Err(_) => return SupervisorShutdown {
+                        stage: BridgeShutdownStage::ClientDrain,
+                        failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                    },
+                }
+                while client.connection_state() == async_nats::connection::State::Connected {
+                    match tokio::time::timeout_at(deadline, lifecycle_rx.changed()).await {
+                        Ok(Ok(())) => {
+                            let _ = lifecycle_rx.borrow_and_update();
+                        }
+                        Ok(Err(_)) => break,
+                        Err(_) => return SupervisorShutdown {
+                            stage: BridgeShutdownStage::ClientDrain,
+                            failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                        },
+                    }
+                }
+                return SupervisorShutdown {
+                    stage: BridgeShutdownStage::Complete,
+                    failure: None,
+                };
+            }
             changed = lifecycle_rx.changed() => {
                 if changed.is_err() {
-                    return;
+                    return SupervisorShutdown {
+                        stage: BridgeShutdownStage::Consumers,
+                        failure: Some(BridgeShutdownFailure::ClientFailure),
+                    };
                 }
                 let delivered = *lifecycle_rx.borrow_and_update();
 
@@ -859,6 +1185,7 @@ async fn run_client_supervisor(
                                         diagnostics: diagnostics.clone(),
                                         local_node_id: local_node_id.clone(),
                                         signal_tx: signal_tx.clone(),
+                                        readiness: readiness.clone(),
                                     },
                                     next_generation_id,
                                 ).await;
@@ -884,7 +1211,12 @@ async fn run_client_supervisor(
                 }
             }
             signal = signal_rx.recv() => {
-                let Some(signal) = signal else { return; };
+                let Some(signal) = signal else {
+                    return SupervisorShutdown {
+                        stage: BridgeShutdownStage::Consumers,
+                        failure: Some(BridgeShutdownFailure::ClientFailure),
+                    };
+                };
                 match signal {
                     ClientSignal::GenerationEnded { generation_id } => {
                         let Some(action) = ended_generation_action(
@@ -925,6 +1257,7 @@ async fn run_client_supervisor(
                                     diagnostics: diagnostics.clone(),
                                     local_node_id: local_node_id.clone(),
                                     signal_tx: signal_tx.clone(),
+                                    readiness: readiness.clone(),
                                 },
                                 next_generation_id,
                             ).await;
@@ -943,7 +1276,10 @@ async fn run_client_supervisor(
             }
             slow_consumer = slow_consumer_rx.recv() => {
                 if slow_consumer.is_none() {
-                    return;
+                    return SupervisorShutdown {
+                        stage: BridgeShutdownStage::Consumers,
+                        failure: Some(BridgeShutdownFailure::ClientFailure),
+                    };
                 }
                 if let Some(action) = handle_slow_consumer(
                     &stats,
@@ -1002,6 +1338,7 @@ async fn build_subscription_generation(
         diagnostics,
         local_node_id,
         signal_tx,
+        readiness,
     } = inputs;
     let mut subscribers = Vec::with_capacity(config.mappings().len());
     for mapping in config.mappings() {
@@ -1021,6 +1358,7 @@ async fn build_subscription_generation(
                 stats.clone(),
                 diagnostics.clone(),
                 local_node_id.clone(),
+                readiness.clone(),
             ));
         }
         if readers.next().await.is_some() {
@@ -1042,8 +1380,12 @@ async fn read_subscription(
     stats: IngressStats,
     diagnostics: IngressDiagnostics,
     local_node_id: String,
+    readiness: BridgeReadiness,
 ) {
     while let Some(message) = subscriber.next().await {
+        if !readiness.snapshot().accepting {
+            break;
+        }
         if has_exact_own_origin(&message.headers, &local_node_id) {
             stats.record_self_suppressed();
             continue;
@@ -1230,6 +1572,127 @@ mod tests {
     use crate::nats_bridge::config::BridgeConfig;
     use crate::nats_bridge::ingress::INGRESS_QUEUE_CAPACITY;
     use async_nats::HeaderMap;
+
+    fn synthetic_shutdown_handle(
+        timeout: Duration,
+        supervisor: impl FnOnce(watch::Receiver<Option<Instant>>) -> JoinHandle<SupervisorShutdown>,
+        producer_tasks: Vec<JoinHandle<()>>,
+        consumer_tasks: Vec<JoinHandle<()>>,
+    ) -> BridgeRuntimeHandle {
+        let readiness = BridgeReadiness::new([async_nats::Subject::from("shutdown.test")]);
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        let lifecycle = LifecycleControl::new(readiness.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        BridgeRuntimeHandle {
+            readiness,
+            lifecycle,
+            task: Some(supervisor(shutdown_rx)),
+            producer_tasks,
+            consumer_tasks,
+            shutdown_tx,
+            reconcile_trigger: None,
+            exclusion: None,
+            delivery: None,
+            stats: IngressStats::default(),
+            _egress_stats: EgressStats::default(),
+            _reconcile_stats: ReconcileStats::default(),
+            shutdown_timeout: timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanly_quiesces_and_joins_all_controlled_tasks() {
+        let producer = tokio::spawn(pending::<()>());
+        let consumer = tokio::spawn(async {});
+        let mut handle = synthetic_shutdown_handle(
+            Duration::from_secs(1),
+            |mut rx| {
+                tokio::spawn(async move {
+                    rx.changed().await.unwrap();
+                    SupervisorShutdown {
+                        stage: BridgeShutdownStage::Complete,
+                        failure: None,
+                    }
+                })
+            },
+            vec![producer],
+            vec![consumer],
+        );
+        let readiness = handle.readiness().clone();
+        let report = handle.shutdown().await.unwrap();
+        assert!(report.is_clean());
+        assert!(!readiness.snapshot().accepting);
+        assert_eq!(report.joined_tasks, 3);
+        assert_eq!(report.aborted_tasks, 0);
+        assert!(handle.task.is_none());
+        assert!(handle.producer_tasks.is_empty());
+        assert!(handle.consumer_tasks.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_timeout_uses_one_absolute_deadline_and_aborts_then_joins() {
+        let mut handle = synthetic_shutdown_handle(
+            Duration::from_secs(10),
+            |_rx| tokio::spawn(pending::<SupervisorShutdown>()),
+            vec![],
+            vec![tokio::spawn(pending::<()>())],
+        );
+        let shutdown = tokio::spawn(async move { handle.shutdown().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let error = shutdown.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.report.failure,
+            Some(BridgeShutdownFailure::DeadlineExceeded)
+        );
+        assert_eq!(error.report.aborted_tasks, 2);
+        assert_eq!(error.report.joined_tasks, 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_task_panic_is_typed_and_payload_safe() {
+        let mut handle = synthetic_shutdown_handle(
+            Duration::from_secs(1),
+            |_rx| tokio::spawn(async { panic!("secret payload must not escape") }),
+            vec![],
+            vec![],
+        );
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(
+            error.report.failure,
+            Some(BridgeShutdownFailure::TaskPanicked)
+        );
+        assert_eq!(
+            error.to_string(),
+            "NATS bridge shutdown did not complete cleanly"
+        );
+        assert!(!format!("{error:?} {error}").contains("secret payload"));
+    }
+
+    struct UnjoinedLedger;
+
+    impl LedgerJoin for UnjoinedLedger {
+        fn join_worker(self) -> Result<(), LedgerError> {
+            Err(LedgerError::IoUnjoined)
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_ledger_io_unjoined_can_never_be_clean() {
+        let failure = join_ledger_worker(
+            Some(UnjoinedLedger),
+            LedgerWorkerKind::Delivery,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(
+            failure,
+            Some(BridgeShutdownFailure::LedgerIoUnjoined(
+                LedgerWorkerKind::Delivery
+            ))
+        );
+    }
 
     #[tokio::test]
     async fn runtime_try_spawn_rejects_invalid_origin_identity_before_nats_tasks() {

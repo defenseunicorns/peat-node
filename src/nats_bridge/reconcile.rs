@@ -90,7 +90,6 @@ impl ReconcileTrigger {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn close(&self) {
         self.closed.store(true, Ordering::Release);
         self.pending.store(false, Ordering::Release);

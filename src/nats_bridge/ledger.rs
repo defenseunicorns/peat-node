@@ -324,9 +324,17 @@ impl LocalExclusionLedger {
         ))
     }
 
+    pub(crate) fn request_stop(&self) {
+        self.worker.request_stop();
+    }
+
+    pub(crate) fn join(&self) -> Result<(), LedgerError> {
+        self.worker.join()
+    }
+
     #[cfg(test)]
     pub(crate) fn stop_for_test(&self) {
-        self.worker.request_stop();
+        self.request_stop();
     }
 
     #[cfg(test)]
@@ -389,8 +397,28 @@ impl DeliveryLedger {
         ))
     }
 
-    pub(crate) fn stop(&self) {
+    pub(crate) fn request_stop(&self) {
         self.worker.request_stop();
+    }
+
+    pub(crate) fn join(&self) -> Result<(), LedgerError> {
+        self.worker.join()
+    }
+
+    pub(crate) fn stop(&self) {
+        self.request_stop();
+    }
+
+    #[cfg(test)]
+    fn cooperative_block_for_test(
+        &self,
+        entered: std_mpsc::Sender<()>,
+        release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    ) {
+        self.worker
+            .sender
+            .try_send(Command::CooperativeBlock { entered, release })
+            .unwrap_or_else(|_| panic!("test command queue should accept cooperative block"));
     }
 }
 
@@ -1154,6 +1182,21 @@ mod tests {
         exclusion.stop_for_test();
         exclusion.join_for_test().unwrap();
         ledger.delivery.worker.join().unwrap();
+    }
+
+    #[test]
+    fn cooperative_delivery_block_observes_stop_and_both_workers_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = BridgeLedger::open(dir.path()).unwrap();
+        let delivery = ledger.delivery();
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        delivery.cooperative_block_for_test(entered_tx, release);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("delivery worker reaches injected cooperative block");
+        ledger.request_stop();
+        ledger.join().unwrap();
     }
 
     #[test]
