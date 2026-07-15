@@ -5,7 +5,7 @@
 //! instead of layering a competing outer dial loop over it.
 
 use std::future::pending;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_nats::{Client, ConnectOptions, Event, Request, RequestErrorKind, Subscriber};
@@ -70,6 +70,8 @@ impl Default for LifecycleSnapshot {
 struct LifecycleControl {
     tx: watch::Sender<LifecycleSnapshot>,
     readiness: BridgeReadiness,
+    // Callback invalidation and barrier validation/commit must be one transition.
+    transition_lock: Arc<Mutex<()>>,
 }
 
 impl LifecycleControl {
@@ -77,6 +79,7 @@ impl LifecycleControl {
         Self {
             tx: watch::channel(LifecycleSnapshot::default()).0,
             readiness,
+            transition_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -89,6 +92,10 @@ impl LifecycleControl {
     }
 
     fn delivered(&self, event: DeliveredLifecycleEvent) {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match event {
             DeliveredLifecycleEvent::Connected => {
                 self.readiness.set_connected();
@@ -122,6 +129,19 @@ impl LifecycleControl {
                 DeliveredLifecycleEvent::Initial => {}
             }
         });
+    }
+
+    fn commit_barrier(&self, tags: BarrierTags, generation_id: Option<u64>) -> bool {
+        let _transition = self
+            .transition_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !barrier_tags_match(tags, self.snapshot(), generation_id) {
+            return false;
+        }
+        self.readiness
+            .mark_all_subscriptions_established()
+            .became_ready()
     }
 }
 
@@ -411,12 +431,12 @@ impl BarrierAttempt {
 fn barrier_tags_match(
     tags: BarrierTags,
     lifecycle: LifecycleSnapshot,
-    generation: Option<&SubscriptionGeneration>,
+    generation_id: Option<u64>,
 ) -> bool {
     lifecycle.connected
         && lifecycle.connection_epoch == tags.connection_epoch
         && lifecycle.invalidation_epoch == tags.invalidation_epoch
-        && generation.is_some_and(|current| current.id == tags.generation_id)
+        && generation_id == Some(tags.generation_id)
 }
 
 fn barrier_allowed_after_latest_delivery(lifecycle: LifecycleSnapshot) -> bool {
@@ -720,12 +740,10 @@ async fn run_client_supervisor(
                 let attempt = barrier.take().expect("completed barrier remains present");
                 let succeeded = result.unwrap_or(false);
                 if succeeded
-                    && barrier_tags_match(
+                    && lifecycle.commit_barrier(
                         attempt.tags,
-                        lifecycle.snapshot(),
-                        generation.as_ref(),
+                        generation.as_ref().map(|current| current.id),
                     )
-                    && readiness.mark_all_subscriptions_established().became_ready()
                 {
                     LifecycleAction::status(
                         LifecycleReason::Ready,
@@ -1110,28 +1128,74 @@ mod tests {
             generation_id: generation.id,
         };
 
-        assert!(barrier_tags_match(tags, current, Some(&generation)));
+        assert!(barrier_tags_match(tags, current, Some(generation.id)));
         assert!(!barrier_tags_match(
             BarrierTags {
                 connection_epoch: tags.connection_epoch.saturating_add(1),
                 ..tags
             },
             current,
-            Some(&generation),
+            Some(generation.id),
         ));
         lifecycle.delivered(DeliveredLifecycleEvent::Error);
         assert!(!barrier_tags_match(
             tags,
             lifecycle.snapshot(),
-            Some(&generation),
+            Some(generation.id),
         ));
         lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
         assert!(!barrier_tags_match(
             tags,
             lifecycle.snapshot(),
-            Some(&generation),
+            Some(generation.id),
         ));
         generation.stop().await;
+    }
+
+    #[test]
+    fn delivered_error_and_stale_barrier_commit_share_one_transition_boundary() {
+        let config = enabled_config();
+        let readiness = BridgeReadiness::new(
+            config
+                .mappings()
+                .iter()
+                .map(|mapping| mapping.subject().clone()),
+        );
+        let lifecycle = LifecycleControl::new(readiness.clone());
+
+        for generation_id in 1..=64 {
+            lifecycle.delivered(DeliveredLifecycleEvent::Connected);
+            let current = lifecycle.snapshot();
+            let tags = BarrierTags {
+                connection_epoch: current.connection_epoch,
+                invalidation_epoch: current.invalidation_epoch,
+                generation_id,
+            };
+            let start = Arc::new(std::sync::Barrier::new(3));
+
+            let error_lifecycle = lifecycle.clone();
+            let error_start = Arc::clone(&start);
+            let error = std::thread::spawn(move || {
+                error_start.wait();
+                error_lifecycle.delivered(DeliveredLifecycleEvent::Error);
+            });
+
+            let barrier_lifecycle = lifecycle.clone();
+            let barrier_start = Arc::clone(&start);
+            let barrier = std::thread::spawn(move || {
+                barrier_start.wait();
+                barrier_lifecycle.commit_barrier(tags, Some(generation_id));
+            });
+
+            start.wait();
+            error.join().expect("delivered error thread should finish");
+            barrier.join().expect("barrier commit thread should finish");
+
+            let status = readiness.snapshot();
+            assert!(status.connected);
+            assert!(status.established_subjects.is_empty());
+            assert!(!status.is_ready());
+        }
     }
 
     #[tokio::test]
