@@ -17,7 +17,10 @@ use tracing::{error, info, warn};
 
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::identity;
-use peat_node::nats_bridge::config::{BridgeConfig, EnabledBridgeConfig};
+use peat_node::nats_bridge::config::{
+    BridgeConfig, EnabledBridgeConfig, DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS,
+    MAX_NATS_SHUTDOWN_TIMEOUT_SECS,
+};
 use peat_node::nats_bridge::runtime::{BridgeRuntime, BridgeRuntimeHandle};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
@@ -73,6 +76,15 @@ struct Args {
         value_delimiter = ','
     )]
     nats_mapping: Vec<String>,
+
+    /// Total time allowed for all NATS bridge shutdown stages.
+    #[arg(
+        long,
+        env = "PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS",
+        default_value_t = DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=MAX_NATS_SHUTDOWN_TIMEOUT_SECS)
+    )]
+    nats_shutdown_timeout_secs: u64,
 
     /// Peers to connect to on startup, in `endpoint_id@host:port` form.
     /// The `@host:port` suffix is required (the n0 public relay is no longer
@@ -401,10 +413,11 @@ async fn start_bridge_runtime_with<N, T, F, Fut>(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<N>,
+    shutdown_timeout: Duration,
     spawn: F,
 ) -> anyhow::Result<Option<T>>
 where
-    F: FnOnce(EnabledBridgeConfig, String, Arc<N>) -> Fut,
+    F: FnOnce(EnabledBridgeConfig, String, Arc<N>, Duration) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     match bridge_config {
@@ -412,7 +425,9 @@ where
             info!("NATS bridge disabled — no --nats-mapping configured");
             Ok(None)
         }
-        BridgeConfig::Enabled(config) => spawn(config, node_id, node).await.map(Some),
+        BridgeConfig::Enabled(config) => spawn(config, node_id, node, shutdown_timeout)
+            .await
+            .map(Some),
     }
 }
 
@@ -420,8 +435,16 @@ async fn start_bridge_runtime(
     bridge_config: BridgeConfig,
     node_id: String,
     node: Arc<SidecarNode>,
+    shutdown_timeout: Duration,
 ) -> anyhow::Result<Option<BridgeRuntimeHandle>> {
-    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::try_spawn).await
+    start_bridge_runtime_with(
+        bridge_config,
+        node_id,
+        node,
+        shutdown_timeout,
+        BridgeRuntime::try_spawn,
+    )
+    .await
 }
 
 #[tokio::main]
@@ -592,8 +615,13 @@ async fn main() -> anyhow::Result<()> {
     // The disabled branch constructs no NATS state. The enabled constructor
     // spawns one supervisor and returns before its first broker dial, keeping
     // Peat/RPC startup independent of local broker availability.
-    let _bridge_runtime =
-        start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node)).await?;
+    let _bridge_runtime = start_bridge_runtime(
+        bridge_config,
+        node_id.clone(),
+        Arc::clone(&node),
+        Duration::from_secs(args.nats_shutdown_timeout_secs),
+    )
+    .await?;
 
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
@@ -722,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use std::ffi::OsString;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use clap::Parser;
 
@@ -802,6 +831,32 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn nats_shutdown_timeout_defaults_and_accepts_inclusive_bounds() {
+        let default = Args::try_parse_from(["peat-node"]).expect("default arguments parse");
+        assert_eq!(default.nats_shutdown_timeout_secs, 10);
+        for value in ["1", "300"] {
+            let args = Args::try_parse_from(["peat-node", "--nats-shutdown-timeout-secs", value])
+                .expect("inclusive shutdown bound parses");
+            assert_eq!(args.nats_shutdown_timeout_secs.to_string(), value);
+        }
+        for value in ["0", "301"] {
+            assert!(
+                Args::try_parse_from(["peat-node", "--nats-shutdown-timeout-secs", value,])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_shutdown_timeout_accepts_environment_value() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS", "29");
+        let args = Args::try_parse_from(["peat-node"]).expect("environment timeout parses");
+        assert_eq!(args.nats_shutdown_timeout_secs, 29);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn nats_mapping_accepts_comma_delimited_environment_values() {
         let _restore = EnvRestore::set("PEAT_NODE_NATS_MAPPING", "a=one,b=two");
         let args = Args::try_parse_from(["peat-node"]).expect("environment mappings should parse");
@@ -852,6 +907,7 @@ mod tests {
             let rendered = format!("{:#?}", redacted_resolved_args(&args, &config));
 
             assert!(rendered.contains("<redacted>"));
+            assert!(rendered.contains("nats_shutdown_timeout_secs: 10"));
             for secret in [
                 "alice",
                 "password",
@@ -920,7 +976,8 @@ mod tests {
             config,
             "disabled-node".to_owned(),
             Arc::clone(&node),
-            |_, _, _| {
+            Duration::from_secs(10),
+            |_, _, _, _| {
                 calls.set(calls.get() + 1);
                 std::future::ready(Ok(()))
             },
@@ -954,7 +1011,8 @@ mod tests {
             config,
             expected_node_id.clone(),
             Arc::clone(&node),
-            |actual_config, actual_node_id, actual_node| {
+            Duration::from_secs(37),
+            |actual_config, actual_node_id, actual_node, actual_timeout| {
                 calls.set(calls.get() + 1);
                 assert_eq!(actual_config.endpoint().to_string(), "nats://127.0.0.1:9");
                 assert_eq!(actual_config.mappings().len(), 1);
@@ -965,6 +1023,7 @@ mod tests {
                 assert_eq!(actual_config.mappings()[0].collection(), "frames");
                 assert_eq!(actual_node_id, expected_node_id);
                 assert!(Arc::ptr_eq(&actual_node, &node));
+                assert_eq!(actual_timeout, Duration::from_secs(37));
                 std::future::ready(Ok("spawned"))
             },
         )
@@ -986,7 +1045,8 @@ mod tests {
             config,
             "awaited-node".to_owned(),
             Arc::new(()),
-            move |_, _, _| async move {
+            Duration::from_secs(10),
+            move |_, _, _, _| async move {
                 entered_tx.send(()).unwrap();
                 release_rx.await.unwrap();
                 Ok("spawned")

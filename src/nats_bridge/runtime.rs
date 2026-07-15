@@ -284,6 +284,7 @@ pub struct BridgeRuntimeHandle {
     stats: IngressStats,
     _egress_stats: EgressStats,
     _reconcile_stats: ReconcileStats,
+    shutdown_timeout: Duration,
 }
 
 /// Public, label-free subset of remote publication outcomes.
@@ -326,6 +327,11 @@ impl BridgeRuntimeHandle {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished() || self.support_tasks.iter().any(JoinHandle::is_finished)
     }
+
+    /// One total budget shared by every shutdown stage.
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
+    }
 }
 
 /// Enabled-only runtime constructor.
@@ -348,6 +354,7 @@ impl BridgeRuntime {
                 exclusion_healthy: true,
                 delivery_healthy: true,
             },
+            Duration::from_secs(10),
         )
     }
 
@@ -357,7 +364,7 @@ impl BridgeRuntime {
         source_node_id: String,
         node: Arc<SidecarNode>,
     ) -> BridgeRuntimeHandle {
-        Self::try_spawn(config, source_node_id, node)
+        Self::try_spawn(config, source_node_id, node, Duration::from_secs(10))
             .await
             .expect("bridge runtime requires startup-validated node identity")
     }
@@ -367,6 +374,7 @@ impl BridgeRuntime {
         config: EnabledBridgeConfig,
         source_node_id: String,
         node: Arc<SidecarNode>,
+        shutdown_timeout: Duration,
     ) -> anyhow::Result<BridgeRuntimeHandle> {
         let local_node_id = node.node_id().to_owned();
         let origin_header_value = validate_bridge_node_identity(&local_node_id)
@@ -427,6 +435,7 @@ impl BridgeRuntime {
                 }),
             vec![ingress_task],
             ledger_health,
+            shutdown_timeout,
         );
         Ok(handle)
     }
@@ -438,6 +447,7 @@ impl BridgeRuntime {
         egress: Option<EgressSetup>,
         mut support_tasks: Vec<JoinHandle<()>>,
         ledger_health: BridgeLedgerHealth,
+        shutdown_timeout: Duration,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -531,6 +541,7 @@ impl BridgeRuntime {
             stats,
             _egress_stats: handle_egress_stats,
             _reconcile_stats: reconcile_stats,
+            shutdown_timeout,
         }
     }
 }
@@ -1238,6 +1249,7 @@ mod tests {
             enabled_config(),
             "invalid\norigin".to_owned(),
             Arc::clone(&node),
+            Duration::from_secs(10),
         )
         .await;
         let Err(error) = result else {

@@ -13,6 +13,10 @@ use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
 
 const DEFAULT_NATS_PORT: u16 = 4222;
 pub(crate) const MAX_BRIDGE_IDENTITY_BYTES: usize = 1_024;
+/// Default total budget for every bridge shutdown stage.
+pub const DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+/// Largest operator-configurable total bridge shutdown budget.
+pub const MAX_NATS_SHUTDOWN_TIMEOUT_SECS: u64 = 300;
 
 /// Validated bridge configuration.
 pub enum BridgeConfig {
@@ -482,6 +486,12 @@ fn valid_collection(collection: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_timeout_constants_are_exact_and_bounded() {
+        assert_eq!(DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS, 10);
+        assert_eq!(MAX_NATS_SHUTDOWN_TIMEOUT_SECS, 300);
+    }
 
     fn mapping() -> Vec<String> {
         vec!["vision.summary=frames".to_owned()]
