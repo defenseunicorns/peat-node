@@ -1086,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_flush_completion_is_durable_and_exact() {
-        let (_dir, delivery) = journals();
+        let (dir, delivery) = journals();
         let readiness = ready();
         let stats = EgressStats::default();
         let (coordinator, rx) = DeliveryCoordinator::new(
@@ -1130,6 +1130,31 @@ mod tests {
             .await
             .unwrap());
         assert_eq!(stats.snapshot().published, 1);
+
+        delivery.request_stop();
+        delivery.join().unwrap();
+        drop(delivery);
+        let reopened = crate::nats_bridge::ledger::BridgeLedger::open(dir.path()).unwrap();
+        let restarted_stats = EgressStats::default();
+        let (restarted, mut restarted_rx) = DeliveryCoordinator::new(
+            &mappings(),
+            "local-node",
+            restarted_stats.clone(),
+            reopened.delivery(),
+            ready(),
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                restarted
+                    .deliver(event_with_id("Frame_Store-1", "complete", &valid))
+                    .await,
+                Err(EgressActionKind::Skipped(EgressSkipKind::Duplicate))
+            );
+        }
+        assert!(restarted_rx.try_recv().is_err());
+        assert_eq!(restarted_stats.snapshot().published, 0);
+        assert_eq!(restarted_stats.snapshot().duplicate, 3);
+        reopened.join().unwrap();
     }
 
     #[tokio::test]
