@@ -267,6 +267,26 @@ continue. The allowance preserves a 1,048,576-byte ingress payload even when
 its JSON string needs escaping in the durable envelope while preventing the
 broadcast from retaining attacker-sized documents or identities. The egress
 FIFO retains at most 256 eligible payloads of at most 1,048,576 bytes each.
+Collection, document, and immediate-peer identity limits are checked before
+the bridge reads the store. Before recursive Automerge-to-JSON hydration, the
+bridge also rejects a `save_nocompress()` representation larger than 8 MiB.
+This prevents an oversized current document from creating an unbounded JSON
+Value tree and serialized event string.
+
+The pinned peat-mesh/Automerge API has an explicit residual limitation:
+`DocChange` carries only a key and origin, `AutomergeStore::get()` deep-clones
+the cached document, and there is no borrowed store read, encoded-size
+metadata, bounded iterator, or limited serializer. `save_nocompress()` itself
+also returns a newly allocated full-document vector. Consequently those two
+pre-gate transient allocations can scale with an attacker-controlled stored
+document even though they are dropped immediately and never enter bridge
+queues. A current-thread allocator regression uses a 16 MiB forged remote
+document to bound observed amplification to four document sizes plus 1 MiB,
+prove no more than 1 MiB remains live after rejection, and verify a later
+valid event continues. Eliminating the two inherited transient allocations
+requires a new bounded/borrowed peat-mesh store API and is not an RSS or
+whole-process memory guarantee.
+
 Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
 queue-closed, unavailable-client, publish, and negotiated `max_payload`
 failures are terminal losses for that document; later events continue. There

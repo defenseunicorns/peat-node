@@ -283,6 +283,12 @@ const BRIDGE_CHANGE_CAPACITY: usize = 256;
 // broadcast ring.
 const MAX_BRIDGE_EVENT_JSON_BYTES: usize = 2 * 1_048_576 + 4_096;
 const MAX_BRIDGE_EVENT_IDENTITY_BYTES: usize = 1_024;
+// Pinned Automerge exposes no borrowed store read or encoded-size metadata:
+// `AutomergeStore::get` deep-clones the cached document. A no-compression save
+// is therefore the earliest available representation-size gate before the
+// bridge recursively hydrates a serde_json::Value. The temporary save itself
+// is an inherited full-document allocation; see the forwarder comment.
+const MAX_BRIDGE_AUTOMERGE_BYTES: usize = 8 * 1_048_576;
 const LOCAL_REVISION_CAPACITY: usize = 4096;
 const MAX_REVISION_HEADS: usize = 64;
 const REVISION_DIGEST_DOMAIN: &[u8] = b"peat-node:local-revision:v1";
@@ -1401,7 +1407,25 @@ impl SidecarNode {
                     key,
                     origin: ChangeOrigin::Remote(remote_peer_id),
                 }) => {
-                    let snapshot = {
+                    // Reject attacker-controlled identities before the store
+                    // read. The pinned notification contains no snapshot or
+                    // encoded size, so this is the only admission work
+                    // possible without materializing the current document.
+                    let Some((collection, doc_id)) = key.split_once(':') else {
+                        warn!("bridge snapshot key classification failed");
+                        continue;
+                    };
+                    if collection.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                        || doc_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                        || remote_peer_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                    {
+                        warn!("bridge change exceeds retained identity bounds");
+                        continue;
+                    }
+                    let collection = collection.to_owned();
+                    let doc_id = doc_id.to_owned();
+
+                    let doc = {
                         let _key_guard = store.lock_doc(&key);
                         let doc = match store.get(&key) {
                             Ok(Some(doc)) => doc,
@@ -1420,13 +1444,26 @@ impl SidecarNode {
                         if locally_authored {
                             continue;
                         }
-                        automerge_to_json(&doc)
+                        doc
                     };
 
-                    let Some((collection, doc_id)) = key.split_once(':') else {
-                        warn!("bridge snapshot key classification failed");
+                    // `save_nocompress` is the earliest size signal available
+                    // from Automerge 0.9.0 and prevents an oversized document
+                    // from entering recursive Value hydration/JSON encoding.
+                    // It allocates one full encoded Vec, as does pinned
+                    // `AutomergeStore::get` when it deep-clones a cache hit;
+                    // neither upstream API offers a borrowed/chunked/limited
+                    // alternative. Those two transient allocations can scale
+                    // with an attacker document, but the bridge adds no
+                    // unbounded Value tree or serialized String after this
+                    // gate and retains neither allocation.
+                    let encoded = doc.save_nocompress();
+                    if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
+                        warn!("bridge document exceeds processing bound");
                         continue;
-                    };
+                    }
+                    drop(encoded);
+                    let snapshot = automerge_to_json(&doc);
                     let json_data = if let Some(encrypted) = snapshot
                         .get("value")
                         .and_then(|value| value.as_str())
@@ -1459,18 +1496,14 @@ impl SidecarNode {
                     // serialized document into the 256-slot broadcast ring.
                     // Oversized events fail closed; the listener remains live
                     // for later valid remote changes.
-                    if json_data.len() > MAX_BRIDGE_EVENT_JSON_BYTES
-                        || collection.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
-                        || doc_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
-                        || remote_peer_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
-                    {
+                    if json_data.len() > MAX_BRIDGE_EVENT_JSON_BYTES {
                         warn!("bridge change exceeds retained event bounds");
                         continue;
                     }
 
                     let _ = tx.send(BridgeChangeEvent {
-                        collection: collection.to_owned(),
-                        doc_id: doc_id.to_owned(),
+                        collection,
+                        doc_id,
                         remote_peer_id,
                         json_data,
                     });
@@ -2009,6 +2042,80 @@ mod tests {
     use super::*;
     use crate::nats_bridge::config::{BridgeConfig, BridgeConfigIssueKind};
     use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static BRIDGE_ALLOC_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static BRIDGE_ALLOC_CURRENT: Cell<i128> = const { Cell::new(0) };
+        static BRIDGE_ALLOC_HIGH_WATER: Cell<i128> = const { Cell::new(0) };
+    }
+
+    struct BridgeTestAllocator;
+
+    fn adjust_bridge_alloc(delta: i128) {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| {
+            if !enabled.get() {
+                return;
+            }
+            BRIDGE_ALLOC_CURRENT.with(|current| {
+                let next = current.get().saturating_add(delta);
+                current.set(next);
+                BRIDGE_ALLOC_HIGH_WATER.with(|high_water| {
+                    high_water.set(high_water.get().max(next));
+                });
+            });
+        });
+    }
+
+    unsafe impl GlobalAlloc for BridgeTestAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                adjust_bridge_alloc(layout.size() as i128);
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                adjust_bridge_alloc(layout.size() as i128);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+            adjust_bridge_alloc(-(layout.size() as i128));
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+            let replacement = unsafe { System.realloc(pointer, old_layout, new_size) };
+            if !replacement.is_null() {
+                adjust_bridge_alloc(new_size as i128 - old_layout.size() as i128);
+            }
+            replacement
+        }
+    }
+
+    #[global_allocator]
+    static BRIDGE_TEST_ALLOCATOR: BridgeTestAllocator = BridgeTestAllocator;
+
+    fn begin_bridge_alloc_accounting() {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(false));
+        BRIDGE_ALLOC_CURRENT.with(|current| current.set(0));
+        BRIDGE_ALLOC_HIGH_WATER.with(|high_water| high_water.set(0));
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(true));
+    }
+
+    fn finish_bridge_alloc_accounting() -> (i128, i128) {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(false));
+        (
+            BRIDGE_ALLOC_CURRENT.with(Cell::get),
+            BRIDGE_ALLOC_HIGH_WATER.with(Cell::get),
+        )
+    }
 
     async fn test_node(encrypted: bool) -> (tempfile::TempDir, SidecarNode) {
         let dir = tempfile::tempdir().unwrap();
@@ -2252,6 +2359,52 @@ mod tests {
         assert_eq!(event.doc_id, "later-valid");
         assert_eq!(event.json_data, r#"{"valid":true}"#);
         expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_change_large_remote_processing_has_bounded_amplification_and_no_retention() {
+        const FORGED_BYTES: usize = 16 * 1_048_576;
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let forged = serde_json::json!({ "forged": "z".repeat(FORGED_BYTES) });
+        put_remote(
+            &node,
+            "frames:allocator-forged",
+            &serde_json::to_string(&forged).unwrap(),
+            "peer-a",
+        );
+        put_remote(
+            &node,
+            "frames:allocator-valid",
+            r#"{"valid":true}"#,
+            "peer-a",
+        );
+
+        // Both notifications are queued before accounting starts. On this
+        // current-thread runtime, the bridge forwarder executes on this same
+        // allocator-accounted thread when recv() yields. The high-water bound
+        // includes pinned AutomergeStore::get's deep clone and the one
+        // uncompressed size-probe Vec. It excludes fixture/store construction.
+        begin_bridge_alloc_accounting();
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("later valid event must continue")
+            .expect("bridge event channel remains open");
+        let (live_delta, high_water) = finish_bridge_alloc_accounting();
+
+        assert_eq!(event.doc_id, "allocator-valid");
+        assert!(
+            high_water >= FORGED_BYTES as i128,
+            "allocator scope did not observe the forged document: {high_water}"
+        );
+        assert!(
+            high_water <= (FORGED_BYTES * 4 + 1_048_576) as i128,
+            "bridge processing amplified one forged document beyond clone + size probe budget: {high_water}"
+        );
+        assert!(
+            live_delta <= 1_048_576,
+            "oversized bridge processing retained forged-document memory: {live_delta}"
+        );
     }
 
     #[tokio::test]
