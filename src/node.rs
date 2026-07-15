@@ -2235,6 +2235,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bridge_change_public_subscription_keeps_remote_upsert_semantics() {
+        let (_dir, node) = test_node(false).await;
+        let mut public_rx = node.subscribe();
+        let mut bridge_rx = node.subscribe_bridge_changes();
+        put_remote(
+            &node,
+            "frames:public-contract",
+            r#"{"remote":true}"#,
+            "peer-a",
+        );
+
+        let public = tokio::time::timeout(Duration::from_secs(2), public_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(public.collection, "frames");
+        assert_eq!(public.doc_id, "public-contract");
+        assert!(matches!(public.change_type, ChangeType::Upsert));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(public.json_data.as_deref().unwrap())
+                .unwrap(),
+            serde_json::json!({"remote": true})
+        );
+
+        let private = tokio::time::timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(private.remote_peer_id, "peer-a");
+    }
+
+    #[test]
+    fn bridge_change_diagnostics_are_fixed_and_payload_safe() {
+        let source = include_str!("node.rs");
+        let diagnostics: Vec<_> = source
+            .lines()
+            .filter(|line| {
+                line.contains("bridge snapshot") || line.contains("bridge change listener")
+            })
+            .collect();
+        assert!(!diagnostics.is_empty());
+        for line in diagnostics {
+            for forbidden in ["json_data", "remote_peer_id", "ciphertext", "{key}", "%key"] {
+                assert!(
+                    !line.contains(forbidden),
+                    "unsafe bridge diagnostic: {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn bridge_change_reserved_collection_blocks_envelope_shaped_attachment_adversary() {
         let (_dir, node) = test_node(false).await;
         let key = format!("{IROH_DISTRIBUTION_COLLECTION}:adversary");
