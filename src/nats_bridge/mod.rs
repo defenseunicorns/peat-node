@@ -8,5 +8,6 @@ pub mod config;
 pub(crate) mod egress;
 pub mod envelope;
 pub mod ingress;
+pub(crate) mod ledger;
 pub mod readiness;
 pub mod runtime;
