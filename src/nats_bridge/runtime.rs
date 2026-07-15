@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use async_nats::{Client, ConnectOptions, Event, Request, RequestErrorKind, Subscriber};
 use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -29,6 +29,100 @@ const SLOW_CONSUMER_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const SUPERVISOR_SIGNAL_CAPACITY: usize = 64;
 const READINESS_BARRIER_SUBJECT: &str = "_PEAT.NATS_BRIDGE.READINESS";
 const READINESS_BARRIER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Last lifecycle event delivered by async-nats to the bridge callback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveredLifecycleEvent {
+    Initial,
+    Connected,
+    Disconnected,
+    Error,
+}
+
+/// Payload-safe, monotonic callback-delivery diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifecycleSnapshot {
+    pub sequence: u64,
+    pub connection_epoch: u64,
+    pub invalidation_epoch: u64,
+    pub connected: bool,
+    pub last_event: DeliveredLifecycleEvent,
+    connected_sequence: u64,
+    invalidation_sequence: u64,
+}
+
+impl Default for LifecycleSnapshot {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            connection_epoch: 0,
+            invalidation_epoch: 0,
+            connected: false,
+            last_event: DeliveredLifecycleEvent::Initial,
+            connected_sequence: 0,
+            invalidation_sequence: 0,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct LifecycleControl {
+    tx: watch::Sender<LifecycleSnapshot>,
+    readiness: BridgeReadiness,
+}
+
+impl LifecycleControl {
+    fn new(readiness: BridgeReadiness) -> Self {
+        Self {
+            tx: watch::channel(LifecycleSnapshot::default()).0,
+            readiness,
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<LifecycleSnapshot> {
+        self.tx.subscribe()
+    }
+
+    fn snapshot(&self) -> LifecycleSnapshot {
+        *self.tx.borrow()
+    }
+
+    fn delivered(&self, event: DeliveredLifecycleEvent) {
+        match event {
+            DeliveredLifecycleEvent::Connected => {
+                self.readiness.set_connected();
+            }
+            DeliveredLifecycleEvent::Disconnected => {
+                self.readiness.mark_disconnected();
+            }
+            DeliveredLifecycleEvent::Error => {
+                self.readiness.invalidate_subscription_generation();
+            }
+            DeliveredLifecycleEvent::Initial => return,
+        }
+        self.tx.send_modify(|state| {
+            state.sequence = state.sequence.saturating_add(1);
+            state.last_event = event;
+            match event {
+                DeliveredLifecycleEvent::Connected => {
+                    state.connection_epoch = state.connection_epoch.saturating_add(1);
+                    state.connected = true;
+                    state.connected_sequence = state.sequence;
+                }
+                DeliveredLifecycleEvent::Disconnected => {
+                    state.invalidation_epoch = state.invalidation_epoch.saturating_add(1);
+                    state.connected = false;
+                    state.invalidation_sequence = state.sequence;
+                }
+                DeliveredLifecycleEvent::Error => {
+                    state.invalidation_epoch = state.invalidation_epoch.saturating_add(1);
+                    state.invalidation_sequence = state.sequence;
+                }
+                DeliveredLifecycleEvent::Initial => {}
+            }
+        });
+    }
+}
 
 /// Stable reason values for credential-safe lifecycle events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +250,7 @@ impl LifecycleAction {
 /// Process-lifetime handle to the single bridge supervisor task.
 pub struct BridgeRuntimeHandle {
     readiness: BridgeReadiness,
+    lifecycle: LifecycleControl,
     task: JoinHandle<()>,
     stats: IngressStats,
 }
@@ -169,6 +264,11 @@ impl BridgeRuntimeHandle {
     /// Label-free ingress counters for operational and integration evidence.
     pub fn stats(&self) -> &IngressStats {
         &self.stats
+    }
+
+    /// Observe only lifecycle events that reached the bridge callback.
+    pub fn lifecycle_snapshot(&self) -> LifecycleSnapshot {
+        self.lifecycle.snapshot()
     }
 
     /// Whether the supervisor has unexpectedly terminated.
@@ -227,6 +327,7 @@ impl BridgeRuntime {
                 .iter()
                 .map(|mapping| mapping.subject().clone()),
         );
+        let lifecycle = LifecycleControl::new(readiness.clone());
 
         LifecycleAction::status(
             LifecycleReason::Starting,
@@ -237,6 +338,7 @@ impl BridgeRuntime {
         .emit();
 
         let task_readiness = readiness.clone();
+        let task_lifecycle = lifecycle.clone();
         let task_host = nats_host.clone();
         let task_stats = stats.clone();
         let task = tokio::spawn(async move {
@@ -245,6 +347,7 @@ impl BridgeRuntime {
                 task_host,
                 nats_port,
                 task_readiness,
+                task_lifecycle,
                 config,
                 ingress_tx,
                 task_stats,
@@ -254,6 +357,7 @@ impl BridgeRuntime {
 
         BridgeRuntimeHandle {
             readiness,
+            lifecycle,
             task,
             stats,
         }
@@ -262,16 +366,46 @@ impl BridgeRuntime {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ClientSignal {
-    Connected,
-    Disconnected,
-    Unavailable,
-    SlowConsumer,
     GenerationEnded { generation_id: u64 },
 }
 
 struct SubscriptionGeneration {
     id: u64,
     task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BarrierTags {
+    connection_epoch: u64,
+    invalidation_epoch: u64,
+    generation_id: u64,
+}
+
+struct BarrierAttempt {
+    tags: BarrierTags,
+    task: JoinHandle<bool>,
+}
+
+impl BarrierAttempt {
+    async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+fn barrier_tags_match(
+    tags: BarrierTags,
+    lifecycle: LifecycleSnapshot,
+    generation: Option<&SubscriptionGeneration>,
+) -> bool {
+    lifecycle.connected
+        && lifecycle.connection_epoch == tags.connection_epoch
+        && lifecycle.invalidation_epoch == tags.invalidation_epoch
+        && generation.is_some_and(|current| current.id == tags.generation_id)
+}
+
+fn barrier_allowed_after_latest_delivery(lifecycle: LifecycleSnapshot) -> bool {
+    lifecycle.connected && lifecycle.connected_sequence > lifecycle.invalidation_sequence
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,13 +459,16 @@ async fn run_client_supervisor(
     nats_host: String,
     nats_port: u16,
     readiness: BridgeReadiness,
+    lifecycle: LifecycleControl,
     config: EnabledBridgeConfig,
     ingress_tx: Option<IngressSender>,
     stats: IngressStats,
 ) {
     let (signal_tx, mut signal_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
+    let (slow_consumer_tx, mut slow_consumer_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
+    let mut lifecycle_rx = lifecycle.subscribe();
     let retry_host = nats_host.clone();
-    let event_signal_tx = signal_tx.clone();
+    let event_lifecycle = lifecycle.clone();
     let options = ConnectOptions::new()
         .retry_on_initial_connect()
         .max_reconnects(None)
@@ -343,19 +480,23 @@ async fn run_client_supervisor(
             delay
         })
         .event_callback(move |event| {
-            let signal_tx = event_signal_tx.clone();
+            let lifecycle = event_lifecycle.clone();
+            let slow_consumer_tx = slow_consumer_tx.clone();
             async move {
-                let signal = match event {
-                    Event::Connected => Some(ClientSignal::Connected),
-                    Event::Disconnected | Event::Closed => Some(ClientSignal::Disconnected),
-                    Event::ClientError(_) | Event::ServerError(_) => {
-                        Some(ClientSignal::Unavailable)
+                match event {
+                    Event::Connected => {
+                        lifecycle.delivered(DeliveredLifecycleEvent::Connected);
                     }
-                    Event::SlowConsumer(_) => Some(ClientSignal::SlowConsumer),
-                    _ => None,
-                };
-                if let Some(signal) = signal {
-                    let _ = signal_tx.send(signal).await;
+                    Event::Disconnected | Event::Closed => {
+                        lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
+                    }
+                    Event::ClientError(_) | Event::ServerError(_) => {
+                        lifecycle.delivered(DeliveredLifecycleEvent::Error);
+                    }
+                    Event::SlowConsumer(_) => {
+                        let _ = slow_consumer_tx.try_send(());
+                    }
+                    _ => {}
                 }
             }
         });
@@ -376,59 +517,32 @@ async fn run_client_supervisor(
     let mut slow_consumers = SlowConsumerLogState::default();
     let mut generation = None;
     let mut next_generation_id = 1_u64;
+    let mut handled_connection_epoch = 0_u64;
+    let mut handled_invalidation_epoch = 0_u64;
+    let mut barrier: Option<BarrierAttempt> = None;
     loop {
         let warning_deadline = outage.deadline();
         tokio::select! {
-            signal = signal_rx.recv() => {
-                let Some(signal) = signal else { return; };
-                match signal {
-                    ClientSignal::Connected => {
-                        outage.recovered();
-                        readiness.set_connected();
-                        LifecycleAction::status(
-                            LifecycleReason::SubscriptionsPending,
-                            &nats_host,
-                            nats_port,
-                            &readiness.snapshot(),
-                        ).emit();
-                        if let Some(ingress_tx) = ingress_tx.as_ref() {
-                            let action = connected_generation_action(
-                                generation.as_ref(),
-                                config.mappings().len(),
-                            );
-                            match action {
-                                GenerationAction::BuildAll { subject_count } => {
-                                    debug_assert_eq!(subject_count, config.mappings().len());
-                                    generation = build_subscription_generation(
-                                        &client,
-                                        &config,
-                                        ingress_tx.clone(),
-                                        signal_tx.clone(),
-                                        next_generation_id,
-                                    ).await;
-                                    next_generation_id = next_generation_id.saturating_add(1);
-                                }
-                                GenerationAction::FlushRetained { generation_id } => {
-                                    debug_assert_eq!(
-                                        generation.as_ref().map(|current| current.id),
-                                        Some(generation_id),
-                                    );
-                                }
-                                GenerationAction::RebuildAll { .. } => unreachable!(
-                                    "connected transition cannot request generation rebuild"
-                                ),
-                            }
-                            establish_generation(
-                                &client,
-                                generation.as_ref(),
-                                &readiness,
+            changed = lifecycle_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let delivered = *lifecycle_rx.borrow_and_update();
+
+                if delivered.invalidation_epoch != handled_invalidation_epoch {
+                    handled_invalidation_epoch = delivered.invalidation_epoch;
+                    if let Some(attempt) = barrier.take() {
+                        attempt.stop().await;
+                    }
+                    if delivered.connected {
+                        if outage.begin(Instant::now()) {
+                            LifecycleAction::unavailable(
                                 &nats_host,
                                 nats_port,
-                            ).await;
+                                &readiness.snapshot(),
+                            ).emit();
                         }
-                    }
-                    ClientSignal::Disconnected => {
-                        handle_disconnected(&readiness);
+                    } else {
                         outage.begin(Instant::now());
                         LifecycleAction::status(
                             LifecycleReason::Disconnected,
@@ -437,26 +551,53 @@ async fn run_client_supervisor(
                             &readiness.snapshot(),
                         ).emit();
                     }
-                    ClientSignal::Unavailable => {
-                        if outage.begin(Instant::now()) {
-                            LifecycleAction::unavailable(
-                                &nats_host,
-                                nats_port,
-                                &readiness.snapshot(),
-                            ).emit();
+                }
+
+                if delivered.connection_epoch != handled_connection_epoch {
+                    handled_connection_epoch = delivered.connection_epoch;
+                    outage.recovered();
+                    LifecycleAction::status(
+                        LifecycleReason::SubscriptionsPending,
+                        &nats_host,
+                        nats_port,
+                        &readiness.snapshot(),
+                    ).emit();
+                    if let Some(ingress_tx) = ingress_tx.as_ref() {
+                        let action = connected_generation_action(
+                            generation.as_ref(),
+                            config.mappings().len(),
+                        );
+                        match action {
+                            GenerationAction::BuildAll { subject_count } => {
+                                debug_assert_eq!(subject_count, config.mappings().len());
+                                generation = build_subscription_generation(
+                                    &client,
+                                    &config,
+                                    ingress_tx.clone(),
+                                    signal_tx.clone(),
+                                    next_generation_id,
+                                ).await;
+                                next_generation_id = next_generation_id.saturating_add(1);
+                            }
+                            GenerationAction::FlushRetained { generation_id } => {
+                                debug_assert_eq!(
+                                    generation.as_ref().map(|current| current.id),
+                                    Some(generation_id),
+                                );
+                            }
+                            GenerationAction::RebuildAll { .. } => unreachable!(
+                                "connected transition cannot request generation rebuild"
+                            ),
+                        }
+                        if barrier_allowed_after_latest_delivery(delivered) {
+                            barrier = start_barrier(&client, generation.as_ref(), delivered);
                         }
                     }
-                    ClientSignal::SlowConsumer => {
-                        if let Some(action) = handle_slow_consumer(
-                            &stats,
-                            &mut slow_consumers,
-                            Instant::now(),
-                            &nats_host,
-                            nats_port,
-                        ) {
-                            action.emit();
-                        }
-                    }
+                }
+            }
+            signal = signal_rx.recv() => {
+                let Some(signal) = signal else { return; };
+                match signal {
                     ClientSignal::GenerationEnded { generation_id } => {
                         let Some(GenerationAction::RebuildAll {
                             generation_id: current_generation_id,
@@ -484,15 +625,50 @@ async fn run_client_supervisor(
                                 next_generation_id,
                             ).await;
                             next_generation_id = next_generation_id.saturating_add(1);
-                            establish_generation(
-                                &client,
-                                generation.as_ref(),
-                                &readiness,
-                                &nats_host,
-                                nats_port,
-                            ).await;
+                            let current_lifecycle = lifecycle.snapshot();
+                            if barrier_allowed_after_latest_delivery(current_lifecycle) {
+                                barrier = start_barrier(
+                                    &client,
+                                    generation.as_ref(),
+                                    current_lifecycle,
+                                );
+                            }
                         }
                     }
+                }
+            }
+            slow_consumer = slow_consumer_rx.recv() => {
+                if slow_consumer.is_none() {
+                    return;
+                }
+                if let Some(action) = handle_slow_consumer(
+                    &stats,
+                    &mut slow_consumers,
+                    Instant::now(),
+                    &nats_host,
+                    nats_port,
+                ) {
+                    action.emit();
+                }
+            }
+            result = wait_for_barrier(&mut barrier) => {
+                let Some(result) = result else { continue; };
+                let attempt = barrier.take().expect("completed barrier remains present");
+                let succeeded = result.unwrap_or(false);
+                if succeeded
+                    && barrier_tags_match(
+                        attempt.tags,
+                        lifecycle.snapshot(),
+                        generation.as_ref(),
+                    )
+                    && readiness.mark_all_subscriptions_established().became_ready()
+                {
+                    LifecycleAction::status(
+                        LifecycleReason::Ready,
+                        &nats_host,
+                        nats_port,
+                        &readiness.snapshot(),
+                    ).emit();
                 }
             }
             _ = wait_for_outage_deadline(warning_deadline) => {
@@ -561,24 +737,29 @@ async fn read_subscription(
     }
 }
 
-async fn establish_generation(
+fn start_barrier(
     client: &Client,
     generation: Option<&SubscriptionGeneration>,
-    readiness: &BridgeReadiness,
-    nats_host: &str,
-    nats_port: u16,
-) {
-    if generation.is_none() {
-        return;
-    }
-    if complete_barrier(readiness, broker_round_trip(client).await) {
-        LifecycleAction::status(
-            LifecycleReason::Ready,
-            nats_host,
-            nats_port,
-            &readiness.snapshot(),
-        )
-        .emit();
+    lifecycle: LifecycleSnapshot,
+) -> Option<BarrierAttempt> {
+    let generation_id = generation?.id;
+    let client = client.clone();
+    Some(BarrierAttempt {
+        tags: BarrierTags {
+            connection_epoch: lifecycle.connection_epoch,
+            invalidation_epoch: lifecycle.invalidation_epoch,
+            generation_id,
+        },
+        task: tokio::spawn(async move { broker_round_trip(&client).await }),
+    })
+}
+
+async fn wait_for_barrier(
+    barrier: &mut Option<BarrierAttempt>,
+) -> Option<Result<bool, tokio::task::JoinError>> {
+    match barrier {
+        Some(attempt) => Some((&mut attempt.task).await),
+        None => pending().await,
     }
 }
 
@@ -591,17 +772,6 @@ async fn broker_round_trip(client: &Client) -> bool {
         Ok(_) => true,
         Err(error) => error.kind() == RequestErrorKind::NoResponders,
     }
-}
-
-fn complete_barrier(readiness: &BridgeReadiness, succeeded: bool) -> bool {
-    succeeded
-        && readiness
-            .mark_all_subscriptions_established()
-            .became_ready()
-}
-
-fn handle_disconnected(readiness: &BridgeReadiness) {
-    readiness.mark_disconnected();
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -842,8 +1012,8 @@ mod tests {
         assert!(!readiness.snapshot().is_ready());
     }
 
-    #[test]
-    fn broker_barrier_success_is_the_only_atomic_ready_transition() {
+    #[tokio::test]
+    async fn barrier_success_requires_exact_live_epoch_and_generation_tags() {
         let config = enabled_config();
         let readiness = BridgeReadiness::new(
             config
@@ -851,14 +1021,38 @@ mod tests {
                 .iter()
                 .map(|mapping| mapping.subject().clone()),
         );
-        readiness.set_connected();
+        let lifecycle = LifecycleControl::new(readiness);
+        lifecycle.delivered(DeliveredLifecycleEvent::Connected);
+        let current = lifecycle.snapshot();
+        let generation = generation(7);
+        let tags = BarrierTags {
+            connection_epoch: current.connection_epoch,
+            invalidation_epoch: current.invalidation_epoch,
+            generation_id: generation.id,
+        };
 
-        assert!(!complete_barrier(&readiness, false));
-        assert!(!readiness.snapshot().is_ready());
-        assert!(complete_barrier(&readiness, true));
-        assert_eq!(readiness.snapshot().established_subjects.len(), 2);
-        assert!(readiness.snapshot().is_ready());
-        assert!(!complete_barrier(&readiness, true));
+        assert!(barrier_tags_match(tags, current, Some(&generation)));
+        assert!(!barrier_tags_match(
+            BarrierTags {
+                connection_epoch: tags.connection_epoch.saturating_add(1),
+                ..tags
+            },
+            current,
+            Some(&generation),
+        ));
+        lifecycle.delivered(DeliveredLifecycleEvent::Error);
+        assert!(!barrier_tags_match(
+            tags,
+            lifecycle.snapshot(),
+            Some(&generation),
+        ));
+        lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
+        assert!(!barrier_tags_match(
+            tags,
+            lifecycle.snapshot(),
+            Some(&generation),
+        ));
+        generation.stop().await;
     }
 
     #[tokio::test]
@@ -920,10 +1114,37 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!blocked.is_finished());
 
-        handle_disconnected(&readiness);
+        let lifecycle = LifecycleControl::new(readiness.clone());
+        lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
         assert!(!readiness.snapshot().connected);
         assert!(!readiness.snapshot().is_ready());
         blocked.abort();
+    }
+
+    #[test]
+    fn delivered_control_invalidation_is_non_blocking_under_callback_saturation() {
+        let readiness = BridgeReadiness::new(["vision.summary".into()]);
+        let lifecycle = LifecycleControl::new(readiness.clone());
+        lifecycle.delivered(DeliveredLifecycleEvent::Connected);
+        readiness.mark_all_subscriptions_established();
+        let (_slow_tx, slow_rx) = mpsc::channel::<()>(1);
+
+        for _ in 0..(SUPERVISOR_SIGNAL_CAPACITY * 4) {
+            lifecycle.delivered(DeliveredLifecycleEvent::Error);
+        }
+
+        let snapshot = lifecycle.snapshot();
+        assert_eq!(
+            snapshot.invalidation_epoch,
+            (SUPERVISOR_SIGNAL_CAPACITY * 4) as u64
+        );
+        assert!(snapshot.connected);
+        assert_eq!(snapshot.last_event, DeliveredLifecycleEvent::Error);
+        assert!(readiness.snapshot().established_subjects.is_empty());
+        assert!(
+            slow_rx.is_empty(),
+            "lifecycle control is separate from telemetry"
+        );
     }
 
     #[tokio::test]

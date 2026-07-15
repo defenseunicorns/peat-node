@@ -15,7 +15,9 @@ use peat_node::nats_bridge::config::{BridgeConfig, EnabledBridgeConfig};
 use peat_node::nats_bridge::envelope::{
     BridgeEnvelope, BRIDGE_ENVELOPE_KIND, BRIDGE_ENVELOPE_VERSION,
 };
-use peat_node::nats_bridge::runtime::{BridgeRuntime, BridgeRuntimeHandle};
+use peat_node::nats_bridge::runtime::{
+    BridgeRuntime, BridgeRuntimeHandle, DeliveredLifecycleEvent, LifecycleSnapshot,
+};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,6 +62,7 @@ enum PeerEvent {
 
 enum PeerCommand {
     ConfirmNoResponders,
+    DenySubscription,
     WithholdBarrier,
     Send { subject: String, payload: Vec<u8> },
     Disconnect,
@@ -265,6 +268,26 @@ async fn run_connection(
                     Ok(Some(PeerCommand::WithholdBarrier)) => {
                         break;
                     }
+                    Ok(Some(PeerCommand::DenySubscription)) => {
+                        writer
+                            .write_all(
+                                b"-ERR 'Permissions Violation for Subscription to \"vision.summary\"'\r\n",
+                            )
+                            .await?;
+                        writer.flush().await?;
+                        match timeout(STEP_TIMEOUT, commands.recv()).await {
+                            Ok(Some(PeerCommand::ConfirmNoResponders)) => {
+                                send_no_responders(&mut writer, &reply, reply_sid).await?;
+                                break;
+                            }
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "post-denial barrier release timeout",
+                                ));
+                            }
+                        }
+                    }
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
@@ -284,7 +307,7 @@ async fn run_connection(
                 }
                 Some(PeerCommand::Disconnect) => return Ok(true),
                 Some(PeerCommand::Stop) | None => return Ok(false),
-                Some(PeerCommand::ConfirmNoResponders | PeerCommand::WithholdBarrier) => {
+                Some(PeerCommand::ConfirmNoResponders | PeerCommand::DenySubscription | PeerCommand::WithholdBarrier) => {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate barrier release"));
                 }
             },
@@ -494,6 +517,24 @@ async fn wait_received(handle: &BridgeRuntimeHandle, received: u64) {
         assert!(
             Instant::now() < deadline,
             "unexpected received count: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_lifecycle(
+    handle: &BridgeRuntimeHandle,
+    predicate: impl Fn(LifecycleSnapshot) -> bool,
+) -> LifecycleSnapshot {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let snapshot = handle.lifecycle_snapshot();
+        if predicate(snapshot) {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lifecycle diagnostic did not advance"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -757,6 +798,95 @@ async fn readiness_barrier_timeout_leaves_the_complete_generation_not_ready() {
     })
     .await
     .expect("bounded barrier timeout test timed out");
+}
+
+#[tokio::test]
+async fn readiness_permission_error_delivered_before_503_invalidates_the_barrier() {
+    timeout(TEST_TIMEOUT, async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 1).await;
+        let dir = tempfile::tempdir().expect("temporary node directory");
+        let node = test_node(dir.path()).await;
+        let handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "effective-test-node".to_owned(),
+            node,
+        );
+
+        loop {
+            if let PeerEvent::Barrier { subjects: seen, .. } = peer.event().await {
+                assert_eq!(seen, subjects());
+                break;
+            }
+        }
+        let before = handle.lifecycle_snapshot();
+        peer.command(PeerCommand::DenySubscription).await;
+        let delivered = wait_lifecycle(&handle, |snapshot| {
+            snapshot.invalidation_epoch > before.invalidation_epoch
+                && snapshot.last_event == DeliveredLifecycleEvent::Error
+        })
+        .await;
+        assert!(delivered.connected);
+        assert!(handle
+            .readiness()
+            .snapshot()
+            .established_subjects
+            .is_empty());
+
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = handle.readiness().snapshot();
+        assert!(!status.is_ready());
+        assert!(status.established_subjects.is_empty());
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded delivered permission error test timed out");
+}
+
+#[tokio::test]
+async fn readiness_disconnect_cancels_withheld_barrier_before_timeout() {
+    timeout(TEST_TIMEOUT, async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 2).await;
+        let dir = tempfile::tempdir().expect("temporary node directory");
+        let node = test_node(dir.path()).await;
+        let handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "effective-test-node".to_owned(),
+            node,
+        );
+
+        loop {
+            if let PeerEvent::Barrier { connection: 0, .. } = peer.event().await {
+                break;
+            }
+        }
+        peer.command(PeerCommand::WithholdBarrier).await;
+        let before = handle.lifecycle_snapshot();
+        let started = Instant::now();
+        peer.command(PeerCommand::Disconnect).await;
+        let disconnected = wait_lifecycle(&handle, |snapshot| {
+            snapshot.invalidation_epoch > before.invalidation_epoch && !snapshot.connected
+        })
+        .await;
+        assert_eq!(
+            disconnected.last_event,
+            DeliveredLifecycleEvent::Disconnected
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!handle.readiness().snapshot().is_ready());
+
+        loop {
+            if let PeerEvent::Barrier { connection: 1, .. } = peer.event().await {
+                break;
+            }
+        }
+        assert!(!handle.readiness().snapshot().is_ready());
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        wait_ready(&handle, true).await;
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded disconnect cancellation test timed out");
 }
 
 #[tokio::test]

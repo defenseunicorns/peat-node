@@ -153,6 +153,19 @@ collection or the later egress path. Brokers that deny either request
 permission or do not return a no-responder status when no service is listening
 will leave the bridge not ready.
 
+Readiness is not an authorization guarantee under the pinned async-nats
+0.49.1 client. `subscribe` returns after locally enqueueing `SUB`; the broker
+does not acknowledge that command, and async-nats sends `CONNECT verbose=false`.
+Broker `-ERR` frames are forwarded through async-nats's bounded 128-event
+`try_send` queue, while the later 503 or normal readiness response completes on
+a separate request path. If that upstream queue drops a subscription-permission
+`-ERR`, the outcome is indistinguishable from authorized subscriptions even
+though the bridge invalidates every client/server error that reaches its event
+callback. Operators must provision and independently validate subscribe
+permission for every configured mapping. Under the developer-approved residual
+risk dated 2026-07-15, `ING-01: partial` and internal bridge readiness must not
+be used as proof that every application `SUB` was authorized.
+
 Each valid UTF-8, syntactically valid JSON message creates one immutable Peat
 document with a fresh UUID v4 in its mapped collection. The durable envelope
 has exactly five fields: fixed `kind`, numeric `version`, the original literal
