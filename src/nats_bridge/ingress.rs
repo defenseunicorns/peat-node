@@ -6,16 +6,20 @@
 //! envelope are created once before bounded retries so one accepted message
 //! cannot become multiple documents.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::Subject;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::nats_bridge::envelope::BridgeEnvelope;
+use crate::nats_bridge::envelope::{BridgeEnvelope, IngressValidationError};
 use crate::node::{CreateBridgeDocumentError, SidecarNode};
 
 /// Process-wide number of raw NATS messages allowed to await persistence.
@@ -30,8 +34,177 @@ pub const STORE_RETRY_DELAY_FIRST: Duration = Duration::from_millis(50);
 /// Delay after the second transient storage failure.
 pub const STORE_RETRY_DELAY_SECOND: Duration = Duration::from_millis(200);
 
-const STORE_RETRY_DELAYS: [Duration; STORE_MAX_ATTEMPTS - 1] =
-    [STORE_RETRY_DELAY_FIRST, STORE_RETRY_DELAY_SECOND];
+const STORE_ATTEMPT_DELAYS: [Option<Duration>; STORE_MAX_ATTEMPTS] = [
+    Some(STORE_RETRY_DELAY_FIRST),
+    Some(STORE_RETRY_DELAY_SECOND),
+    None,
+];
+
+/// Cadence for per-subject summaries of suppressed invalid input warnings.
+pub const INVALID_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Cloneable, label-free ingress counters shared with runtime diagnostics.
+#[derive(Clone, Default)]
+pub struct IngressStats {
+    inner: Arc<IngressStatsInner>,
+}
+
+#[derive(Default)]
+struct IngressStatsInner {
+    received: AtomicU64,
+    stored: AtomicU64,
+    invalid_utf8: AtomicU64,
+    invalid_json: AtomicU64,
+    final_store_failures: AtomicU64,
+    slow_consumer_events: AtomicU64,
+}
+
+/// Point-in-time values for the bounded ingress counter set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IngressStatsSnapshot {
+    pub received: u64,
+    pub stored: u64,
+    pub invalid_utf8: u64,
+    pub invalid_json: u64,
+    pub final_store_failures: u64,
+    pub slow_consumer_events: u64,
+}
+
+impl IngressStats {
+    /// Read every counter without introducing payload- or subject-derived labels.
+    pub fn snapshot(&self) -> IngressStatsSnapshot {
+        IngressStatsSnapshot {
+            received: self.inner.received.load(Ordering::Relaxed),
+            stored: self.inner.stored.load(Ordering::Relaxed),
+            invalid_utf8: self.inner.invalid_utf8.load(Ordering::Relaxed),
+            invalid_json: self.inner.invalid_json.load(Ordering::Relaxed),
+            final_store_failures: self.inner.final_store_failures.load(Ordering::Relaxed),
+            slow_consumer_events: self.inner.slow_consumer_events.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record one Core NATS slow-consumer event without adding a dynamic label.
+    pub fn record_slow_consumer(&self) {
+        self.inner
+            .slow_consumer_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Fixed reason carried by a payload-safe ingress action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressActionKind {
+    InvalidOccurrence,
+    InvalidWarning,
+    InvalidSummary,
+    StoreRetry,
+    StoreFailure,
+}
+
+/// Fixed error classifications safe to expose in bridge diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressErrorKind {
+    InvalidUtf8,
+    InvalidJson,
+    InvalidInputSummary,
+    EnvelopeEncoding,
+    AlreadyExists,
+    InvalidInput,
+    Encryption,
+    Conversion,
+    StoreRead,
+    StoreWrite,
+}
+
+impl IngressErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidInputSummary => "invalid_input_summary",
+            Self::EnvelopeEncoding => "envelope_encoding",
+            Self::AlreadyExists => "already_exists",
+            Self::InvalidInput => "invalid_input",
+            Self::Encryption => "encryption",
+            Self::Conversion => "conversion",
+            Self::StoreRead => "store_read",
+            Self::StoreWrite => "store_write",
+        }
+    }
+}
+
+/// Complete typed data behind one ingress log event.
+///
+/// The shape intentionally has no payload, URL, parser error, source error, or
+/// error-chain field. All strings are validated route metadata or generated IDs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IngressAction {
+    pub kind: IngressActionKind,
+    pub subject: Option<String>,
+    pub collection: Option<String>,
+    pub payload_bytes: Option<usize>,
+    pub document_id: Option<String>,
+    pub attempt: Option<usize>,
+    pub delay_ms: Option<u64>,
+    pub suppressed_count: Option<u64>,
+    pub error_kind: IngressErrorKind,
+}
+
+impl IngressAction {
+    fn emit(&self) {
+        let error_kind = self.error_kind.as_str();
+        let subject = self.subject.as_deref().unwrap_or("");
+        let collection = self.collection.as_deref().unwrap_or("");
+        let payload_bytes = self.payload_bytes.unwrap_or_default();
+        let document_id = self.document_id.as_deref().unwrap_or("");
+        let attempt = self.attempt.unwrap_or_default();
+        let delay_ms = self.delay_ms.unwrap_or_default();
+        let suppressed_count = self.suppressed_count.unwrap_or_default();
+        match self.kind {
+            IngressActionKind::InvalidOccurrence | IngressActionKind::StoreRetry => debug!(
+                subject,
+                collection,
+                payload_bytes,
+                document_id,
+                attempt,
+                delay_ms,
+                error_kind,
+                "NATS bridge ingress action"
+            ),
+            IngressActionKind::InvalidWarning
+            | IngressActionKind::InvalidSummary
+            | IngressActionKind::StoreFailure => warn!(
+                subject,
+                collection,
+                payload_bytes,
+                document_id,
+                attempt,
+                suppressed_count,
+                error_kind,
+                "NATS bridge ingress failure"
+            ),
+        }
+    }
+}
+
+trait IngressActionEmitter: Send + Sync + 'static {
+    fn emit(&self, action: IngressAction);
+}
+
+#[derive(Clone, Copy)]
+struct TracingIngressEmitter;
+
+impl IngressActionEmitter for TracingIngressEmitter {
+    fn emit(&self, action: IngressAction) {
+        action.emit();
+    }
+}
+
+#[derive(Default)]
+struct InvalidWarningState {
+    warning_emitted: bool,
+    suppressed: u64,
+}
 
 /// One routed message awaiting validation and persistence.
 #[derive(Debug)]
@@ -99,42 +272,254 @@ impl BridgeDocumentWriter for Arc<SidecarNode> {
 
 /// Drain one ingress receiver serially until every sender has been dropped.
 pub async fn run_ingress_processor<W>(
-    mut rx: mpsc::Receiver<IngressItem>,
+    rx: mpsc::Receiver<IngressItem>,
     source_node_id: String,
     writer: W,
+    stats: IngressStats,
+    configured_subjects: impl IntoIterator<Item = Subject>,
 ) where
     W: BridgeDocumentWriter,
 {
-    while let Some(item) = rx.recv().await {
-        process_item(&source_node_id, &writer, item).await;
+    run_ingress_processor_with_emitter(
+        rx,
+        source_node_id,
+        writer,
+        stats,
+        configured_subjects,
+        TracingIngressEmitter,
+    )
+    .await;
+}
+
+async fn run_ingress_processor_with_emitter<W, E>(
+    mut rx: mpsc::Receiver<IngressItem>,
+    source_node_id: String,
+    writer: W,
+    stats: IngressStats,
+    configured_subjects: impl IntoIterator<Item = Subject>,
+    emitter: E,
+) where
+    W: BridgeDocumentWriter,
+    E: IngressActionEmitter,
+{
+    let mut invalid_warnings = configured_subjects
+        .into_iter()
+        .map(|subject| (subject.to_string(), InvalidWarningState::default()))
+        .collect::<HashMap<_, _>>();
+    let mut summary_interval = tokio::time::interval_at(
+        Instant::now() + INVALID_WARNING_INTERVAL,
+        INVALID_WARNING_INTERVAL,
+    );
+    summary_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                let Some(item) = item else { return; };
+                process_item(
+                    &source_node_id,
+                    &writer,
+                    &stats,
+                    &emitter,
+                    &mut invalid_warnings,
+                    item,
+                ).await;
+            }
+            _ = summary_interval.tick() => {
+                emit_invalid_summaries(&emitter, &mut invalid_warnings);
+            }
+        }
     }
 }
 
-async fn process_item<W>(source_node_id: &str, writer: &W, item: IngressItem)
-where
+async fn process_item<W, E>(
+    source_node_id: &str,
+    writer: &W,
+    stats: &IngressStats,
+    emitter: &E,
+    invalid_warnings: &mut HashMap<String, InvalidWarningState>,
+    item: IngressItem,
+) where
     W: BridgeDocumentWriter,
+    E: IngressActionEmitter,
 {
+    stats.inner.received.fetch_add(1, Ordering::Relaxed);
     let envelope =
         match BridgeEnvelope::from_payload(item.subject.as_str(), source_node_id, &item.payload) {
             Ok(envelope) => envelope,
-            Err(_) => return,
+            Err(error) => {
+                record_invalid(stats, emitter, invalid_warnings, &item, error);
+                return;
+            }
         };
 
     let doc_id = Uuid::new_v4().to_string();
     let Ok(envelope_json) = serde_json::to_string(&envelope) else {
+        emitter.emit(store_action(
+            IngressActionKind::StoreFailure,
+            &item,
+            &doc_id,
+            0,
+            None,
+            IngressErrorKind::EnvelopeEncoding,
+        ));
         return;
     };
 
-    for attempt in 0..STORE_MAX_ATTEMPTS {
+    for (attempt, retry_delay) in STORE_ATTEMPT_DELAYS.into_iter().enumerate() {
         match writer
             .create_bridge_document(&item.collection, &doc_id, &envelope_json)
             .await
         {
-            Ok(()) => return,
-            Err(error) if is_transient(error) && attempt < STORE_RETRY_DELAYS.len() => {
-                tokio::time::sleep(STORE_RETRY_DELAYS[attempt]).await;
+            Ok(()) => {
+                stats.inner.stored.fetch_add(1, Ordering::Relaxed);
+                return;
             }
-            Err(_) => return,
+            Err(error) if is_transient(error) && retry_delay.is_some() => {
+                let delay = retry_delay.expect("guard proves retry delay exists");
+                emitter.emit(store_action(
+                    IngressActionKind::StoreRetry,
+                    &item,
+                    &doc_id,
+                    attempt + 1,
+                    Some(delay),
+                    error.into(),
+                ));
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => {
+                stats
+                    .inner
+                    .final_store_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                emitter.emit(store_action(
+                    IngressActionKind::StoreFailure,
+                    &item,
+                    &doc_id,
+                    attempt + 1,
+                    None,
+                    error.into(),
+                ));
+                return;
+            }
+        }
+    }
+}
+
+fn record_invalid<E: IngressActionEmitter>(
+    stats: &IngressStats,
+    emitter: &E,
+    invalid_warnings: &mut HashMap<String, InvalidWarningState>,
+    item: &IngressItem,
+    error: IngressValidationError,
+) {
+    let error_kind = match error {
+        IngressValidationError::InvalidUtf8 => {
+            stats.inner.invalid_utf8.fetch_add(1, Ordering::Relaxed);
+            IngressErrorKind::InvalidUtf8
+        }
+        IngressValidationError::InvalidJson => {
+            stats.inner.invalid_json.fetch_add(1, Ordering::Relaxed);
+            IngressErrorKind::InvalidJson
+        }
+    };
+    emitter.emit(invalid_action(
+        IngressActionKind::InvalidOccurrence,
+        item,
+        error_kind,
+        None,
+    ));
+
+    // The map is seeded exclusively from validated configured subjects. An
+    // unexpected subject is still counted/debugged but never creates a key.
+    let Some(state) = invalid_warnings.get_mut(item.subject.as_str()) else {
+        return;
+    };
+    if state.warning_emitted {
+        state.suppressed = state.suppressed.saturating_add(1);
+    } else {
+        state.warning_emitted = true;
+        emitter.emit(invalid_action(
+            IngressActionKind::InvalidWarning,
+            item,
+            error_kind,
+            None,
+        ));
+    }
+}
+
+fn emit_invalid_summaries<E: IngressActionEmitter>(
+    emitter: &E,
+    invalid_warnings: &mut HashMap<String, InvalidWarningState>,
+) {
+    for (subject, state) in invalid_warnings {
+        if state.suppressed > 0 {
+            emitter.emit(IngressAction {
+                kind: IngressActionKind::InvalidSummary,
+                subject: Some(subject.to_string()),
+                collection: None,
+                payload_bytes: None,
+                document_id: None,
+                attempt: None,
+                delay_ms: None,
+                suppressed_count: Some(state.suppressed),
+                error_kind: IngressErrorKind::InvalidInputSummary,
+            });
+        }
+        state.warning_emitted = false;
+        state.suppressed = 0;
+    }
+}
+
+fn invalid_action(
+    kind: IngressActionKind,
+    item: &IngressItem,
+    error_kind: IngressErrorKind,
+    suppressed_count: Option<u64>,
+) -> IngressAction {
+    IngressAction {
+        kind,
+        subject: Some(item.subject.to_string()),
+        collection: Some(item.collection.clone()),
+        payload_bytes: Some(item.payload.len()),
+        document_id: None,
+        attempt: None,
+        delay_ms: None,
+        suppressed_count,
+        error_kind,
+    }
+}
+
+fn store_action(
+    kind: IngressActionKind,
+    item: &IngressItem,
+    doc_id: &str,
+    attempt: usize,
+    delay: Option<Duration>,
+    error_kind: IngressErrorKind,
+) -> IngressAction {
+    IngressAction {
+        kind,
+        subject: Some(item.subject.to_string()),
+        collection: Some(item.collection.clone()),
+        payload_bytes: Some(item.payload.len()),
+        document_id: Some(doc_id.to_owned()),
+        attempt: Some(attempt),
+        delay_ms: delay.map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64),
+        suppressed_count: None,
+        error_kind,
+    }
+}
+
+impl From<CreateBridgeDocumentError> for IngressErrorKind {
+    fn from(value: CreateBridgeDocumentError) -> Self {
+        match value {
+            CreateBridgeDocumentError::AlreadyExists => Self::AlreadyExists,
+            CreateBridgeDocumentError::InvalidInput => Self::InvalidInput,
+            CreateBridgeDocumentError::Encryption => Self::Encryption,
+            CreateBridgeDocumentError::Conversion => Self::Conversion,
+            CreateBridgeDocumentError::StoreRead => Self::StoreRead,
+            CreateBridgeDocumentError::StoreWrite => Self::StoreWrite,
         }
     }
 }
@@ -149,9 +534,11 @@ fn is_transient(error: CreateBridgeDocumentError) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::io::{self, Write};
     use std::sync::Mutex;
 
     use tokio::sync::{mpsc, Notify};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
 
@@ -170,6 +557,56 @@ mod tests {
         call_tx: Arc<Mutex<Option<mpsc::Sender<WriteCall>>>>,
         blocked: Arc<Mutex<bool>>,
         release: Arc<Notify>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEmitter {
+        actions: Arc<Mutex<Vec<IngressAction>>>,
+    }
+
+    impl RecordingEmitter {
+        fn actions(&self) -> Vec<IngressAction> {
+            self.actions.lock().expect("actions lock").clone()
+        }
+    }
+
+    impl IngressActionEmitter for RecordingEmitter {
+        fn emit(&self, action: IngressAction) {
+            self.actions.lock().expect("actions lock").push(action);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureMakeWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CaptureWriter {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes
+                .lock()
+                .expect("capture lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CaptureMakeWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CaptureWriter {
+                bytes: Arc::clone(&self.bytes),
+            }
+        }
     }
 
     impl FakeWriter {
@@ -238,6 +675,20 @@ mod tests {
         IngressItem::new(subject.into(), collection.to_owned(), payload.to_vec())
     }
 
+    fn configured_subjects() -> [Subject; 2] {
+        ["alpha".into(), "beta".into()]
+    }
+
+    async fn wait_for_received(stats: &IngressStats, expected: u64) {
+        for _ in 0..100 {
+            if stats.snapshot().received == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("processor did not receive {expected} items");
+    }
+
     #[tokio::test]
     async fn queue_capacity_blocks_the_257th_send() {
         let (sender, _rx) = ingress_channel();
@@ -271,6 +722,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
 
         sender
@@ -312,6 +765,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
 
         sender
@@ -340,6 +795,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
         let payload = br#"{"same":true}"#;
 
@@ -375,6 +832,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
         sender
             .send(item("alpha", "frames", br#"{"valid":true}"#))
@@ -415,6 +874,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
         sender
             .send(item("alpha", "frames", br#"{"valid":true}"#))
@@ -435,6 +896,8 @@ mod tests {
             rx,
             "source-a".to_owned(),
             writer.clone(),
+            IngressStats::default(),
+            configured_subjects(),
         ));
         sender
             .send(item("alpha", "frames", br#"{"valid":true}"#))
@@ -444,5 +907,221 @@ mod tests {
         worker.await.expect("worker should finish");
         assert_eq!(writer.calls().len(), 1);
         assert_eq!(tokio::time::Instant::now(), writer.calls()[0].at);
+    }
+
+    #[tokio::test]
+    async fn stats_distinguish_validation_storage_and_slow_consumer_outcomes() {
+        let writer =
+            FakeWriter::with_results([Ok(()), Err(CreateBridgeDocumentError::AlreadyExists)]);
+        let stats = IngressStats::default();
+        stats.record_slow_consumer();
+        let (sender, rx) = ingress_channel();
+        let worker = tokio::spawn(run_ingress_processor(
+            rx,
+            "source-a".to_owned(),
+            writer,
+            stats.clone(),
+            configured_subjects(),
+        ));
+        for message in [
+            item("alpha", "frames", &[0xff]),
+            item("alpha", "frames", br#"{"broken":"#),
+            item("alpha", "frames", br#"{"stored":true}"#),
+            item("alpha", "frames", br#"{"collision":true}"#),
+        ] {
+            sender.send(message).await.expect("send");
+        }
+        drop(sender);
+        worker.await.expect("worker should finish");
+
+        assert_eq!(
+            stats.snapshot(),
+            IngressStatsSnapshot {
+                received: 4,
+                stored: 1,
+                invalid_utf8: 1,
+                invalid_json: 1,
+                final_store_failures: 1,
+                slow_consumer_events: 1,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_warnings_are_immediate_summarized_at_sixty_seconds_and_reset() {
+        let writer = FakeWriter::default();
+        let stats = IngressStats::default();
+        let emitter = RecordingEmitter::default();
+        let (sender, rx) = ingress_channel();
+        let worker = tokio::spawn(run_ingress_processor_with_emitter(
+            rx,
+            "source-a".to_owned(),
+            writer,
+            stats.clone(),
+            [Subject::from("alpha")],
+            emitter.clone(),
+        ));
+
+        sender
+            .send(item("alpha", "frames", br#"{"broken":"#))
+            .await
+            .expect("first invalid send");
+        sender
+            .send(item("alpha", "frames", br#"{"broken-again":"#))
+            .await
+            .expect("second invalid send");
+        wait_for_received(&stats, 2).await;
+        let before_summary = emitter.actions();
+        assert_eq!(
+            before_summary
+                .iter()
+                .filter(|action| action.kind == IngressActionKind::InvalidOccurrence)
+                .count(),
+            2
+        );
+        assert_eq!(
+            before_summary
+                .iter()
+                .filter(|action| action.kind == IngressActionKind::InvalidWarning)
+                .count(),
+            1
+        );
+
+        tokio::time::advance(INVALID_WARNING_INTERVAL).await;
+        tokio::task::yield_now().await;
+        let summaries = emitter
+            .actions()
+            .into_iter()
+            .filter(|action| action.kind == IngressActionKind::InvalidSummary)
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].suppressed_count, Some(1));
+
+        sender
+            .send(item("alpha", "frames", &[0xff]))
+            .await
+            .expect("post-reset invalid send");
+        wait_for_received(&stats, 3).await;
+        assert_eq!(
+            emitter
+                .actions()
+                .iter()
+                .filter(|action| action.kind == IngressActionKind::InvalidWarning)
+                .count(),
+            2,
+            "the next interval must permit a new immediate warning"
+        );
+        drop(sender);
+        worker.await.expect("worker should finish");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_transient_failures_emit_two_debug_retries_and_one_final_warning() {
+        let writer = FakeWriter::with_results(std::iter::repeat_n(
+            Err(CreateBridgeDocumentError::StoreWrite),
+            STORE_MAX_ATTEMPTS,
+        ));
+        let stats = IngressStats::default();
+        let emitter = RecordingEmitter::default();
+        let (sender, rx) = ingress_channel();
+        let worker = tokio::spawn(run_ingress_processor_with_emitter(
+            rx,
+            "source-a".to_owned(),
+            writer,
+            stats.clone(),
+            [Subject::from("alpha")],
+            emitter.clone(),
+        ));
+        sender
+            .send(item("alpha", "frames", br#"{"valid":true}"#))
+            .await
+            .expect("send");
+        drop(sender);
+        tokio::time::advance(STORE_RETRY_DELAY_FIRST + STORE_RETRY_DELAY_SECOND).await;
+        tokio::task::yield_now().await;
+        worker.await.expect("worker should finish");
+
+        let actions = emitter.actions();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind == IngressActionKind::StoreRetry)
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.kind == IngressActionKind::StoreFailure)
+                .count(),
+            1
+        );
+        assert_eq!(stats.snapshot().final_store_failures, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn warning_state_never_grows_from_unconfigured_subjects() {
+        let stats = IngressStats::default();
+        let emitter = RecordingEmitter::default();
+        let (sender, rx) = ingress_channel();
+        let worker = tokio::spawn(run_ingress_processor_with_emitter(
+            rx,
+            "source-a".to_owned(),
+            FakeWriter::default(),
+            stats.clone(),
+            [Subject::from("configured")],
+            emitter.clone(),
+        ));
+        sender
+            .send(item("payload-derived-key", "frames", &[0xff]))
+            .await
+            .expect("send");
+        wait_for_received(&stats, 1).await;
+        tokio::time::advance(INVALID_WARNING_INTERVAL).await;
+        tokio::task::yield_now().await;
+        assert!(emitter.actions().iter().all(|action| {
+            !matches!(
+                action.kind,
+                IngressActionKind::InvalidWarning | IngressActionKind::InvalidSummary
+            )
+        }));
+        drop(sender);
+        worker.await.expect("worker should finish");
+    }
+
+    #[test]
+    fn formatted_actions_and_captured_logs_exclude_payload_urls_and_source_details() {
+        let action = IngressAction {
+            kind: IngressActionKind::StoreFailure,
+            subject: Some("vision.summary".to_owned()),
+            collection: Some("frames".to_owned()),
+            payload_bytes: Some(87),
+            document_id: Some("550e8400-e29b-41d4-a716-446655440000".to_owned()),
+            attempt: Some(3),
+            delay_ms: None,
+            suppressed_count: None,
+            error_kind: IngressErrorKind::StoreWrite,
+        };
+        let capture = CaptureMakeWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_writer(capture.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || action.emit());
+
+        let captured = String::from_utf8(capture.bytes.lock().expect("capture lock").clone())
+            .expect("captured logs should be UTF-8");
+        let rendered = format!("{action:?} {captured}");
+        for forbidden in [
+            r#"{"secret_payload":"do-not-log"}"#,
+            "raw-user:raw-password@broker.internal",
+            "expected value at line 1 column 19",
+            "/private/data/peat/store.db: permission denied",
+            "caused by: database source chain",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert!(captured.contains("store_write"));
+        assert!(captured.contains("payload_bytes=87"));
     }
 }
