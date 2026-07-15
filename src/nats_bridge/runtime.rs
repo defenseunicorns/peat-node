@@ -416,6 +416,9 @@ enum GenerationAction {
     FlushRetained {
         generation_id: u64,
     },
+    RemoveOnly {
+        generation_id: u64,
+    },
     RebuildAll {
         generation_id: u64,
         subject_count: usize,
@@ -441,10 +444,19 @@ fn ended_generation_action(
     subject_count: usize,
 ) -> Option<GenerationAction> {
     let generation = generation?;
-    (connected && generation.id == ended_generation_id).then_some(GenerationAction::RebuildAll {
-        generation_id: generation.id,
-        subject_count,
-    })
+    if generation.id != ended_generation_id {
+        return None;
+    }
+    if connected {
+        Some(GenerationAction::RebuildAll {
+            generation_id: generation.id,
+            subject_count,
+        })
+    } else {
+        Some(GenerationAction::RemoveOnly {
+            generation_id: generation.id,
+        })
+    }
 }
 
 impl SubscriptionGeneration {
@@ -588,6 +600,9 @@ async fn run_client_supervisor(
                             GenerationAction::RebuildAll { .. } => unreachable!(
                                 "connected transition cannot request generation rebuild"
                             ),
+                            GenerationAction::RemoveOnly { .. } => unreachable!(
+                                "connected transition cannot request generation removal"
+                            ),
                         }
                         if barrier_allowed_after_latest_delivery(delivered) {
                             barrier = start_barrier(&client, generation.as_ref(), delivered);
@@ -599,10 +614,7 @@ async fn run_client_supervisor(
                 let Some(signal) = signal else { return; };
                 match signal {
                     ClientSignal::GenerationEnded { generation_id } => {
-                        let Some(GenerationAction::RebuildAll {
-                            generation_id: current_generation_id,
-                            subject_count,
-                        }) = ended_generation_action(
+                        let Some(action) = ended_generation_action(
                             generation.as_ref(),
                             generation_id,
                             readiness.snapshot().connected,
@@ -610,13 +622,27 @@ async fn run_client_supervisor(
                         ) else {
                             continue;
                         };
+                        let current_generation_id = match action {
+                            GenerationAction::RemoveOnly { generation_id }
+                            | GenerationAction::RebuildAll { generation_id, .. } => generation_id,
+                            GenerationAction::BuildAll { .. }
+                            | GenerationAction::FlushRetained { .. } => unreachable!(
+                                "generation end must remove the matching generation"
+                            ),
+                        };
                         debug_assert_eq!(current_generation_id, generation_id);
-                        debug_assert_eq!(subject_count, config.mappings().len());
                         readiness.invalidate_subscription_generation();
+                        if let Some(attempt) = barrier.take() {
+                            attempt.stop().await;
+                        }
                         if let Some(old_generation) = generation.take() {
                             old_generation.stop().await;
                         }
-                        if let Some(ingress_tx) = ingress_tx.as_ref() {
+                        if let GenerationAction::RebuildAll { subject_count, .. } = action {
+                            debug_assert_eq!(subject_count, config.mappings().len());
+                            let Some(ingress_tx) = ingress_tx.as_ref() else {
+                                continue;
+                            };
                             generation = build_subscription_generation(
                                 &client,
                                 &config,
@@ -1148,27 +1174,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_retains_generation_but_stream_end_rebuilds_all_subjects() {
+    async fn ended_generation_disconnect_then_end_removes_before_next_connect() {
         let generation = generation(41);
         assert_eq!(
-            connected_generation_action(Some(&generation), 2),
-            GenerationAction::FlushRetained { generation_id: 41 }
+            ended_generation_action(Some(&generation), 41, false, 2),
+            Some(GenerationAction::RemoveOnly { generation_id: 41 })
         );
+        generation.stop().await;
         assert_eq!(
             connected_generation_action(None, 2),
-            GenerationAction::BuildAll { subject_count: 2 }
+            GenerationAction::BuildAll { subject_count: 2 },
+            "the next connection must build a replacement generation"
         );
+        let replacement_id = 42_u64;
+        assert!(replacement_id > 41);
+    }
+
+    #[tokio::test]
+    async fn ended_generation_end_then_disconnect_retains_only_the_replacement() {
+        let ended = generation(41);
         assert_eq!(
-            ended_generation_action(Some(&generation), 41, true, 2),
+            ended_generation_action(Some(&ended), 41, true, 2),
             Some(GenerationAction::RebuildAll {
                 generation_id: 41,
                 subject_count: 2,
             })
         );
+        ended.stop().await;
+
+        let replacement = generation(42);
         assert_eq!(
-            ended_generation_action(Some(&generation), 42, true, 2),
+            connected_generation_action(Some(&replacement), 2),
+            GenerationAction::FlushRetained { generation_id: 42 },
+            "ordinary disconnect retains only the live replacement"
+        );
+        assert!(replacement.id > 41);
+        replacement.stop().await;
+    }
+
+    #[tokio::test]
+    async fn ended_generation_stale_signal_cannot_remove_current_generation() {
+        let generation = generation(42);
+        assert_eq!(
+            ended_generation_action(Some(&generation), 41, false, 2),
             None,
             "a stale sentinel cannot replace the live generation"
+        );
+        assert_eq!(
+            connected_generation_action(Some(&generation), 2),
+            GenerationAction::FlushRetained { generation_id: 42 }
         );
         generation.stop().await;
     }

@@ -735,10 +735,11 @@ async fn reconnect_replays_the_complete_literal_subscription_set_before_readines
         let mut peer = ScriptedPeer::start(subjects(), None, 2).await;
         let dir = tempfile::tempdir().expect("temporary node directory");
         let node = test_node(dir.path()).await;
+        let mut changes = node.subscribe();
         let handle = BridgeRuntime::spawn(
             enabled_config(&peer.url),
             "effective-test-node".to_owned(),
-            node,
+            Arc::clone(&node),
         );
 
         for connection in 0..2 {
@@ -763,6 +764,27 @@ async fn reconnect_replays_the_complete_literal_subscription_set_before_readines
                 wait_ready(&handle, false).await;
             }
         }
+
+        let payload = b" {\"after_reconnect\":true} \n".to_vec();
+        peer.command(PeerCommand::Send {
+            subject: "vision.summary".to_owned(),
+            payload: payload.clone(),
+        })
+        .await;
+        wait_stats(&handle, 1, 1).await;
+        let event = timeout(STEP_TIMEOUT, changes.recv())
+            .await
+            .expect("post-reconnect observer timeout")
+            .expect("post-reconnect observer event");
+        assert_eq!(event.collection, "frames");
+        let document = node
+            .get_document("frames", &event.doc_id)
+            .await
+            .expect("read post-reconnect document")
+            .expect("post-reconnect document exists");
+        let envelope: BridgeEnvelope =
+            serde_json::from_str(&document).expect("decode post-reconnect envelope");
+        assert_eq!(envelope.payload.as_bytes(), payload);
         peer.finish().await;
     })
     .await
