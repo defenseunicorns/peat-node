@@ -317,7 +317,8 @@ impl LocalExclusionLedger {
             .map(|_| ())
     }
 
-    #[cfg(test)]
+    // Reconciliation consumes this in Plan 04-02 Task 2.
+    #[allow(dead_code)]
     pub(crate) async fn contains(&self, digest: LedgerDigest) -> Result<bool, LedgerError> {
         Ok(matches!(
             self.worker.lookup(digest).await?,
@@ -388,6 +389,10 @@ impl DeliveryLedger {
             self.worker.lookup(digest).await?,
             Some(RecordState::Reserved | RecordState::Completed)
         ))
+    }
+
+    pub(crate) fn stop(&self) {
+        self.worker.request_stop();
     }
 }
 

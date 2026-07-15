@@ -19,8 +19,8 @@ use tracing::{debug, info, warn};
 
 use super::config::{validate_bridge_node_identity, EnabledBridgeConfig};
 use super::egress::{
-    run_bridge_event_router, run_egress_worker, EgressDiagnostics, EgressRouter, EgressStats,
-    NatsBridgePublisher, BRIDGE_ORIGIN_HEADER,
+    run_bridge_event_router, run_egress_worker, DeliveryCoordinator, EgressDiagnostics,
+    EgressStats, NatsBridgePublisher, BRIDGE_ORIGIN_HEADER,
 };
 use super::ingress::{
     ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
@@ -380,11 +380,10 @@ impl BridgeRuntime {
                 .map(|mapping| (mapping.subject().clone(), mapping.collection().to_owned())),
         );
         let (ingress_tx, ingress_rx) = ingress_channel();
-        let bridge_events = node.subscribe_bridge_changes();
         let egress_stats = EgressStats::default();
-        let (egress_router, egress_rx) =
-            EgressRouter::new(config.mappings(), &local_node_id, egress_stats.clone());
-        let egress_diagnostics = egress_router.diagnostics();
+        let (_exclusion, delivery) = node
+            .bridge_ledgers()
+            .expect("successful installation retains journal facades");
         let configured_subjects = config
             .mappings()
             .iter()
@@ -397,28 +396,18 @@ impl BridgeRuntime {
             stats.clone(),
             configured_subjects,
         ));
-        let router_stats = egress_stats.clone();
-        let router_diagnostics = egress_diagnostics.clone();
-        let router_task = tokio::spawn(async move {
-            run_bridge_event_router(
-                bridge_events,
-                egress_router,
-                router_stats,
-                router_diagnostics,
-            )
-            .await;
-        });
         let handle = Self::spawn_supervisor(
             config,
             stats,
-            Some((ingress_tx, diagnostics, local_node_id)),
-            Some(EgressSupervisor {
-                rx: egress_rx,
+            Some((ingress_tx, diagnostics, local_node_id.clone())),
+            delivery.map(|delivery| EgressSetup {
+                delivery,
                 origin_header_value,
                 stats: egress_stats,
-                diagnostics: egress_diagnostics,
+                events: node.subscribe_bridge_changes(),
+                local_node_id: local_node_id.clone(),
             }),
-            vec![ingress_task, router_task],
+            vec![ingress_task],
         );
         handle
             .readiness
@@ -433,8 +422,8 @@ impl BridgeRuntime {
         config: EnabledBridgeConfig,
         stats: IngressStats,
         ingress: Option<(IngressSender, IngressDiagnostics, String)>,
-        egress: Option<EgressSupervisor>,
-        support_tasks: Vec<JoinHandle<()>>,
+        egress: Option<EgressSetup>,
+        mut support_tasks: Vec<JoinHandle<()>>,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -463,6 +452,29 @@ impl BridgeRuntime {
             .as_ref()
             .map(|state| state.stats.clone())
             .unwrap_or_default();
+        let egress = egress.map(|setup| {
+            let (coordinator, rx) = DeliveryCoordinator::new(
+                config.mappings(),
+                &setup.local_node_id,
+                setup.stats.clone(),
+                setup.delivery.clone(),
+                readiness.clone(),
+            );
+            let diagnostics = coordinator.diagnostics();
+            support_tasks.push(tokio::spawn(run_bridge_event_router(
+                setup.events,
+                coordinator,
+                setup.stats.clone(),
+                diagnostics.clone(),
+            )));
+            EgressSupervisor {
+                rx,
+                delivery: setup.delivery,
+                origin_header_value: setup.origin_header_value,
+                stats: setup.stats,
+                diagnostics,
+            }
+        });
         let task = tokio::spawn(async move {
             run_client_supervisor(
                 server_addr,
@@ -518,9 +530,18 @@ struct SupervisorRuntime {
 
 struct EgressSupervisor {
     rx: mpsc::Receiver<super::egress::EgressItem>,
+    delivery: super::ledger::DeliveryLedger,
     origin_header_value: HeaderValue,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
+}
+
+struct EgressSetup {
+    delivery: super::ledger::DeliveryLedger,
+    origin_header_value: HeaderValue,
+    stats: EgressStats,
+    events: tokio::sync::broadcast::Receiver<crate::node::BridgeChangeEvent>,
+    local_node_id: String,
 }
 
 struct AbortTaskOnDrop(JoinHandle<()>);
@@ -701,6 +722,8 @@ async fn run_client_supervisor(
             state.rx,
             state.origin_header_value,
             publisher,
+            state.delivery,
+            readiness.clone(),
             state.stats,
             state.diagnostics,
         )))

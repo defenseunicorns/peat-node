@@ -2459,6 +2459,15 @@ impl SidecarNode {
         Ok(health)
     }
 
+    /// Cloned journal facades for the runtime coordinator and reconciler.
+    pub(crate) fn bridge_ledgers(&self) -> Option<(LocalExclusionLedger, Option<DeliveryLedger>)> {
+        self.bridge_ledger
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|installed| (installed.exclusion.clone(), installed.delivery.clone()))
+    }
+
     async fn record_local_exclusion(
         &self,
         collection: &str,

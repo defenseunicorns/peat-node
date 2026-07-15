@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 use async_nats::connection::State;
 use async_nats::{Client, HeaderMap, HeaderValue, PublishErrorKind, Subject};
 use buffa::bytes::Bytes;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::nats_bridge::config::SubjectMapping;
 use crate::nats_bridge::envelope::{BridgeEnvelope, BRIDGE_ENVELOPE_KIND, BRIDGE_ENVELOPE_VERSION};
 use crate::nats_bridge::ingress::MAX_INGRESS_PAYLOAD_BYTES;
+use crate::nats_bridge::ledger::{document_digest, DeliveryLedger, LedgerDigest, ReserveResult};
 use crate::nats_bridge::readiness::BridgeReadiness;
 use crate::node::BridgeChangeEvent;
 
@@ -31,15 +31,11 @@ pub(crate) const BRIDGE_ORIGIN_HEADER: &str = "Peat-Nats-Bridge-Origin";
 /// Maximum eligible egress items retained by the bridge-owned FIFO.
 pub(crate) const EGRESS_QUEUE_CAPACITY: usize = 256;
 
-/// Exact count of process-lifetime document digests retained for deduplication.
-pub(crate) const EGRESS_DEDUP_CAPACITY: usize = 4096;
-
 /// Minimum interval between diagnostics in one fixed egress classification.
 pub(crate) const EGRESS_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(60);
 
-const EGRESS_DIAGNOSTIC_CLASSIFICATIONS: usize = 16;
-
-const EGRESS_DOCUMENT_DIGEST_DOMAIN: &[u8] = b"peat-node/egress-document/v1\0";
+const EGRESS_DIAGNOSTIC_CLASSIFICATIONS: usize = 17;
+const EGRESS_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fixed, payload-safe reason that a remote Peat upsert is ineligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,12 +48,12 @@ pub(crate) enum EgressSkipKind {
     ReturnedLocal,
     OversizedPayload,
     Duplicate,
-    DedupExhausted,
 }
 
 /// One byte-exact publish request after all envelope and route gates pass.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct EgressItem {
+    pub digest: LedgerDigest,
     pub subject: Subject,
     pub payload: Bytes,
     /// Index in the validated finite startup mapping list.
@@ -73,6 +69,8 @@ pub(crate) enum EgressFailureKind {
     Unavailable,
     PublishFailed,
     MaxPayloadExceeded,
+    FlushFailed,
+    LedgerUnavailable,
 }
 
 /// Fixed action shape safe for logs and bounded diagnostics.
@@ -216,14 +214,15 @@ fn diagnostic_classification(kind: EgressActionKind) -> usize {
         EgressActionKind::Skipped(EgressSkipKind::ReturnedLocal) => 5,
         EgressActionKind::Skipped(EgressSkipKind::OversizedPayload) => 6,
         EgressActionKind::Skipped(EgressSkipKind::Duplicate) => 7,
-        EgressActionKind::Skipped(EgressSkipKind::DedupExhausted) => 8,
-        EgressActionKind::Lost(EgressFailureKind::EventLagged) => 9,
-        EgressActionKind::Lost(EgressFailureKind::QueueFull) => 10,
-        EgressActionKind::Lost(EgressFailureKind::QueueClosed) => 11,
-        EgressActionKind::Lost(EgressFailureKind::Unavailable) => 12,
-        EgressActionKind::Lost(EgressFailureKind::PublishFailed) => 13,
-        EgressActionKind::Lost(EgressFailureKind::MaxPayloadExceeded) => 14,
-        EgressActionKind::Published => 15,
+        EgressActionKind::Lost(EgressFailureKind::EventLagged) => 8,
+        EgressActionKind::Lost(EgressFailureKind::QueueFull) => 9,
+        EgressActionKind::Lost(EgressFailureKind::QueueClosed) => 10,
+        EgressActionKind::Lost(EgressFailureKind::Unavailable) => 11,
+        EgressActionKind::Lost(EgressFailureKind::PublishFailed) => 12,
+        EgressActionKind::Lost(EgressFailureKind::MaxPayloadExceeded) => 13,
+        EgressActionKind::Lost(EgressFailureKind::FlushFailed) => 14,
+        EgressActionKind::Lost(EgressFailureKind::LedgerUnavailable) => 15,
+        EgressActionKind::Published => 16,
     }
 }
 
@@ -242,12 +241,13 @@ struct EgressStatsInner {
     returned_local: AtomicU64,
     oversized_payload: AtomicU64,
     duplicate: AtomicU64,
-    dedup_exhausted: AtomicU64,
     queue_full: AtomicU64,
     queue_closed: AtomicU64,
     unavailable: AtomicU64,
     publish_failed: AtomicU64,
     max_payload_exceeded: AtomicU64,
+    flush_failed: AtomicU64,
+    ledger_unavailable: AtomicU64,
     event_lagged: AtomicU64,
     published: AtomicU64,
 }
@@ -261,12 +261,13 @@ pub(crate) struct EgressStatsSnapshot {
     pub returned_local: u64,
     pub oversized_payload: u64,
     pub duplicate: u64,
-    pub dedup_exhausted: u64,
     pub queue_full: u64,
     pub queue_closed: u64,
     pub unavailable: u64,
     pub publish_failed: u64,
     pub max_payload_exceeded: u64,
+    pub flush_failed: u64,
+    pub ledger_unavailable: u64,
     pub event_lagged: u64,
     pub published: u64,
 }
@@ -281,12 +282,13 @@ impl EgressStats {
             returned_local: self.inner.returned_local.load(Ordering::Relaxed),
             oversized_payload: self.inner.oversized_payload.load(Ordering::Relaxed),
             duplicate: self.inner.duplicate.load(Ordering::Relaxed),
-            dedup_exhausted: self.inner.dedup_exhausted.load(Ordering::Relaxed),
             queue_full: self.inner.queue_full.load(Ordering::Relaxed),
             queue_closed: self.inner.queue_closed.load(Ordering::Relaxed),
             unavailable: self.inner.unavailable.load(Ordering::Relaxed),
             publish_failed: self.inner.publish_failed.load(Ordering::Relaxed),
             max_payload_exceeded: self.inner.max_payload_exceeded.load(Ordering::Relaxed),
+            flush_failed: self.inner.flush_failed.load(Ordering::Relaxed),
+            ledger_unavailable: self.inner.ledger_unavailable.load(Ordering::Relaxed),
             event_lagged: self.inner.event_lagged.load(Ordering::Relaxed),
             published: self.inner.published.load(Ordering::Relaxed),
         }
@@ -303,7 +305,6 @@ impl EgressStats {
             EgressSkipKind::ReturnedLocal => &self.inner.returned_local,
             EgressSkipKind::OversizedPayload => &self.inner.oversized_payload,
             EgressSkipKind::Duplicate => &self.inner.duplicate,
-            EgressSkipKind::DedupExhausted => &self.inner.dedup_exhausted,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -316,6 +317,8 @@ impl EgressStats {
             EgressFailureKind::Unavailable => &self.inner.unavailable,
             EgressFailureKind::PublishFailed => &self.inner.publish_failed,
             EgressFailureKind::MaxPayloadExceeded => &self.inner.max_payload_exceeded,
+            EgressFailureKind::FlushFailed => &self.inner.flush_failed,
+            EgressFailureKind::LedgerUnavailable => &self.inner.ledger_unavailable,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -328,6 +331,7 @@ impl EgressStats {
 }
 
 /// Finite collection-to-subject table derived only from validated startup config.
+#[derive(Clone)]
 pub(crate) struct EgressClassifier {
     routes: HashMap<String, Subject>,
     route_indexes: HashMap<String, usize>,
@@ -358,6 +362,7 @@ impl EgressClassifier {
 
     /// Classify one private remote-only node event without retaining event data.
     pub fn classify(&self, event: BridgeChangeEvent) -> Result<EgressItem, EgressSkipKind> {
+        let digest = document_digest(&event.collection, &event.doc_id);
         let envelope: BridgeEnvelope = serde_json::from_str(&event.json_data)
             .map_err(|_| EgressSkipKind::MalformedEnvelope)?;
         if envelope.kind != BRIDGE_ENVELOPE_KIND {
@@ -384,6 +389,7 @@ impl EgressClassifier {
         }
 
         Ok(EgressItem {
+            digest,
             subject: subject.clone(),
             payload: Bytes::from(envelope.payload),
             route_index,
@@ -396,102 +402,43 @@ impl EgressClassifier {
     }
 }
 
-type DocumentDigestFn = fn(&str, &str) -> Option<[u8; 32]>;
-
-fn document_digest(collection: &str, doc_id: &str) -> Option<[u8; 32]> {
-    let collection_len = u64::try_from(collection.len()).ok()?;
-    let doc_id_len = u64::try_from(doc_id.len()).ok()?;
-    let mut hasher = Sha256::new();
-    hasher.update(EGRESS_DOCUMENT_DIGEST_DOMAIN);
-    hasher.update(collection_len.to_be_bytes());
-    hasher.update(collection.as_bytes());
-    hasher.update(doc_id_len.to_be_bytes());
-    hasher.update(doc_id.as_bytes());
-    Some(hasher.finalize().into())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DedupDisposition {
-    Inserted,
-    Duplicate,
-    Exhausted,
-}
-
-/// Exact-size, non-evicting process-lifetime digest table.
-struct EgressDedup {
-    slots: Box<[[u8; 32]; EGRESS_DEDUP_CAPACITY]>,
-    len: usize,
-    exhausted: bool,
-    digest_fn: DocumentDigestFn,
-}
-
-impl EgressDedup {
-    #[cfg(test)]
-    fn new() -> Self {
-        Self::with_digest_fn(document_digest)
-    }
-
-    fn with_digest_fn(digest_fn: DocumentDigestFn) -> Self {
-        Self {
-            slots: Box::new([[0; 32]; EGRESS_DEDUP_CAPACITY]),
-            len: 0,
-            exhausted: false,
-            digest_fn,
-        }
-    }
-
-    fn check_and_insert_digest(&mut self, digest: Option<[u8; 32]>) -> DedupDisposition {
-        let Some(digest) = digest else {
-            self.exhausted = true;
-            return DedupDisposition::Exhausted;
-        };
-        if self.slots[..self.len].contains(&digest) {
-            return DedupDisposition::Duplicate;
-        }
-        if self.exhausted || self.len == EGRESS_DEDUP_CAPACITY {
-            self.exhausted = true;
-            return DedupDisposition::Exhausted;
-        }
-        self.slots[self.len] = digest;
-        self.len += 1;
-        if self.len == EGRESS_DEDUP_CAPACITY {
-            self.exhausted = true;
-        }
-        DedupDisposition::Inserted
-    }
-}
-
-/// Non-blocking producer that classifies and deduplicates before FIFO admission.
-pub(crate) struct EgressRouter {
+/// Sole durable admission path shared by live events and reconciliation.
+#[derive(Clone)]
+pub(crate) struct DeliveryCoordinator {
     classifier: EgressClassifier,
-    dedup: Mutex<EgressDedup>,
     tx: mpsc::Sender<EgressItem>,
+    delivery: DeliveryLedger,
+    readiness: BridgeReadiness,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
 }
 
-impl EgressRouter {
+impl DeliveryCoordinator {
     pub fn new(
         mappings: &[SubjectMapping],
         local_node_id: &str,
         stats: EgressStats,
+        delivery: DeliveryLedger,
+        readiness: BridgeReadiness,
     ) -> (Self, mpsc::Receiver<EgressItem>) {
-        Self::with_capacity_and_digest(
+        Self::with_capacity(
             mappings,
             local_node_id,
             stats,
+            delivery,
+            readiness,
             EGRESS_QUEUE_CAPACITY,
-            document_digest,
             TracingEgressEmitter,
         )
     }
 
-    fn with_capacity_and_digest<E>(
+    fn with_capacity<E>(
         mappings: &[SubjectMapping],
         local_node_id: &str,
         stats: EgressStats,
+        delivery: DeliveryLedger,
+        readiness: BridgeReadiness,
         queue_capacity: usize,
-        digest_fn: DocumentDigestFn,
         emitter: E,
     ) -> (Self, mpsc::Receiver<EgressItem>)
     where
@@ -501,8 +448,9 @@ impl EgressRouter {
         (
             Self {
                 classifier: EgressClassifier::new(mappings, local_node_id),
-                dedup: Mutex::new(EgressDedup::with_digest_fn(digest_fn)),
                 tx,
+                delivery,
+                readiness,
                 stats,
                 diagnostics: EgressDiagnostics::with_emitter(mappings.len(), emitter),
             },
@@ -510,13 +458,8 @@ impl EgressRouter {
         )
     }
 
-    pub fn admit(&self, event: BridgeChangeEvent) -> Result<(), EgressActionKind> {
+    pub async fn deliver(&self, event: BridgeChangeEvent) -> Result<(), EgressActionKind> {
         let route_index = self.classifier.route_index(&event.collection);
-        let digest = (self
-            .dedup
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .digest_fn)(&event.collection, &event.doc_id);
         let item = match self.classifier.classify(event) {
             Ok(item) => item,
             Err(kind) => {
@@ -524,23 +467,33 @@ impl EgressRouter {
                 return Err(EgressActionKind::Skipped(kind));
             }
         };
-        let disposition = self
-            .dedup
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .check_and_insert_digest(digest);
-        match disposition {
-            DedupDisposition::Duplicate => {
+        let status = self.readiness.snapshot();
+        if !status.accepting || !status.delivery_healthy || !status.is_ready() {
+            let kind = EgressFailureKind::Unavailable;
+            self.record_action(
+                EgressActionKind::Lost(kind),
+                route_index,
+                Some(item.payload.len()),
+            );
+            return Err(EgressActionKind::Lost(kind));
+        }
+        match self.delivery.check_and_reserve(item.digest).await {
+            Ok(ReserveResult::Suppressed) => {
                 let kind = EgressSkipKind::Duplicate;
                 self.record_action(EgressActionKind::Skipped(kind), route_index, None);
                 return Err(EgressActionKind::Skipped(kind));
             }
-            DedupDisposition::Exhausted => {
-                let kind = EgressSkipKind::DedupExhausted;
-                self.record_action(EgressActionKind::Skipped(kind), route_index, None);
-                return Err(EgressActionKind::Skipped(kind));
+            Ok(ReserveResult::Reserved) => {}
+            Err(_) => {
+                self.readiness.set_delivery_healthy(false);
+                let kind = EgressFailureKind::LedgerUnavailable;
+                self.record_action(
+                    EgressActionKind::Lost(kind),
+                    route_index,
+                    Some(item.payload.len()),
+                );
+                return Err(EgressActionKind::Lost(kind));
             }
-            DedupDisposition::Inserted => {}
         }
 
         let payload_bytes = item.payload.len();
@@ -601,6 +554,8 @@ pub(crate) trait BridgePublisher: Send + Sync + 'static {
         headers: HeaderMap,
         payload: Bytes,
     ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + 'a>>;
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + '_>>;
 }
 
 impl BridgePublisher for async_nats::Client {
@@ -619,6 +574,14 @@ impl BridgePublisher for async_nats::Client {
                         EgressFailureKind::PublishFailed
                     }
                 })
+        })
+    }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + '_>> {
+        Box::pin(async move {
+            self.flush()
+                .await
+                .map_err(|_| EgressFailureKind::FlushFailed)
         })
     }
 }
@@ -651,19 +614,28 @@ impl BridgePublisher for NatsBridgePublisher {
             BridgePublisher::publish(&self.client, subject, headers, payload).await
         })
     }
+
+    fn flush(&self) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + '_>> {
+        Box::pin(async move {
+            if !self.readiness.snapshot().is_ready() {
+                return Err(EgressFailureKind::Unavailable);
+            }
+            BridgePublisher::flush(&self.client).await
+        })
+    }
 }
 
 /// Forward private node events without ever awaiting bridge-owned FIFO space.
 pub(crate) async fn run_bridge_event_router(
     mut events: tokio::sync::broadcast::Receiver<BridgeChangeEvent>,
-    router: EgressRouter,
+    coordinator: DeliveryCoordinator,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
 ) {
     loop {
         match events.recv().await {
             Ok(event) => {
-                let _ = router.admit(event);
+                let _ = coordinator.deliver(event).await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                 stats.record_event_lagged(dropped);
@@ -684,6 +656,8 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
     mut rx: mpsc::Receiver<EgressItem>,
     origin_header_value: HeaderValue,
     publisher: P,
+    delivery: DeliveryLedger,
+    readiness: BridgeReadiness,
     stats: EgressStats,
     diagnostics: EgressDiagnostics,
 ) {
@@ -692,8 +666,27 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
         let route_index = Some(item.route_index);
         let mut headers = HeaderMap::new();
         headers.insert(BRIDGE_ORIGIN_HEADER, origin_header_value.clone());
-        match publisher.publish(item.subject, headers, item.payload).await {
+        let outcome = match publisher.publish(item.subject, headers, item.payload).await {
+            Ok(()) => match tokio::time::timeout(EGRESS_FLUSH_TIMEOUT, publisher.flush()).await {
+                Ok(result) => result,
+                Err(_) => Err(EgressFailureKind::FlushFailed),
+            },
+            Err(kind) => Err(kind),
+        };
+        match outcome {
             Ok(()) => {
+                if delivery.mark_completed(item.digest).await.is_err() {
+                    readiness.set_delivery_healthy(false);
+                    let kind = EgressFailureKind::LedgerUnavailable;
+                    stats.record_failure(kind);
+                    diagnostics.record(EgressAction {
+                        kind: EgressActionKind::Lost(kind),
+                        route_index,
+                        payload_bytes: Some(payload_bytes),
+                        suppressed_count: 0,
+                    });
+                    continue;
+                }
                 stats.inner.published.fetch_add(1, Ordering::Relaxed);
                 diagnostics.record(EgressAction {
                     kind: EgressActionKind::Published,
@@ -704,7 +697,9 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
             }
             Err(kind @ EgressFailureKind::Unavailable)
             | Err(kind @ EgressFailureKind::PublishFailed)
-            | Err(kind @ EgressFailureKind::MaxPayloadExceeded) => {
+            | Err(kind @ EgressFailureKind::MaxPayloadExceeded)
+            | Err(kind @ EgressFailureKind::FlushFailed)
+            | Err(kind @ EgressFailureKind::LedgerUnavailable) => {
                 stats.record_failure(kind);
                 diagnostics.record(EgressAction {
                     kind: EgressActionKind::Lost(kind),
@@ -780,6 +775,7 @@ mod tests {
         assert_eq!(
             classifier.classify(event("Frame_Store-1", &valid)),
             Ok(EgressItem {
+                digest: document_digest("Frame_Store-1", "untrusted-document-id"),
                 subject: Subject::from("Vision.Summary"),
                 payload: Bytes::from_static(br#"{"ok":true}"#),
                 route_index: 0,
@@ -909,23 +905,6 @@ mod tests {
         let _: async_nats::HeaderName = BRIDGE_ORIGIN_HEADER.parse().expect("valid header name");
     }
 
-    #[derive(Clone, Default)]
-    struct RecordingEmitter {
-        actions: Arc<Mutex<Vec<EgressAction>>>,
-    }
-
-    impl EgressActionEmitter for RecordingEmitter {
-        fn emit(&self, action: EgressAction) {
-            self.actions.lock().expect("actions lock").push(action);
-        }
-    }
-
-    impl RecordingEmitter {
-        fn actions(&self) -> Vec<EgressAction> {
-            self.actions.lock().expect("actions lock").clone()
-        }
-    }
-
     #[derive(Clone, Debug)]
     struct PublishCall {
         subject: Subject,
@@ -936,15 +915,22 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakePublisher {
         calls: Arc<Mutex<Vec<PublishCall>>>,
-        results: Arc<Mutex<Vec<Result<(), EgressFailureKind>>>>,
+        publish_results: Arc<Mutex<Vec<Result<(), EgressFailureKind>>>>,
+        flush_results: Arc<Mutex<Vec<Result<(), EgressFailureKind>>>>,
     }
 
     impl FakePublisher {
-        fn with_results(results: impl IntoIterator<Item = Result<(), EgressFailureKind>>) -> Self {
-            let mut results = results.into_iter().collect::<Vec<_>>();
-            results.reverse();
+        fn with_results(
+            publish_results: impl IntoIterator<Item = Result<(), EgressFailureKind>>,
+            flush_results: impl IntoIterator<Item = Result<(), EgressFailureKind>>,
+        ) -> Self {
+            let mut publish_results = publish_results.into_iter().collect::<Vec<_>>();
+            publish_results.reverse();
+            let mut flush_results = flush_results.into_iter().collect::<Vec<_>>();
+            flush_results.reverse();
             Self {
-                results: Arc::new(Mutex::new(results)),
+                publish_results: Arc::new(Mutex::new(publish_results)),
+                flush_results: Arc::new(Mutex::new(flush_results)),
                 ..Self::default()
             }
         }
@@ -967,419 +953,221 @@ mod tests {
                     headers,
                     payload,
                 });
-                self.results
+                self.publish_results
                     .lock()
                     .expect("results lock")
                     .pop()
                     .unwrap_or(Ok(()))
             })
         }
-    }
 
-    fn constant_digest(_collection: &str, _doc_id: &str) -> Option<[u8; 32]> {
-        Some([0x5a; 32])
-    }
-
-    #[test]
-    fn dedup_digest_is_domain_separated_and_length_framed() {
-        let actual = document_digest("ab", "c").expect("digest");
-        let mut expected = Sha256::new();
-        expected.update(b"peat-node/egress-document/v1\0");
-        expected.update(2_u64.to_be_bytes());
-        expected.update(b"ab");
-        expected.update(1_u64.to_be_bytes());
-        expected.update(b"c");
-        assert_eq!(actual, <[u8; 32]>::from(expected.finalize()));
-        assert_ne!(actual, document_digest("a", "bc").expect("digest"));
-        assert_ne!(
-            document_digest("same", "id").expect("digest"),
-            document_digest("same-id", "").expect("digest")
-        );
-    }
-
-    #[test]
-    fn dedup_table_has_exact_fixed_width_storage_and_no_dynamic_entries() {
-        let table = EgressDedup::new();
-        assert_eq!(table.slots.len(), EGRESS_DEDUP_CAPACITY);
-        assert_eq!(
-            std::mem::size_of_val(table.slots.as_ref()),
-            EGRESS_DEDUP_CAPACITY * 32
-        );
-        assert_eq!(EGRESS_DEDUP_CAPACITY * 32, 131_072);
-        assert_eq!(table.len, 0);
-    }
-
-    #[test]
-    fn dedup_distinguishes_collections_and_collision_only_suppresses() {
-        let mut table = EgressDedup::new();
-        let a = document_digest("collection-a", "same-id");
-        let b = document_digest("collection-b", "same-id");
-        assert_eq!(table.check_and_insert_digest(a), DedupDisposition::Inserted);
-        assert_eq!(table.check_and_insert_digest(b), DedupDisposition::Inserted);
-
-        let mut collision_table = EgressDedup::with_digest_fn(constant_digest);
-        let first = (collision_table.digest_fn)("a", "first");
-        let collision = (collision_table.digest_fn)("b", "second");
-        assert_eq!(
-            collision_table.check_and_insert_digest(first),
-            DedupDisposition::Inserted
-        );
-        assert_eq!(
-            collision_table.check_and_insert_digest(collision),
-            DedupDisposition::Duplicate
-        );
-        assert_eq!(collision_table.len, 1);
-    }
-
-    #[test]
-    fn dedup_exhaustion_is_non_evicting_and_sticky_for_unseen_documents() {
-        let mut table = EgressDedup::new();
-        let first = document_digest("frames", "0");
-        for sequence in 0..EGRESS_DEDUP_CAPACITY {
-            assert_eq!(
-                table.check_and_insert_digest(document_digest(
-                    "frames",
-                    sequence.to_string().as_str()
-                )),
-                DedupDisposition::Inserted
-            );
+        fn flush(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + '_>> {
+            Box::pin(async {
+                self.flush_results
+                    .lock()
+                    .expect("flush results lock")
+                    .pop()
+                    .unwrap_or(Ok(()))
+            })
         }
-        assert_eq!(table.len, EGRESS_DEDUP_CAPACITY);
-        assert!(table.exhausted);
-        assert_eq!(
-            table.check_and_insert_digest(document_digest("frames", "unseen")),
-            DedupDisposition::Exhausted
-        );
-        assert_eq!(
-            table.check_and_insert_digest(first),
-            DedupDisposition::Duplicate
-        );
-        assert_eq!(table.len, EGRESS_DEDUP_CAPACITY);
     }
 
-    #[test]
-    fn digest_conversion_failure_is_sticky_fail_closed() {
-        let mut table = EgressDedup::new();
-        assert_eq!(
-            table.check_and_insert_digest(None),
-            DedupDisposition::Exhausted
-        );
-        assert!(table.exhausted);
-        assert_eq!(
-            table.check_and_insert_digest(document_digest("frames", "later")),
-            DedupDisposition::Exhausted
-        );
+    fn ready() -> BridgeReadiness {
+        let readiness = BridgeReadiness::new([
+            Subject::from("Vision.Summary"),
+            Subject::from("telemetry.reading"),
+        ]);
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        readiness
     }
 
-    #[test]
-    fn queue_failure_is_terminal_and_duplicate_cannot_retry() {
-        let stats = EgressStats::default();
-        let emitter = RecordingEmitter::default();
-        let (router, _rx) = EgressRouter::with_capacity_and_digest(
-            &mappings(),
-            "local-node",
-            stats.clone(),
-            1,
-            document_digest,
-            emitter.clone(),
-        );
-        let valid = envelope("Vision.Summary", "remote-node", "1");
-        router
-            .admit(event_with_id("Frame_Store-1", "first", &valid))
-            .expect("first item fits");
-        assert_eq!(
-            router.admit(event_with_id("Frame_Store-1", "lost", &valid)),
-            Err(EgressActionKind::Lost(EgressFailureKind::QueueFull))
-        );
-        assert_eq!(
-            router.admit(event_with_id("Frame_Store-1", "lost", &valid)),
-            Err(EgressActionKind::Skipped(EgressSkipKind::Duplicate))
-        );
-        assert_eq!(stats.snapshot().queue_full, 1);
-        assert_eq!(stats.snapshot().duplicate, 1);
-        assert_eq!(emitter.actions().len(), 2);
-    }
-
-    #[test]
-    fn closed_queue_is_terminal_and_does_not_enable_retry() {
-        let stats = EgressStats::default();
-        let (router, rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
-        drop(rx);
-        let valid = envelope("Vision.Summary", "remote-node", "true");
-        assert_eq!(
-            router.admit(event_with_id("Frame_Store-1", "closed", &valid)),
-            Err(EgressActionKind::Lost(EgressFailureKind::QueueClosed))
-        );
-        assert_eq!(
-            router.admit(event_with_id("Frame_Store-1", "closed", &valid)),
-            Err(EgressActionKind::Skipped(EgressSkipKind::Duplicate))
-        );
-        assert_eq!(stats.snapshot().queue_closed, 1);
+    fn journals() -> (tempfile::TempDir, DeliveryLedger) {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = crate::nats_bridge::ledger::BridgeLedger::open(dir.path()).unwrap();
+        (dir, ledger.delivery())
     }
 
     #[tokio::test]
-    async fn serial_worker_preserves_fifo_and_continues_after_terminal_failure() {
+    async fn durable_reservation_precedes_fifo_and_racing_sources_publish_once() {
+        let (_dir, delivery) = journals();
+        let readiness = ready();
         let stats = EgressStats::default();
-        let (router, rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
-        let publisher = FakePublisher::with_results([
-            Err(EgressFailureKind::Unavailable),
-            Ok(()),
-            Err(EgressFailureKind::PublishFailed),
-            Err(EgressFailureKind::MaxPayloadExceeded),
-            Ok(()),
+        let (coordinator, mut rx) = DeliveryCoordinator::new(
+            &mappings(),
+            "local-node",
+            stats.clone(),
+            delivery.clone(),
+            readiness,
+        );
+        let valid = envelope("Vision.Summary", "remote-node", r#"{"frame":1}"#);
+        let first = coordinator.clone();
+        let second = coordinator.clone();
+        let a = tokio::spawn(async move {
+            first
+                .deliver(event_with_id("Frame_Store-1", "same", &valid))
+                .await
+        });
+        let valid = envelope("Vision.Summary", "remote-node", r#"{"frame":1}"#);
+        let b = tokio::spawn(async move {
+            second
+                .deliver(event_with_id("Frame_Store-1", "same", &valid))
+                .await
+        });
+        let results = [a.await.unwrap(), b.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            rx.recv().await.unwrap().digest,
+            document_digest("Frame_Store-1", "same")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(delivery
+            .is_suppressed(document_digest("Frame_Store-1", "same"))
+            .await
+            .unwrap());
+        assert_eq!(stats.snapshot().duplicate, 1);
+    }
+
+    #[tokio::test]
+    async fn unready_and_unhealthy_paths_never_reserve_or_enqueue() {
+        let (_dir, delivery) = journals();
+        let readiness = BridgeReadiness::new([
+            Subject::from("Vision.Summary"),
+            Subject::from("telemetry.reading"),
         ]);
+        let (coordinator, mut rx) = DeliveryCoordinator::new(
+            &mappings(),
+            "local-node",
+            EgressStats::default(),
+            delivery.clone(),
+            readiness.clone(),
+        );
+        let valid = envelope("Vision.Summary", "remote-node", "true");
+        assert_eq!(
+            coordinator
+                .deliver(event_with_id("Frame_Store-1", "unready", &valid))
+                .await,
+            Err(EgressActionKind::Lost(EgressFailureKind::Unavailable))
+        );
+        assert!(!delivery
+            .is_suppressed(document_digest("Frame_Store-1", "unready"))
+            .await
+            .unwrap());
+        assert!(rx.try_recv().is_err());
+
+        readiness.set_connected();
+        readiness.mark_all_subscriptions_established();
+        delivery.stop();
+        let valid = envelope("Vision.Summary", "remote-node", "true");
+        assert_eq!(
+            coordinator
+                .deliver(event_with_id("Frame_Store-1", "bad-ledger", &valid))
+                .await,
+            Err(EgressActionKind::Lost(EgressFailureKind::LedgerUnavailable))
+        );
+        assert!(!readiness.snapshot().delivery_healthy);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn publish_flush_completion_is_durable_and_exact() {
+        let (_dir, delivery) = journals();
+        let readiness = ready();
+        let stats = EgressStats::default();
+        let (coordinator, rx) = DeliveryCoordinator::new(
+            &mappings(),
+            "local-node",
+            stats.clone(),
+            delivery.clone(),
+            readiness.clone(),
+        );
+        let publisher = FakePublisher::default();
+        let calls = publisher.clone();
         let worker = tokio::spawn(run_egress_worker(
             rx,
             "local-node".parse().unwrap(),
-            publisher.clone(),
+            publisher,
+            delivery.clone(),
+            readiness,
             stats.clone(),
-            router.diagnostics(),
+            coordinator.diagnostics(),
         ));
-        let payloads = ["1", "2", "3", "4", "5"];
-        for (sequence, payload) in payloads.into_iter().enumerate() {
-            let valid = envelope("Vision.Summary", "remote-node", payload);
-            router
-                .admit(event_with_id(
-                    "Frame_Store-1",
-                    &format!("doc-{sequence}"),
-                    &valid,
-                ))
-                .expect("queue admission");
-        }
-        drop(router);
-        worker.await.expect("worker completes");
-
-        let calls = publisher.calls();
+        let payload = r#" {"frame":1.0,"label":"\u03bb"} "#;
+        let valid = envelope("Vision.Summary", "remote-node", payload);
+        coordinator
+            .deliver(event_with_id("Frame_Store-1", "complete", &valid))
+            .await
+            .unwrap();
+        drop(coordinator);
+        worker.await.unwrap();
+        assert_eq!(calls.calls()[0].payload.as_ref(), payload.as_bytes());
+        assert_eq!(calls.calls()[0].subject, Subject::from("Vision.Summary"));
         assert_eq!(
-            calls
-                .iter()
-                .map(|call| call.payload.as_ref())
-                .collect::<Vec<_>>(),
-            payloads.map(str::as_bytes)
-        );
-        assert!(calls
-            .iter()
-            .all(|call| call.subject == Subject::from("Vision.Summary")));
-        assert!(calls.iter().all(|call| {
-            call.headers
+            calls.calls()[0]
+                .headers
                 .get_all(BRIDGE_ORIGIN_HEADER)
                 .map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                == ["local-node"]
-        }));
-        assert_eq!(stats.snapshot().unavailable, 1);
-        assert_eq!(stats.snapshot().publish_failed, 1);
-        assert_eq!(stats.snapshot().max_payload_exceeded, 1);
-        assert_eq!(stats.snapshot().published, 2);
+                .collect::<Vec<_>>(),
+            ["local-node"]
+        );
+        assert!(delivery
+            .is_suppressed(document_digest("Frame_Store-1", "complete"))
+            .await
+            .unwrap());
+        assert_eq!(stats.snapshot().published, 1);
     }
 
     #[tokio::test]
-    async fn serial_worker_preserves_each_validated_route_index_in_diagnostics() {
+    async fn queue_publish_and_flush_failures_remain_terminal_reserved() {
+        let (_dir, delivery) = journals();
+        let readiness = ready();
         let stats = EgressStats::default();
-        let emitter = RecordingEmitter::default();
-        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
-        let (tx, rx) = mpsc::channel(2);
-        tx.send(EgressItem {
-            subject: Subject::from("Vision.Summary"),
-            payload: Bytes::from_static(b"1"),
-            route_index: 0,
-        })
-        .await
-        .unwrap();
-        tx.send(EgressItem {
-            subject: Subject::from("telemetry.reading"),
-            payload: Bytes::from_static(b"2"),
-            route_index: 1,
-        })
-        .await
-        .unwrap();
-        drop(tx);
+        let (coordinator, rx) = DeliveryCoordinator::with_capacity(
+            &mappings(),
+            "local-node",
+            stats.clone(),
+            delivery.clone(),
+            readiness.clone(),
+            2,
+            TracingEgressEmitter,
+        );
+        for id in ["publish-fail", "flush-fail", "queue-full"] {
+            let valid = envelope("Vision.Summary", "remote-node", "true");
+            let result = coordinator
+                .deliver(event_with_id("Frame_Store-1", id, &valid))
+                .await;
+            if id == "queue-full" {
+                assert_eq!(
+                    result,
+                    Err(EgressActionKind::Lost(EgressFailureKind::QueueFull))
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+        let publisher = FakePublisher::with_results(
+            [Err(EgressFailureKind::PublishFailed), Ok(())],
+            [Err(EgressFailureKind::FlushFailed)],
+        );
+        drop(coordinator);
         run_egress_worker(
             rx,
             "local-node".parse().unwrap(),
-            FakePublisher::with_results([
-                Err(EgressFailureKind::Unavailable),
-                Err(EgressFailureKind::PublishFailed),
-            ]),
-            stats,
-            diagnostics,
+            publisher,
+            delivery.clone(),
+            readiness,
+            stats.clone(),
+            EgressDiagnostics::new(2),
         )
         .await;
-
-        assert_eq!(
-            emitter
-                .actions()
-                .iter()
-                .map(|action| (action.kind, action.route_index))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    EgressActionKind::Lost(EgressFailureKind::Unavailable),
-                    Some(0)
-                ),
-                (
-                    EgressActionKind::Lost(EgressFailureKind::PublishFailed),
-                    Some(1)
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn diagnostic_actions_are_fixed_width_and_exclude_all_untrusted_text() {
-        let stats = EgressStats::default();
-        let emitter = RecordingEmitter::default();
-        let (router, rx) = EgressRouter::with_capacity_and_digest(
-            &mappings(),
-            "local-node",
-            stats,
-            1,
-            document_digest,
-            emitter.clone(),
-        );
-        drop(rx);
-        let secret_payload = r#"{"secret":"do-not-log"}"#;
-        let secret_source = "source-secret";
-        let valid = envelope("Vision.Summary", secret_source, secret_payload);
-        let mut untrusted = event_with_id("Frame_Store-1", "document-secret", &valid);
-        untrusted.remote_peer_id = "peer-secret".to_owned();
-        let _ = router.admit(untrusted);
-
-        let rendered = format!("{:?}", emitter.actions());
-        for forbidden in [
-            secret_payload,
-            secret_source,
-            "document-secret",
-            "peer-secret",
-            BRIDGE_ORIGIN_HEADER,
-            "raw-user:raw-password@broker",
-            "source error chain",
-        ] {
-            assert!(!rendered.contains(forbidden));
+        for id in ["publish-fail", "flush-fail", "queue-full"] {
+            let digest = document_digest("Frame_Store-1", id);
+            assert!(delivery.is_suppressed(digest).await.unwrap());
         }
-        assert_eq!(
-            emitter.actions(),
-            [EgressAction {
-                kind: EgressActionKind::Lost(EgressFailureKind::QueueClosed),
-                route_index: Some(0),
-                payload_bytes: Some(secret_payload.len()),
-                suppressed_count: 0,
-            }]
-        );
-    }
-
-    #[test]
-    fn diagnostics_rate_limit_and_periodically_aggregate_fixed_classifications() {
-        let emitter = RecordingEmitter::default();
-        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
-        let start = Instant::now();
-        let kinds = [
-            EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope),
-            EgressActionKind::Lost(EgressFailureKind::QueueFull),
-            EgressActionKind::Lost(EgressFailureKind::Unavailable),
-            EgressActionKind::Lost(EgressFailureKind::EventLagged),
-        ];
-
-        for kind in kinds {
-            let action = EgressAction {
-                kind,
-                route_index: Some(1),
-                payload_bytes: Some(17),
-                suppressed_count: 0,
-            };
-            diagnostics.record_at(action.clone(), start);
-            for _ in 0..100 {
-                diagnostics.record_at(action.clone(), start + Duration::from_secs(59));
-            }
-            diagnostics.record_at(action, start + EGRESS_DIAGNOSTIC_INTERVAL);
-        }
-
-        let actions = emitter.actions();
-        assert_eq!(actions.len(), kinds.len() * 2);
-        for (pair, kind) in actions.chunks_exact(2).zip(kinds) {
-            assert_eq!(pair[0].kind, kind);
-            assert_eq!(pair[0].suppressed_count, 0);
-            assert_eq!(pair[1].kind, kind);
-            assert_eq!(pair[1].suppressed_count, 100);
-            assert_eq!(pair[1].route_index, Some(1));
-            assert_eq!(pair[1].payload_bytes, Some(17));
-        }
-        assert_eq!(
-            diagnostics.buckets.lock().unwrap().len(),
-            3 * EGRESS_DIAGNOSTIC_CLASSIFICATIONS
-        );
-    }
-
-    #[test]
-    fn diagnostics_keep_same_classification_aggregates_route_exact_and_none_distinct() {
-        let emitter = RecordingEmitter::default();
-        let diagnostics = EgressDiagnostics::with_emitter(2, emitter.clone());
-        let start = Instant::now();
-        let unavailable = |route_index| EgressAction {
-            kind: EgressActionKind::Lost(EgressFailureKind::Unavailable),
-            route_index,
-            payload_bytes: Some(1),
-            suppressed_count: 0,
-        };
-        let lag = EgressAction {
-            kind: EgressActionKind::Lost(EgressFailureKind::EventLagged),
-            route_index: None,
-            payload_bytes: None,
-            suppressed_count: 0,
-        };
-
-        diagnostics.record_at(unavailable(Some(0)), start);
-        diagnostics.record_at(unavailable(Some(1)), start);
-        diagnostics.record_at(lag.clone(), start);
-        for _ in 0..3 {
-            diagnostics.record_at(unavailable(Some(0)), start + Duration::from_secs(1));
-        }
-        for _ in 0..7 {
-            diagnostics.record_at(unavailable(Some(1)), start + Duration::from_secs(1));
-        }
-        diagnostics.record_at(lag.clone(), start + Duration::from_secs(1));
-        diagnostics.record_at(unavailable(Some(0)), start + EGRESS_DIAGNOSTIC_INTERVAL);
-        diagnostics.record_at(unavailable(Some(1)), start + EGRESS_DIAGNOSTIC_INTERVAL);
-        diagnostics.record_at(lag, start + EGRESS_DIAGNOSTIC_INTERVAL);
-
-        let actions = emitter.actions();
-        assert_eq!(
-            actions
-                .iter()
-                .map(|action| (action.route_index, action.suppressed_count))
-                .collect::<Vec<_>>(),
-            [
-                (Some(0), 0),
-                (Some(1), 0),
-                (None, 0),
-                (Some(0), 3),
-                (Some(1), 7),
-                (None, 1),
-            ]
-        );
-        assert_eq!(format!("{:?}", actions[5].route_index), "None");
-    }
-
-    #[test]
-    fn router_counts_every_fixed_classification_without_dynamic_labels() {
-        let stats = EgressStats::default();
-        let (router, _rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
-        let malformed = BridgeChangeEvent {
-            collection: "Frame_Store-1".to_owned(),
-            doc_id: "a".to_owned(),
-            remote_peer_id: "peer".to_owned(),
-            json_data: "ordinary".to_owned(),
-        };
-        assert_eq!(
-            router.admit(malformed),
-            Err(EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope))
-        );
-        let returned = envelope("Vision.Summary", "local-node", "null");
-        assert_eq!(
-            router.admit(event_with_id("Frame_Store-1", "b", &returned)),
-            Err(EgressActionKind::Skipped(EgressSkipKind::ReturnedLocal))
-        );
-        assert_eq!(stats.snapshot().malformed, 1);
-        assert_eq!(stats.snapshot().returned_local, 1);
+        assert_eq!(stats.snapshot().publish_failed, 1);
+        assert_eq!(stats.snapshot().flush_failed, 1);
+        assert_eq!(stats.snapshot().queue_full, 1);
     }
 }
