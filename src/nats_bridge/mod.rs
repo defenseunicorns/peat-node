@@ -5,6 +5,7 @@
 //! only by later phases once they can depend on validated configuration.
 
 pub mod config;
+pub(crate) mod egress;
 pub mod envelope;
 pub mod ingress;
 pub mod readiness;
