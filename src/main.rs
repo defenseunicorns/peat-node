@@ -397,21 +397,27 @@ fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
     redacted
 }
 
-fn start_bridge_runtime_with<T>(
+fn start_bridge_runtime_with<N, T>(
     bridge_config: BridgeConfig,
-    spawn: impl FnOnce(EnabledBridgeConfig) -> T,
+    node_id: String,
+    node: Arc<N>,
+    spawn: impl FnOnce(EnabledBridgeConfig, String, Arc<N>) -> T,
 ) -> Option<T> {
     match bridge_config {
         BridgeConfig::Disabled => {
             info!("NATS bridge disabled — no --nats-mapping configured");
             None
         }
-        BridgeConfig::Enabled(config) => Some(spawn(config)),
+        BridgeConfig::Enabled(config) => Some(spawn(config, node_id, node)),
     }
 }
 
-fn start_bridge_runtime(bridge_config: BridgeConfig) -> Option<BridgeRuntimeHandle> {
-    start_bridge_runtime_with(bridge_config, BridgeRuntime::spawn_connection_only)
+fn start_bridge_runtime(
+    bridge_config: BridgeConfig,
+    node_id: String,
+    node: Arc<SidecarNode>,
+) -> Option<BridgeRuntimeHandle> {
+    start_bridge_runtime_with(bridge_config, node_id, node, BridgeRuntime::spawn)
 }
 
 #[tokio::main]
@@ -581,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
     // The disabled branch constructs no NATS state. The enabled constructor
     // spawns one supervisor and returns before its first broker dial, keeping
     // Peat/RPC startup independent of local broker availability.
-    let _bridge_runtime = start_bridge_runtime(bridge_config);
+    let _bridge_runtime = start_bridge_runtime(bridge_config, node_id.clone(), Arc::clone(&node));
 
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
@@ -709,6 +715,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Arc;
 
     use clap::Parser;
 
@@ -894,12 +901,18 @@ mod tests {
     }
 
     #[test]
-    fn nats_disabled_does_not_invoke_runtime_factory() {
+    fn start_bridge_runtime_disabled_does_not_invoke_factory() {
         let config = BridgeConfig::from_raw(None, &[]).expect("empty config should be valid");
         let calls = std::cell::Cell::new(0usize);
-        let handle: Option<()> = start_bridge_runtime_with(config, |_| {
-            calls.set(calls.get() + 1);
-        });
+        let node = Arc::new(());
+        let handle: Option<()> = start_bridge_runtime_with(
+            config,
+            "disabled-node".to_owned(),
+            Arc::clone(&node),
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+            },
+        );
         assert!(handle.is_none());
         assert_eq!(calls.get(), 0);
 
@@ -916,15 +929,31 @@ mod tests {
     }
 
     #[test]
-    fn nats_enabled_invokes_runtime_factory_once() {
+    fn start_bridge_runtime_enabled_passes_inputs_once() {
         let mappings = vec!["vision.summary=frames".to_owned()];
         let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
             .expect("enabled config should be valid");
+        let expected_node_id = "operator-visible-node".to_owned();
+        let node = Arc::new(());
         let calls = std::cell::Cell::new(0usize);
-        let handle = start_bridge_runtime_with(config, |_| {
-            calls.set(calls.get() + 1);
-            "spawned"
-        });
+        let handle = start_bridge_runtime_with(
+            config,
+            expected_node_id.clone(),
+            Arc::clone(&node),
+            |actual_config, actual_node_id, actual_node| {
+                calls.set(calls.get() + 1);
+                assert_eq!(actual_config.endpoint().to_string(), "nats://127.0.0.1:9");
+                assert_eq!(actual_config.mappings().len(), 1);
+                assert_eq!(
+                    actual_config.mappings()[0].subject().as_str(),
+                    "vision.summary"
+                );
+                assert_eq!(actual_config.mappings()[0].collection(), "frames");
+                assert_eq!(actual_node_id, expected_node_id);
+                assert!(Arc::ptr_eq(&actual_node, &node));
+                "spawned"
+            },
+        );
         assert_eq!(handle, Some("spawned"));
         assert_eq!(calls.get(), 1);
     }
