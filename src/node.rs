@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::crypto::derive_iroh_node_key;
@@ -25,7 +25,10 @@ use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
-use peat_protocol::storage::file_distribution::IrohFileDistribution;
+use peat_protocol::storage::file_distribution::{
+    DistributionDocument, IrohFileDistribution, NodeTransferStatus,
+};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -130,6 +133,11 @@ pub struct SidecarNode {
     backend: Arc<AutomergeBackend>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
+    // Wired into the NATS runtime in the next phase plan; exercised here via
+    // the crate-private seam before that consumer exists.
+    #[allow(dead_code)]
+    bridge_change_tx: broadcast::Sender<BridgeChangeEvent>,
+    local_revisions: Arc<Mutex<LocalRevisionGuard>>,
     cipher: Option<StoreCipher>,
     /// PRD-006 attachment configuration. Carried through so handlers can
     /// short-circuit to `Unimplemented` when no `--attachment-root` is
@@ -254,6 +262,130 @@ pub struct ChangeEvent {
     pub doc_id: String,
     pub change_type: ChangeType,
     pub json_data: Option<String>,
+}
+
+/// Private transport-origin event consumed only by the native NATS bridge.
+///
+/// This deliberately does not extend [`ChangeEvent`]: client subscriptions
+/// retain their existing local/remote/delete behavior and public shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeChangeEvent {
+    pub collection: String,
+    pub doc_id: String,
+    pub remote_peer_id: String,
+    pub json_data: String,
+}
+
+const BRIDGE_CHANGE_CAPACITY: usize = 256;
+const LOCAL_REVISION_CAPACITY: usize = 4096;
+const MAX_REVISION_HEADS: usize = 64;
+const REVISION_DIGEST_DOMAIN: &[u8] = b"peat-node:local-revision:v1";
+
+/// Fixed-width, non-evicting journal of locally authored revisions.
+///
+/// The retained digest payload is exactly 4096 * 32 = 131,072 bytes plus
+/// fixed metadata. It retains neither document keys nor Automerge head
+/// vectors. Exhaustion is sticky and fail-closed until process restart.
+struct LocalRevisionGuard {
+    slots: Box<[[u8; 32]]>,
+    len: usize,
+    exhausted: bool,
+}
+
+impl LocalRevisionGuard {
+    fn new() -> Self {
+        Self {
+            slots: vec![[0; 32]; LOCAL_REVISION_CAPACITY].into_boxed_slice(),
+            len: 0,
+            exhausted: false,
+        }
+    }
+
+    fn digest_revision<'a>(
+        &mut self,
+        key: &str,
+        heads: impl ExactSizeIterator<Item = &'a [u8]>,
+    ) -> Option<[u8; 32]> {
+        // Automerge 0.9.0 get_heads() has already collected and sorted every
+        // current head before this check. This limit bounds only our digest
+        // iteration and retained state, not that inherited temporary Vec.
+        let head_count = heads.len();
+        if self.exhausted || head_count > MAX_REVISION_HEADS {
+            self.exhausted = true;
+            return None;
+        }
+
+        let mut digest = Sha256::new();
+        digest.update((REVISION_DIGEST_DOMAIN.len() as u64).to_be_bytes());
+        digest.update(REVISION_DIGEST_DOMAIN);
+        digest.update((key.len() as u64).to_be_bytes());
+        digest.update(key.as_bytes());
+        digest.update((head_count as u64).to_be_bytes());
+        for head in heads {
+            digest.update((head.len() as u64).to_be_bytes());
+            digest.update(head);
+        }
+        Some(digest.finalize().into())
+    }
+
+    fn record<'a>(&mut self, key: &str, heads: impl ExactSizeIterator<Item = &'a [u8]>) -> bool {
+        let Some(digest) = self.digest_revision(key, heads) else {
+            return false;
+        };
+        if self.slots[..self.len].contains(&digest) {
+            return true;
+        }
+        if self.len == self.slots.len() {
+            self.exhausted = true;
+            return false;
+        }
+        self.slots[self.len] = digest;
+        self.len += 1;
+        true
+    }
+
+    fn is_local<'a>(&mut self, key: &str, heads: impl ExactSizeIterator<Item = &'a [u8]>) -> bool {
+        let Some(digest) = self.digest_revision(key, heads) else {
+            return true;
+        };
+        self.slots[..self.len].contains(&digest)
+    }
+}
+
+/// Read-only facade over the node's document store.
+///
+/// The backing `Arc<AutomergeStore>` is intentionally private and this type
+/// implements no `Deref`, `AsRef`, or `Borrow`, so callers cannot recover a
+/// mutable store handle.
+///
+#[derive(Clone)]
+pub struct DocumentStoreReader {
+    store: Arc<AutomergeStore>,
+}
+
+impl DocumentStoreReader {
+    pub fn get(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        self.store
+            .get(key)
+            .map(|doc| doc.map(|doc| automerge_to_json(&doc)))
+    }
+
+    pub fn scan_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        self.store.scan_prefix(prefix).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(key, doc)| (key, automerge_to_json(&doc)))
+                .collect()
+        })
+    }
+
+    pub fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.store.keys_with_prefix(prefix)
+    }
+
+    pub fn subscribe_to_observer_changes(&self) -> broadcast::Receiver<String> {
+        self.store.subscribe_to_observer_changes()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,6 +569,8 @@ impl SidecarNode {
         };
 
         let (change_tx, _) = broadcast::channel(256);
+        let (bridge_change_tx, _) = broadcast::channel(BRIDGE_CHANGE_CAPACITY);
+        let local_revisions = Arc::new(Mutex::new(LocalRevisionGuard::new()));
 
         // Forward AutomergeStore observer events into our ChangeEvent shape
         // (collection/doc_id split + cipher decrypt) for service.rs::subscribe.
@@ -470,6 +604,21 @@ impl SidecarNode {
         // latency-sensitive document preempts a lower-priority backlog instead
         // of being head-of-line-blocked behind it in the inline loop.
         let sync_rx = backend.store().subscribe_to_changes_with_origin();
+        let bridge_rx = backend.store().subscribe_to_changes_with_origin();
+        let bridge_store = Arc::clone(backend.store());
+        let bridge_tx = bridge_change_tx.clone();
+        let bridge_cipher = cipher.clone();
+        let bridge_local_revisions = Arc::clone(&local_revisions);
+        tokio::spawn(async move {
+            Self::forward_bridge_changes(
+                bridge_rx,
+                bridge_tx,
+                bridge_store,
+                bridge_cipher,
+                bridge_local_revisions,
+            )
+            .await;
+        });
         let fanout = crate::fanout::PriorityFanout::new();
         tokio::spawn(Arc::clone(&fanout).run(
             Arc::clone(backend.coordinator()),
@@ -862,6 +1011,8 @@ impl SidecarNode {
             backend,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
+            bridge_change_tx,
+            local_revisions,
             cipher,
             attachment_config: config.attachment_config,
             bundle_registry,
@@ -1049,7 +1200,7 @@ impl SidecarNode {
 
     /// PRD-006 distribution substrate. `None` when attachments are
     /// disabled (no `--attachment-root` configured).
-    pub fn file_distribution(&self) -> Option<&Arc<IrohFileDistribution>> {
+    pub(crate) fn file_distribution(&self) -> Option<&Arc<IrohFileDistribution>> {
         self.file_distribution.as_ref()
     }
 
@@ -1060,7 +1211,7 @@ impl SidecarNode {
         self.backend.blob_store()
     }
 
-    /// The Automerge document store the backend holds.
+    /// Read-only access to documents held by the backend.
     ///
     /// Exposed for the attachment subsystem's inbox watcher (which writes
     /// receiver-side `NodeTransferStatus` into the `file_distributions`
@@ -1068,8 +1219,48 @@ impl SidecarNode {
     /// sees real cross-peer state — see `attachments/inbox.rs`), and for
     /// integration tests that need to read the local document state
     /// directly rather than through the gRPC surface.
-    pub fn document_store(&self) -> &Arc<AutomergeStore> {
-        self.backend.store()
+    ///
+    /// Former raw-store mutation is intentionally a compile error:
+    ///
+    /// ```compile_fail
+    /// fn raw_mutation_is_unavailable(reader: &peat_node::node::DocumentStoreReader) {
+    ///     reader.delete("frames:one").unwrap();
+    ///     reader.put("frames:one", panic!("type is irrelevant")).unwrap();
+    /// }
+    /// ```
+    pub fn document_store(&self) -> DocumentStoreReader {
+        DocumentStoreReader {
+            store: Arc::clone(self.backend.store()),
+        }
+    }
+
+    /// Typed attachment-document read for integration and attachment code.
+    pub fn read_attachment_distribution(
+        &self,
+        distribution_id: &str,
+    ) -> anyhow::Result<Option<DistributionDocument>> {
+        peat_protocol::storage::read_distribution_document(
+            self.backend.store().as_ref(),
+            distribution_id,
+        )
+    }
+
+    /// Narrow attachment mutation used by the discovery-grace promoter.
+    ///
+    /// The only collection this can mutate is peat-mesh's canonical
+    /// `file_distributions`, which bridge configuration reserves exactly.
+    pub(crate) fn write_attachment_node_status(
+        &self,
+        distribution_id: &str,
+        node_id: &str,
+        status: &NodeTransferStatus,
+    ) -> anyhow::Result<()> {
+        peat_protocol::storage::write_receiver_node_status(
+            self.backend.store().as_ref(),
+            distribution_id,
+            node_id,
+            status,
+        )
     }
 
     /// The short-form id of this node's iroh endpoint, the same string the
@@ -1177,6 +1368,98 @@ impl SidecarNode {
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("store observer lagged {n} messages");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    /// Forward only proven remote, present, non-local revisions to the bridge.
+    ///
+    /// Pinned peat-mesh exposes `DocChange { key, origin }`, not an atomic
+    /// origin+snapshot event. The shared per-key lock therefore closes the
+    /// notification/reread race: local writes record their completed exact
+    /// heads before unlock, while this path captures and classifies the current
+    /// snapshot under the same lock. Superseded remote events may be dropped;
+    /// a later local snapshot can never be attributed as remote.
+    async fn forward_bridge_changes(
+        mut rx: broadcast::Receiver<DocChange>,
+        tx: broadcast::Sender<BridgeChangeEvent>,
+        store: Arc<AutomergeStore>,
+        cipher: Option<StoreCipher>,
+        local_revisions: Arc<Mutex<LocalRevisionGuard>>,
+    ) {
+        loop {
+            match rx.recv().await {
+                Ok(DocChange {
+                    key,
+                    origin: ChangeOrigin::Remote(remote_peer_id),
+                }) => {
+                    let snapshot = {
+                        let _key_guard = store.lock_doc(&key);
+                        let doc = match store.get(&key) {
+                            Ok(Some(doc)) => doc,
+                            Ok(None) => continue,
+                            Err(_) => {
+                                warn!("bridge snapshot read failed");
+                                continue;
+                            }
+                        };
+                        let heads = doc.get_heads();
+                        let locally_authored = local_revisions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_local(&key, heads.iter().map(AsRef::as_ref));
+                        drop(heads);
+                        if locally_authored {
+                            continue;
+                        }
+                        automerge_to_json(&doc)
+                    };
+
+                    let Some((collection, doc_id)) = key.split_once(':') else {
+                        warn!("bridge snapshot key classification failed");
+                        continue;
+                    };
+                    let json_data = if let Some(encrypted) = snapshot
+                        .get("value")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| crate::crypto::is_encrypted(value))
+                    {
+                        let Some(cipher) = &cipher else {
+                            warn!("bridge snapshot decrypt unavailable");
+                            continue;
+                        };
+                        match cipher.decrypt(encrypted) {
+                            Ok(plaintext) => plaintext,
+                            Err(_) => {
+                                warn!("bridge snapshot decrypt failed");
+                                continue;
+                            }
+                        }
+                    } else {
+                        match serde_json::to_string(&snapshot) {
+                            Ok(json) => json,
+                            Err(_) => {
+                                warn!("bridge snapshot conversion failed");
+                                continue;
+                            }
+                        }
+                    };
+
+                    let _ = tx.send(BridgeChangeEvent {
+                        collection: collection.to_owned(),
+                        doc_id: doc_id.to_owned(),
+                        remote_peer_id,
+                        json_data,
+                    });
+                }
+                Ok(DocChange {
+                    origin: ChangeOrigin::Local,
+                    ..
+                }) => {}
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    warn!(dropped_count = count, "bridge change listener lagged");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1546,6 +1829,7 @@ impl SidecarNode {
 
         let key = format!("{collection}:{doc_id}");
         let store = self.backend.store();
+        let _key_guard = store.lock_doc(&key);
         let existing = store.get(&key).map_err(DocumentWriteError::StoreRead)?;
         if matches!(mode, DocumentWriteMode::CreateOnly) && existing.is_some() {
             return Err(DocumentWriteError::AlreadyExists);
@@ -1577,6 +1861,11 @@ impl SidecarNode {
         store
             .put(&key, &doc)
             .map_err(DocumentWriteError::StoreWrite)?;
+        let heads = doc.get_heads();
+        self.local_revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(&key, heads.iter().map(AsRef::as_ref));
         Ok(())
     }
 
@@ -1612,7 +1901,9 @@ impl SidecarNode {
 
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
-        self.backend.store().delete(&key)?;
+        let store = self.backend.store();
+        let _key_guard = store.lock_doc(&key);
+        store.delete(&key)?;
 
         let _ = self.change_tx.send(ChangeEvent {
             collection: collection.to_string(),
@@ -1650,6 +1941,11 @@ impl SidecarNode {
         self.change_tx.subscribe()
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_bridge_changes(&self) -> broadcast::Receiver<BridgeChangeEvent> {
+        self.bridge_change_tx.subscribe()
+    }
+
     // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
 
     pub fn set_collection_config(&self, entry: CollectionConfigEntry) -> anyhow::Result<()> {
@@ -1684,6 +1980,303 @@ impl SidecarNode {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.backend.blob_store().shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nats_bridge::config::{BridgeConfig, BridgeConfigIssueKind};
+    use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
+
+    async fn test_node(encrypted: bool) -> (tempfile::TempDir, SidecarNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let encryption_key =
+            encrypted.then(|| base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]));
+        let node = SidecarNode::new(SidecarConfig {
+            node_id: "bridge-test".to_owned(),
+            app_id: "bridge-test".to_owned(),
+            data_dir: dir.path().to_path_buf(),
+            encryption_key,
+            disable_mdns: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (dir, node)
+    }
+
+    fn put_remote(node: &SidecarNode, key: &str, json: &str, peer: &str) {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let doc = if let Some(cipher) = &node.cipher {
+            let encrypted = cipher.encrypt(json).unwrap();
+            json_to_automerge(&serde_json::json!({ "value": encrypted }), None).unwrap()
+        } else {
+            json_to_automerge(&value, None).unwrap()
+        };
+        let store = node.backend.store();
+        let _guard = store.lock_doc(key);
+        store
+            .put_with_origin(key, &doc, ChangeOrigin::Remote(peer.to_owned()))
+            .unwrap();
+    }
+
+    async fn expect_no_bridge_event(rx: &mut broadcast::Receiver<BridgeChangeEvent>) {
+        assert!(tokio::time::timeout(Duration::from_millis(75), rx.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn bridge_change_remote_plain_and_encrypted_upserts_are_exact() {
+        for encrypted in [false, true] {
+            let (_dir, node) = test_node(encrypted).await;
+            let mut rx = node.subscribe_bridge_changes();
+            let json = r#"{"kind":"peat.nats-bridge","version":1,"subject":"vision.summary","source_node_id":"other","payload":" {\"frame\":1} "}"#;
+            put_remote(&node, "frames:remote-1", json, "peer-immediate");
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.collection, "frames");
+            assert_eq!(event.doc_id, "remote-1");
+            assert_eq!(event.remote_peer_id, "peer-immediate");
+            if encrypted {
+                assert_eq!(event.json_data, json);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&event.json_data).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(json).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_change_local_mutations_and_all_deletes_are_excluded() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        node.put_document("frames", "local", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        node.create_bridge_document("frames", "ingress", r#"{"ingress":true}"#)
+            .await
+            .unwrap();
+        node.delete_document("frames", "local").await.unwrap();
+        {
+            let store = node.backend.store();
+            let key = "frames:remote-delete";
+            let _guard = store.lock_doc(key);
+            store
+                .delete_with_origin(key, ChangeOrigin::Remote("peer-a".to_owned()))
+                .unwrap();
+        }
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_change_queued_remote_then_local_overwrite_never_emits_local_snapshot() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let key = "frames:raced";
+        {
+            // The store lock is the deterministic pause gate: the Remote
+            // notification is queued, but the forwarder cannot capture until
+            // the mediated local revision has been recorded before unlock.
+            let store = node.backend.store();
+            let _pause = store.lock_doc(key);
+            store
+                .put_with_origin(
+                    key,
+                    &json_to_automerge(&serde_json::json!({"remote": true}), None).unwrap(),
+                    ChangeOrigin::Remote("peer-a".to_owned()),
+                )
+                .unwrap();
+            let local = json_to_automerge(&serde_json::json!({"local": true}), None).unwrap();
+            store.put(key, &local).unwrap();
+            let heads = local.get_heads();
+            node.local_revisions
+                .lock()
+                .unwrap()
+                .record(key, heads.iter().map(AsRef::as_ref));
+        }
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_change_queued_remote_tombstone_then_local_put_is_suppressed() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let key = "frames:tombstone-race";
+        {
+            let store = node.backend.store();
+            let _pause = store.lock_doc(key);
+            store
+                .delete_with_origin(key, ChangeOrigin::Remote("peer-a".to_owned()))
+                .unwrap();
+            let local = json_to_automerge(&serde_json::json!({"local": true}), None).unwrap();
+            store.put(key, &local).unwrap();
+            let heads = local.get_heads();
+            node.local_revisions
+                .lock()
+                .unwrap()
+                .record(key, heads.iter().map(AsRef::as_ref));
+        }
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_change_remote_capture_first_preserves_clone_before_local_last() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        put_remote(&node, "frames:ordered", r#"{"remote":true}"#, "peer-a");
+        let remote = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        node.put_document("frames", "ordered", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        assert_eq!(remote.json_data, r#"{"remote":true}"#);
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_change_local_first_remote_last_emits_exact_remote_state() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        node.put_document("frames", "ordered", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        put_remote(&node, "frames:ordered", r#"{"remote":true}"#, "peer-a");
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.json_data, r#"{"remote":true}"#);
+    }
+
+    #[test]
+    fn bridge_change_revision_guard_is_fixed_non_evicting_and_fail_closed() {
+        let mut guard = LocalRevisionGuard::new();
+        assert_eq!(guard.slots.len(), LOCAL_REVISION_CAPACITY);
+        assert_eq!(std::mem::size_of_val(&*guard.slots), 131_072);
+        let head = [7u8; 32];
+        for index in 0..LOCAL_REVISION_CAPACITY {
+            assert!(guard.record(&format!("frames:{index}"), std::iter::once(head.as_slice())));
+        }
+        assert_eq!(guard.len, LOCAL_REVISION_CAPACITY);
+        assert!(!guard.record("frames:overflow", std::iter::once(head.as_slice())));
+        assert!(guard.exhausted);
+        assert!(guard.is_local("never-seen", std::iter::once(head.as_slice())));
+    }
+
+    #[test]
+    fn bridge_change_revision_digest_frames_inputs_and_caps_post_get_heads_work() {
+        let mut guard = LocalRevisionGuard::new();
+        let heads_64 = [[1u8; 32]; MAX_REVISION_HEADS];
+        assert!(guard.record("ab", heads_64.iter().map(|head| head.as_slice())));
+        assert!(guard.is_local("ab", heads_64.iter().map(|head| head.as_slice())));
+        assert!(!guard.is_local("a", heads_64.iter().map(|head| head.as_slice())));
+
+        let heads_65 = [[2u8; 32]; MAX_REVISION_HEADS + 1];
+        assert!(!guard.record("over", heads_65.iter().map(|head| head.as_slice())));
+        assert!(guard.exhausted);
+        // Pinned Automerge 0.9.0 get_heads() has already allocated and sorted
+        // its complete Vec before this 65-head fail-closed check. This asserts
+        // retained guard state only; it makes no transient allocation claim.
+        assert_eq!(guard.len, 1);
+    }
+
+    #[tokio::test]
+    async fn bridge_change_broadcast_is_bounded_and_recovers_after_lag() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        for index in 0..=BRIDGE_CHANGE_CAPACITY {
+            node.bridge_change_tx
+                .send(BridgeChangeEvent {
+                    collection: "frames".to_owned(),
+                    doc_id: index.to_string(),
+                    remote_peer_id: "peer".to_owned(),
+                    json_data: "{}".to_owned(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        assert!(rx.recv().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_change_reader_facade_supports_reads_without_raw_store_extraction() {
+        let (_dir, node) = test_node(false).await;
+        let mut observer = node.document_store().subscribe_to_observer_changes();
+        node.put_document("frames", "one", r#"{"value":1}"#)
+            .await
+            .unwrap();
+        assert_eq!(observer.recv().await.unwrap(), "frames:one");
+        assert_eq!(
+            node.document_store().get("frames:one").unwrap(),
+            Some(serde_json::json!({"value": 1}))
+        );
+        assert_eq!(
+            node.document_store()
+                .keys_with_prefix("frames:")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            node.document_store().scan_prefix("frames:").unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_change_reserved_collection_blocks_envelope_shaped_attachment_adversary() {
+        let (_dir, node) = test_node(false).await;
+        let key = format!("{IROH_DISTRIBUTION_COLLECTION}:adversary");
+        let value = serde_json::json!({
+            "kind": "peat.nats-bridge",
+            "version": 1,
+            "subject": "vision.summary",
+            "source_node_id": "remote",
+            "payload": "{\"frame\":1}",
+            "blob_hash": "attachment-like-extra-field"
+        });
+        let doc = json_to_automerge(&value, None).unwrap();
+        node.backend.store().put(&key, &doc).unwrap();
+        assert!(node.backend.store().get(&key).unwrap().is_some());
+
+        let error = BridgeConfig::from_raw(
+            Some("nats://127.0.0.1:4222"),
+            &[format!("vision.summary={IROH_DISTRIBUTION_COLLECTION}")],
+        )
+        .expect_err("internal attachment collection must not create a runtime");
+        assert_eq!(
+            error.issues()[0].kind,
+            BridgeConfigIssueKind::ReservedCollection
+        );
+        assert!(BridgeConfig::from_raw(
+            Some("nats://127.0.0.1:4222"),
+            &["vision.summary=File_Distributions".to_owned()],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bridge_change_source_inventory_keeps_raw_mutation_private_and_reserved() {
+        let node_source = include_str!("node.rs");
+        let handler_source = include_str!("attachments/handlers.rs");
+        assert!(!node_source.contains(&["pub fn ", "backend("].concat()));
+        assert!(!node_source.contains(&["pub fn ", "raw_store("].concat()));
+        assert!(!node_source.contains(&["pub fn ", "file_distribution("].concat()));
+        assert!(!handler_source.contains("document_store().put"));
+        assert!(!handler_source.contains("document_store().delete"));
+        assert!(node_source.contains("write_attachment_node_status"));
+        assert_eq!(IROH_DISTRIBUTION_COLLECTION, "file_distributions");
     }
 }
 

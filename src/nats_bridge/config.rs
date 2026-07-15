@@ -9,6 +9,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use async_nats::{ServerAddr, Subject};
+use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
 
 const DEFAULT_NATS_PORT: u16 = 4222;
 
@@ -248,6 +249,7 @@ pub enum BridgeConfigIssueKind {
     SubjectContainsWildcard,
     ReservedSubject,
     InvalidCollection,
+    ReservedCollection,
     DuplicateSubject { original_index: usize },
     DuplicateCollection { original_index: usize },
 }
@@ -271,6 +273,7 @@ impl BridgeConfigIssueKind {
             Self::SubjectContainsWildcard => "mapping subject must be literal",
             Self::ReservedSubject => "mapping subject uses a reserved prefix",
             Self::InvalidCollection => "mapping collection has invalid characters",
+            Self::ReservedCollection => "mapping collection is reserved for internal use",
             Self::DuplicateSubject { .. } => "mapping subject duplicates an earlier mapping",
             Self::DuplicateCollection { .. } => "mapping collection duplicates an earlier mapping",
         }
@@ -390,6 +393,12 @@ fn parse_mappings(
             issues.push(BridgeConfigIssue::mapping(
                 index,
                 BridgeConfigIssueKind::InvalidCollection,
+            ));
+        } else if collection == IROH_DISTRIBUTION_COLLECTION {
+            collection_valid = false;
+            issues.push(BridgeConfigIssue::mapping(
+                index,
+                BridgeConfigIssueKind::ReservedCollection,
             ));
         }
 
@@ -616,6 +625,38 @@ mod tests {
                 error.issues()[0].kind,
                 BridgeConfigIssueKind::InvalidCollection
             );
+        }
+    }
+
+    #[test]
+    fn reserves_only_the_exact_internal_file_distribution_collection() {
+        let error = BridgeConfig::from_raw(
+            Some("nats://broker.example"),
+            &[format!("vision.summary={IROH_DISTRIBUTION_COLLECTION}")],
+        )
+        .expect_err("the canonical attachment collection must be unmappable");
+        assert_eq!(
+            error.issues(),
+            &[BridgeConfigIssue::mapping(
+                1,
+                BridgeConfigIssueKind::ReservedCollection
+            )]
+        );
+        assert_eq!(
+            error.to_string(),
+            "invalid NATS bridge configuration; mapping 1: mapping collection is reserved for internal use"
+        );
+
+        for collection in [
+            "File_Distributions",
+            "file_distribution",
+            "file_distributions_v2",
+        ] {
+            assert!(BridgeConfig::from_raw(
+                Some("nats://broker.example"),
+                &[format!("vision.summary={collection}")],
+            )
+            .is_ok());
         }
     }
 

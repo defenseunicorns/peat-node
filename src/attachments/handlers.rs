@@ -25,12 +25,10 @@ use std::time::Duration;
 
 use connectrpc::ConnectError;
 use futures::stream::{Stream, StreamExt};
-use peat_mesh::storage::AutomergeStore;
 use peat_protocol::storage::file_distribution::{
     DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
     TransferPriority, TransferState,
 };
-use peat_protocol::storage::{read_distribution_document, write_receiver_node_status};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
@@ -210,7 +208,7 @@ pub async fn send_attachments(
         // terminal — no separate finalize path.
         if let Some(ids) = declared_node_list.clone() {
             spawn_discovery_grace_promoter(
-                Arc::clone(node.document_store()),
+                Arc::clone(node),
                 h.distribution_handle.distribution_id.clone(),
                 ids,
                 discovery_grace,
@@ -698,7 +696,7 @@ fn spawn_distribution_watcher(
 /// transfer path — the grace window is about discovery, not transfer
 /// speed.
 fn spawn_discovery_grace_promoter(
-    document_store: Arc<AutomergeStore>,
+    node: Arc<SidecarNode>,
     distribution_id: String,
     declared_ids: Vec<String>,
     grace: Duration,
@@ -707,7 +705,7 @@ fn spawn_discovery_grace_promoter(
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
 
-        let doc = match read_distribution_document(document_store.as_ref(), &distribution_id) {
+        let doc = match node.read_attachment_distribution(&distribution_id) {
             Ok(Some(d)) => d,
             // Doc gone (bundle evicted, or never persisted) — nothing
             // to promote.
@@ -744,9 +742,7 @@ fn spawn_discovery_grace_promoter(
                 completed_at: None,
                 error: Some("discovery grace expired: peer never connected".to_string()),
             };
-            if let Err(e) =
-                write_receiver_node_status(document_store.as_ref(), &distribution_id, id, &ns)
-            {
+            if let Err(e) = node.write_attachment_node_status(&distribution_id, id, &ns) {
                 warn!(
                     distribution_id = %distribution_id,
                     node = %id,
