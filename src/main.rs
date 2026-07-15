@@ -411,7 +411,7 @@ fn start_bridge_runtime_with<T>(
 }
 
 fn start_bridge_runtime(bridge_config: BridgeConfig) -> Option<BridgeRuntimeHandle> {
-    start_bridge_runtime_with(bridge_config, BridgeRuntime::spawn)
+    start_bridge_runtime_with(bridge_config, BridgeRuntime::spawn_connection_only)
 }
 
 #[tokio::main]

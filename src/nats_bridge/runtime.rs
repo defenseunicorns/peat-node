@@ -181,15 +181,15 @@ pub struct BridgeRuntime;
 impl BridgeRuntime {
     /// Phase 1 compatibility constructor used until process wiring supplies a node.
     ///
-    /// This keeps the connection lifecycle non-blocking; [`Self::spawn_with_node`]
+    /// This keeps the connection lifecycle non-blocking; [`Self::spawn`]
     /// owns the Phase 2 subscription and ingress generation.
-    pub fn spawn(config: EnabledBridgeConfig) -> BridgeRuntimeHandle {
+    pub fn spawn_connection_only(config: EnabledBridgeConfig) -> BridgeRuntimeHandle {
         let stats = IngressStats::default();
         Self::spawn_supervisor(config, stats, None)
     }
 
     /// Spawn the complete subscription-aware ingress runtime.
-    pub fn spawn_with_node(
+    pub fn spawn(
         config: EnabledBridgeConfig,
         source_node_id: String,
         node: Arc<SidecarNode>,
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_returns_before_unavailable_connector_can_resolve() {
-        let handle = BridgeRuntime::spawn(enabled_config());
+        let handle = BridgeRuntime::spawn_connection_only(enabled_config());
         assert!(!handle.readiness().snapshot().is_ready());
         assert!(!handle.is_finished());
     }
