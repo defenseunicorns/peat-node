@@ -5,17 +5,37 @@
 //! configured route, and non-local provenance. The payload string is then
 //! moved directly into [`Bytes`] without parsing or serialization.
 
-use std::collections::HashMap;
+// Plan 03-02 builds the complete internal seam; Plan 03-03 wires it into the
+// runtime. Keep non-test builds warning-clean during that intentional interval.
+#![allow(dead_code)]
 
-use async_nats::Subject;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_nats::{HeaderMap, HeaderValue, Subject};
 use buffa::bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
 
 use crate::nats_bridge::config::SubjectMapping;
 use crate::nats_bridge::envelope::{BridgeEnvelope, BRIDGE_ENVELOPE_KIND, BRIDGE_ENVELOPE_VERSION};
+use crate::nats_bridge::ingress::MAX_INGRESS_PAYLOAD_BYTES;
 use crate::node::BridgeChangeEvent;
 
 /// Stable private marker added to bridge-owned Core NATS publications.
 pub(crate) const BRIDGE_ORIGIN_HEADER: &str = "Peat-Nats-Bridge-Origin";
+
+/// Maximum eligible egress items retained by the bridge-owned FIFO.
+pub(crate) const EGRESS_QUEUE_CAPACITY: usize = 256;
+
+/// Exact count of process-lifetime document digests retained for deduplication.
+pub(crate) const EGRESS_DEDUP_CAPACITY: usize = 4096;
+
+const EGRESS_DOCUMENT_DIGEST_DOMAIN: &[u8] = b"peat-node/egress-document/v1\0";
 
 /// Fixed, payload-safe reason that a remote Peat upsert is ineligible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +46,9 @@ pub(crate) enum EgressSkipKind {
     UnmappedCollection,
     RouteMismatch,
     ReturnedLocal,
+    OversizedPayload,
+    Duplicate,
+    DedupExhausted,
 }
 
 /// One byte-exact publish request after all envelope and route gates pass.
@@ -35,9 +58,159 @@ pub(crate) struct EgressItem {
     pub payload: Bytes,
 }
 
+/// Fixed terminal delivery failure; source error text is deliberately discarded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EgressFailureKind {
+    QueueFull,
+    QueueClosed,
+    Unavailable,
+    PublishFailed,
+}
+
+/// Fixed action shape safe for logs and bounded diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EgressActionKind {
+    Skipped(EgressSkipKind),
+    Lost(EgressFailureKind),
+    Published,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EgressAction {
+    pub kind: EgressActionKind,
+    /// Index in the finite startup mapping list, never event-derived text.
+    pub route_index: Option<usize>,
+    pub payload_bytes: Option<usize>,
+}
+
+impl EgressAction {
+    fn emit(&self) {
+        let route_index = self.route_index.unwrap_or_default();
+        let payload_bytes = self.payload_bytes.unwrap_or_default();
+        match self.kind {
+            EgressActionKind::Published => debug!(
+                route_index,
+                payload_bytes, "NATS bridge egress publish enqueued"
+            ),
+            EgressActionKind::Skipped(kind) => debug!(
+                route_index,
+                payload_bytes,
+                reason = ?kind,
+                "NATS bridge egress skipped"
+            ),
+            EgressActionKind::Lost(kind) => warn!(
+                route_index,
+                payload_bytes,
+                reason = ?kind,
+                "NATS bridge egress terminal loss"
+            ),
+        }
+    }
+}
+
+trait EgressActionEmitter: Send + Sync + 'static {
+    fn emit(&self, action: EgressAction);
+}
+
+#[derive(Clone, Copy)]
+struct TracingEgressEmitter;
+
+impl EgressActionEmitter for TracingEgressEmitter {
+    fn emit(&self, action: EgressAction) {
+        action.emit();
+    }
+}
+
+/// Label-free monotonic egress counters.
+#[derive(Clone, Default)]
+pub(crate) struct EgressStats {
+    inner: Arc<EgressStatsInner>,
+}
+
+#[derive(Default)]
+struct EgressStatsInner {
+    malformed: AtomicU64,
+    unsupported: AtomicU64,
+    unmapped: AtomicU64,
+    route_mismatch: AtomicU64,
+    returned_local: AtomicU64,
+    oversized_payload: AtomicU64,
+    duplicate: AtomicU64,
+    dedup_exhausted: AtomicU64,
+    queue_full: AtomicU64,
+    queue_closed: AtomicU64,
+    unavailable: AtomicU64,
+    publish_failed: AtomicU64,
+    published: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct EgressStatsSnapshot {
+    pub malformed: u64,
+    pub unsupported: u64,
+    pub unmapped: u64,
+    pub route_mismatch: u64,
+    pub returned_local: u64,
+    pub oversized_payload: u64,
+    pub duplicate: u64,
+    pub dedup_exhausted: u64,
+    pub queue_full: u64,
+    pub queue_closed: u64,
+    pub unavailable: u64,
+    pub publish_failed: u64,
+    pub published: u64,
+}
+
+impl EgressStats {
+    pub fn snapshot(&self) -> EgressStatsSnapshot {
+        EgressStatsSnapshot {
+            malformed: self.inner.malformed.load(Ordering::Relaxed),
+            unsupported: self.inner.unsupported.load(Ordering::Relaxed),
+            unmapped: self.inner.unmapped.load(Ordering::Relaxed),
+            route_mismatch: self.inner.route_mismatch.load(Ordering::Relaxed),
+            returned_local: self.inner.returned_local.load(Ordering::Relaxed),
+            oversized_payload: self.inner.oversized_payload.load(Ordering::Relaxed),
+            duplicate: self.inner.duplicate.load(Ordering::Relaxed),
+            dedup_exhausted: self.inner.dedup_exhausted.load(Ordering::Relaxed),
+            queue_full: self.inner.queue_full.load(Ordering::Relaxed),
+            queue_closed: self.inner.queue_closed.load(Ordering::Relaxed),
+            unavailable: self.inner.unavailable.load(Ordering::Relaxed),
+            publish_failed: self.inner.publish_failed.load(Ordering::Relaxed),
+            published: self.inner.published.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_skip(&self, kind: EgressSkipKind) {
+        let counter = match kind {
+            EgressSkipKind::MalformedEnvelope => &self.inner.malformed,
+            EgressSkipKind::UnsupportedKind | EgressSkipKind::UnsupportedVersion => {
+                &self.inner.unsupported
+            }
+            EgressSkipKind::UnmappedCollection => &self.inner.unmapped,
+            EgressSkipKind::RouteMismatch => &self.inner.route_mismatch,
+            EgressSkipKind::ReturnedLocal => &self.inner.returned_local,
+            EgressSkipKind::OversizedPayload => &self.inner.oversized_payload,
+            EgressSkipKind::Duplicate => &self.inner.duplicate,
+            EgressSkipKind::DedupExhausted => &self.inner.dedup_exhausted,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, kind: EgressFailureKind) {
+        let counter = match kind {
+            EgressFailureKind::QueueFull => &self.inner.queue_full,
+            EgressFailureKind::QueueClosed => &self.inner.queue_closed,
+            EgressFailureKind::Unavailable => &self.inner.unavailable,
+            EgressFailureKind::PublishFailed => &self.inner.publish_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Finite collection-to-subject table derived only from validated startup config.
 pub(crate) struct EgressClassifier {
     routes: HashMap<String, Subject>,
+    route_indexes: HashMap<String, usize>,
     local_node_id: String,
 }
 
@@ -47,10 +220,20 @@ impl EgressClassifier {
             .iter()
             .map(|mapping| (mapping.collection().to_owned(), mapping.subject().clone()))
             .collect();
+        let route_indexes = mappings
+            .iter()
+            .enumerate()
+            .map(|(index, mapping)| (mapping.collection().to_owned(), index))
+            .collect();
         Self {
             routes,
+            route_indexes,
             local_node_id: local_node_id.to_owned(),
         }
+    }
+
+    fn route_index(&self, collection: &str) -> Option<usize> {
+        self.route_indexes.get(collection).copied()
     }
 
     /// Classify one private remote-only node event without retaining event data.
@@ -73,6 +256,9 @@ impl EgressClassifier {
         if envelope.source_node_id == self.local_node_id {
             return Err(EgressSkipKind::ReturnedLocal);
         }
+        if envelope.payload.len() > MAX_INGRESS_PAYLOAD_BYTES {
+            return Err(EgressSkipKind::OversizedPayload);
+        }
 
         Ok(EgressItem {
             subject: subject.clone(),
@@ -83,6 +269,271 @@ impl EgressClassifier {
     #[cfg(test)]
     fn route_count(&self) -> usize {
         self.routes.len()
+    }
+}
+
+type DocumentDigestFn = fn(&str, &str) -> Option<[u8; 32]>;
+
+fn document_digest(collection: &str, doc_id: &str) -> Option<[u8; 32]> {
+    let collection_len = u64::try_from(collection.len()).ok()?;
+    let doc_id_len = u64::try_from(doc_id.len()).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(EGRESS_DOCUMENT_DIGEST_DOMAIN);
+    hasher.update(collection_len.to_be_bytes());
+    hasher.update(collection.as_bytes());
+    hasher.update(doc_id_len.to_be_bytes());
+    hasher.update(doc_id.as_bytes());
+    Some(hasher.finalize().into())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DedupDisposition {
+    Inserted,
+    Duplicate,
+    Exhausted,
+}
+
+/// Exact-size, non-evicting process-lifetime digest table.
+struct EgressDedup {
+    slots: Box<[[u8; 32]; EGRESS_DEDUP_CAPACITY]>,
+    len: usize,
+    exhausted: bool,
+    digest_fn: DocumentDigestFn,
+}
+
+impl EgressDedup {
+    fn new() -> Self {
+        Self::with_digest_fn(document_digest)
+    }
+
+    fn with_digest_fn(digest_fn: DocumentDigestFn) -> Self {
+        Self {
+            slots: Box::new([[0; 32]; EGRESS_DEDUP_CAPACITY]),
+            len: 0,
+            exhausted: false,
+            digest_fn,
+        }
+    }
+
+    fn check_and_insert_digest(&mut self, digest: Option<[u8; 32]>) -> DedupDisposition {
+        let Some(digest) = digest else {
+            self.exhausted = true;
+            return DedupDisposition::Exhausted;
+        };
+        if self.slots[..self.len].contains(&digest) {
+            return DedupDisposition::Duplicate;
+        }
+        if self.exhausted || self.len == EGRESS_DEDUP_CAPACITY {
+            self.exhausted = true;
+            return DedupDisposition::Exhausted;
+        }
+        self.slots[self.len] = digest;
+        self.len += 1;
+        if self.len == EGRESS_DEDUP_CAPACITY {
+            self.exhausted = true;
+        }
+        DedupDisposition::Inserted
+    }
+}
+
+/// Non-blocking producer that classifies and deduplicates before FIFO admission.
+pub(crate) struct EgressRouter {
+    classifier: EgressClassifier,
+    dedup: Mutex<EgressDedup>,
+    tx: mpsc::Sender<EgressItem>,
+    stats: EgressStats,
+    emitter: Arc<dyn EgressActionEmitter>,
+}
+
+impl EgressRouter {
+    pub fn new(
+        mappings: &[SubjectMapping],
+        local_node_id: &str,
+        stats: EgressStats,
+    ) -> (Self, mpsc::Receiver<EgressItem>) {
+        Self::with_capacity_and_digest(
+            mappings,
+            local_node_id,
+            stats,
+            EGRESS_QUEUE_CAPACITY,
+            document_digest,
+            TracingEgressEmitter,
+        )
+    }
+
+    fn with_capacity_and_digest<E>(
+        mappings: &[SubjectMapping],
+        local_node_id: &str,
+        stats: EgressStats,
+        queue_capacity: usize,
+        digest_fn: DocumentDigestFn,
+        emitter: E,
+    ) -> (Self, mpsc::Receiver<EgressItem>)
+    where
+        E: EgressActionEmitter,
+    {
+        let (tx, rx) = mpsc::channel(queue_capacity);
+        (
+            Self {
+                classifier: EgressClassifier::new(mappings, local_node_id),
+                dedup: Mutex::new(EgressDedup::with_digest_fn(digest_fn)),
+                tx,
+                stats,
+                emitter: Arc::new(emitter),
+            },
+            rx,
+        )
+    }
+
+    pub fn admit(&self, event: BridgeChangeEvent) -> Result<(), EgressActionKind> {
+        let route_index = self.classifier.route_index(&event.collection);
+        let digest = (self
+            .dedup
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .digest_fn)(&event.collection, &event.doc_id);
+        let item = match self.classifier.classify(event) {
+            Ok(item) => item,
+            Err(kind) => {
+                self.record_action(EgressActionKind::Skipped(kind), route_index, None);
+                return Err(EgressActionKind::Skipped(kind));
+            }
+        };
+        let disposition = self
+            .dedup
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .check_and_insert_digest(digest);
+        match disposition {
+            DedupDisposition::Duplicate => {
+                let kind = EgressSkipKind::Duplicate;
+                self.record_action(EgressActionKind::Skipped(kind), route_index, None);
+                return Err(EgressActionKind::Skipped(kind));
+            }
+            DedupDisposition::Exhausted => {
+                let kind = EgressSkipKind::DedupExhausted;
+                self.record_action(EgressActionKind::Skipped(kind), route_index, None);
+                return Err(EgressActionKind::Skipped(kind));
+            }
+            DedupDisposition::Inserted => {}
+        }
+
+        let payload_bytes = item.payload.len();
+        match self.tx.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let kind = EgressFailureKind::QueueFull;
+                self.record_action(
+                    EgressActionKind::Lost(kind),
+                    route_index,
+                    Some(payload_bytes),
+                );
+                Err(EgressActionKind::Lost(kind))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let kind = EgressFailureKind::QueueClosed;
+                self.record_action(
+                    EgressActionKind::Lost(kind),
+                    route_index,
+                    Some(payload_bytes),
+                );
+                Err(EgressActionKind::Lost(kind))
+            }
+        }
+    }
+
+    fn record_action(
+        &self,
+        kind: EgressActionKind,
+        route_index: Option<usize>,
+        payload_bytes: Option<usize>,
+    ) {
+        match kind {
+            EgressActionKind::Skipped(kind) => self.stats.record_skip(kind),
+            EgressActionKind::Lost(kind) => self.stats.record_failure(kind),
+            EgressActionKind::Published => {
+                self.stats.inner.published.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.emitter.emit(EgressAction {
+            kind,
+            route_index,
+            payload_bytes,
+        });
+    }
+}
+
+/// Fallible serial publish seam. Success means client enqueue, not broker acknowledgement.
+pub(crate) trait BridgePublisher: Send + Sync + 'static {
+    fn publish<'a>(
+        &'a self,
+        subject: Subject,
+        headers: HeaderMap,
+        payload: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + 'a>>;
+}
+
+impl BridgePublisher for async_nats::Client {
+    fn publish<'a>(
+        &'a self,
+        subject: Subject,
+        headers: HeaderMap,
+        payload: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + 'a>> {
+        Box::pin(async move {
+            self.publish_with_headers(subject, headers, payload)
+                .await
+                .map_err(|_| EgressFailureKind::PublishFailed)
+        })
+    }
+}
+
+/// Drain the sole FIFO serially; failures are terminal and later items continue.
+pub(crate) async fn run_egress_worker<P: BridgePublisher>(
+    mut rx: mpsc::Receiver<EgressItem>,
+    local_node_id: String,
+    publisher: P,
+    stats: EgressStats,
+) {
+    let origin_header_value = local_node_id.parse::<HeaderValue>().ok();
+    while let Some(item) = rx.recv().await {
+        let payload_bytes = item.payload.len();
+        let Some(origin_header_value) = origin_header_value.clone() else {
+            stats.record_failure(EgressFailureKind::PublishFailed);
+            EgressAction {
+                kind: EgressActionKind::Lost(EgressFailureKind::PublishFailed),
+                route_index: None,
+                payload_bytes: Some(payload_bytes),
+            }
+            .emit();
+            continue;
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(BRIDGE_ORIGIN_HEADER, origin_header_value);
+        match publisher.publish(item.subject, headers, item.payload).await {
+            Ok(()) => {
+                stats.inner.published.fetch_add(1, Ordering::Relaxed);
+                EgressAction {
+                    kind: EgressActionKind::Published,
+                    route_index: None,
+                    payload_bytes: Some(payload_bytes),
+                }
+                .emit();
+            }
+            Err(kind @ EgressFailureKind::Unavailable)
+            | Err(kind @ EgressFailureKind::PublishFailed) => {
+                stats.record_failure(kind);
+                EgressAction {
+                    kind: EgressActionKind::Lost(kind),
+                    route_index: None,
+                    payload_bytes: Some(payload_bytes),
+                }
+                .emit();
+            }
+            Err(EgressFailureKind::QueueFull | EgressFailureKind::QueueClosed) => {
+                unreachable!("publisher cannot report FIFO admission failures")
+            }
+        }
     }
 }
 
@@ -119,9 +570,17 @@ mod tests {
     }
 
     fn event(collection: &str, envelope: &BridgeEnvelope) -> BridgeChangeEvent {
+        event_with_id(collection, "untrusted-document-id", envelope)
+    }
+
+    fn event_with_id(
+        collection: &str,
+        doc_id: &str,
+        envelope: &BridgeEnvelope,
+    ) -> BridgeChangeEvent {
         BridgeChangeEvent {
             collection: collection.to_owned(),
-            doc_id: "untrusted-document-id".to_owned(),
+            doc_id: doc_id.to_owned(),
             remote_peer_id: "untrusted-immediate-peer".to_owned(),
             json_data: serde_json::to_string(envelope).expect("serialize envelope"),
         }
@@ -238,8 +697,380 @@ mod tests {
     }
 
     #[test]
+    fn classifier_bounds_fifo_payload_bytes_without_truncation() {
+        let classifier = classifier();
+        let exact = format!("0{}", " ".repeat(MAX_INGRESS_PAYLOAD_BYTES - 1));
+        let accepted = envelope("Vision.Summary", "remote-node", &exact);
+        let item = classifier
+            .classify(event("Frame_Store-1", &accepted))
+            .expect("exact ingress ceiling remains eligible");
+        assert_eq!(item.payload.len(), MAX_INGRESS_PAYLOAD_BYTES);
+        assert_eq!(item.payload.as_ref(), exact.as_bytes());
+
+        let over = format!("{exact} ");
+        let rejected = envelope("Vision.Summary", "remote-node", &over);
+        assert_eq!(
+            classifier.classify(event("Frame_Store-1", &rejected)),
+            Err(EgressSkipKind::OversizedPayload)
+        );
+    }
+
+    #[test]
     fn classifier_header_name_is_stable_and_valid() {
         assert_eq!(BRIDGE_ORIGIN_HEADER, "Peat-Nats-Bridge-Origin");
         let _: async_nats::HeaderName = BRIDGE_ORIGIN_HEADER.parse().expect("valid header name");
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingEmitter {
+        actions: Arc<Mutex<Vec<EgressAction>>>,
+    }
+
+    impl EgressActionEmitter for RecordingEmitter {
+        fn emit(&self, action: EgressAction) {
+            self.actions.lock().expect("actions lock").push(action);
+        }
+    }
+
+    impl RecordingEmitter {
+        fn actions(&self) -> Vec<EgressAction> {
+            self.actions.lock().expect("actions lock").clone()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct PublishCall {
+        subject: Subject,
+        headers: HeaderMap,
+        payload: Bytes,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePublisher {
+        calls: Arc<Mutex<Vec<PublishCall>>>,
+        results: Arc<Mutex<Vec<Result<(), EgressFailureKind>>>>,
+    }
+
+    impl FakePublisher {
+        fn with_results(results: impl IntoIterator<Item = Result<(), EgressFailureKind>>) -> Self {
+            let mut results = results.into_iter().collect::<Vec<_>>();
+            results.reverse();
+            Self {
+                results: Arc::new(Mutex::new(results)),
+                ..Self::default()
+            }
+        }
+
+        fn calls(&self) -> Vec<PublishCall> {
+            self.calls.lock().expect("calls lock").clone()
+        }
+    }
+
+    impl BridgePublisher for FakePublisher {
+        fn publish<'a>(
+            &'a self,
+            subject: Subject,
+            headers: HeaderMap,
+            payload: Bytes,
+        ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.lock().expect("calls lock").push(PublishCall {
+                    subject,
+                    headers,
+                    payload,
+                });
+                self.results
+                    .lock()
+                    .expect("results lock")
+                    .pop()
+                    .unwrap_or(Ok(()))
+            })
+        }
+    }
+
+    fn constant_digest(_collection: &str, _doc_id: &str) -> Option<[u8; 32]> {
+        Some([0x5a; 32])
+    }
+
+    #[test]
+    fn dedup_digest_is_domain_separated_and_length_framed() {
+        let actual = document_digest("ab", "c").expect("digest");
+        let mut expected = Sha256::new();
+        expected.update(b"peat-node/egress-document/v1\0");
+        expected.update(2_u64.to_be_bytes());
+        expected.update(b"ab");
+        expected.update(1_u64.to_be_bytes());
+        expected.update(b"c");
+        assert_eq!(actual, <[u8; 32]>::from(expected.finalize()));
+        assert_ne!(actual, document_digest("a", "bc").expect("digest"));
+        assert_ne!(
+            document_digest("same", "id").expect("digest"),
+            document_digest("same-id", "").expect("digest")
+        );
+    }
+
+    #[test]
+    fn dedup_table_has_exact_fixed_width_storage_and_no_dynamic_entries() {
+        let table = EgressDedup::new();
+        assert_eq!(table.slots.len(), EGRESS_DEDUP_CAPACITY);
+        assert_eq!(
+            std::mem::size_of_val(table.slots.as_ref()),
+            EGRESS_DEDUP_CAPACITY * 32
+        );
+        assert_eq!(EGRESS_DEDUP_CAPACITY * 32, 131_072);
+        assert_eq!(table.len, 0);
+    }
+
+    #[test]
+    fn dedup_distinguishes_collections_and_collision_only_suppresses() {
+        let mut table = EgressDedup::new();
+        let a = document_digest("collection-a", "same-id");
+        let b = document_digest("collection-b", "same-id");
+        assert_eq!(table.check_and_insert_digest(a), DedupDisposition::Inserted);
+        assert_eq!(table.check_and_insert_digest(b), DedupDisposition::Inserted);
+
+        let mut collision_table = EgressDedup::with_digest_fn(constant_digest);
+        let first = (collision_table.digest_fn)("a", "first");
+        let collision = (collision_table.digest_fn)("b", "second");
+        assert_eq!(
+            collision_table.check_and_insert_digest(first),
+            DedupDisposition::Inserted
+        );
+        assert_eq!(
+            collision_table.check_and_insert_digest(collision),
+            DedupDisposition::Duplicate
+        );
+        assert_eq!(collision_table.len, 1);
+    }
+
+    #[test]
+    fn dedup_exhaustion_is_non_evicting_and_sticky_for_unseen_documents() {
+        let mut table = EgressDedup::new();
+        let first = document_digest("frames", "0");
+        for sequence in 0..EGRESS_DEDUP_CAPACITY {
+            assert_eq!(
+                table.check_and_insert_digest(document_digest(
+                    "frames",
+                    sequence.to_string().as_str()
+                )),
+                DedupDisposition::Inserted
+            );
+        }
+        assert_eq!(table.len, EGRESS_DEDUP_CAPACITY);
+        assert!(table.exhausted);
+        assert_eq!(
+            table.check_and_insert_digest(document_digest("frames", "unseen")),
+            DedupDisposition::Exhausted
+        );
+        assert_eq!(
+            table.check_and_insert_digest(first),
+            DedupDisposition::Duplicate
+        );
+        assert_eq!(table.len, EGRESS_DEDUP_CAPACITY);
+    }
+
+    #[test]
+    fn digest_conversion_failure_is_sticky_fail_closed() {
+        let mut table = EgressDedup::new();
+        assert_eq!(
+            table.check_and_insert_digest(None),
+            DedupDisposition::Exhausted
+        );
+        assert!(table.exhausted);
+        assert_eq!(
+            table.check_and_insert_digest(document_digest("frames", "later")),
+            DedupDisposition::Exhausted
+        );
+    }
+
+    #[test]
+    fn queue_failure_is_terminal_and_duplicate_cannot_retry() {
+        let stats = EgressStats::default();
+        let emitter = RecordingEmitter::default();
+        let (router, _rx) = EgressRouter::with_capacity_and_digest(
+            &mappings(),
+            "local-node",
+            stats.clone(),
+            1,
+            document_digest,
+            emitter.clone(),
+        );
+        let valid = envelope("Vision.Summary", "remote-node", "1");
+        router
+            .admit(event_with_id("Frame_Store-1", "first", &valid))
+            .expect("first item fits");
+        assert_eq!(
+            router.admit(event_with_id("Frame_Store-1", "lost", &valid)),
+            Err(EgressActionKind::Lost(EgressFailureKind::QueueFull))
+        );
+        assert_eq!(
+            router.admit(event_with_id("Frame_Store-1", "lost", &valid)),
+            Err(EgressActionKind::Skipped(EgressSkipKind::Duplicate))
+        );
+        assert_eq!(stats.snapshot().queue_full, 1);
+        assert_eq!(stats.snapshot().duplicate, 1);
+        assert_eq!(emitter.actions().len(), 2);
+    }
+
+    #[test]
+    fn closed_queue_is_terminal_and_does_not_enable_retry() {
+        let stats = EgressStats::default();
+        let (router, rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
+        drop(rx);
+        let valid = envelope("Vision.Summary", "remote-node", "true");
+        assert_eq!(
+            router.admit(event_with_id("Frame_Store-1", "closed", &valid)),
+            Err(EgressActionKind::Lost(EgressFailureKind::QueueClosed))
+        );
+        assert_eq!(
+            router.admit(event_with_id("Frame_Store-1", "closed", &valid)),
+            Err(EgressActionKind::Skipped(EgressSkipKind::Duplicate))
+        );
+        assert_eq!(stats.snapshot().queue_closed, 1);
+    }
+
+    #[tokio::test]
+    async fn serial_worker_preserves_fifo_and_continues_after_terminal_failure() {
+        let stats = EgressStats::default();
+        let (router, rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
+        let publisher = FakePublisher::with_results([
+            Err(EgressFailureKind::Unavailable),
+            Ok(()),
+            Err(EgressFailureKind::PublishFailed),
+            Ok(()),
+        ]);
+        let worker = tokio::spawn(run_egress_worker(
+            rx,
+            "local-node".to_owned(),
+            publisher.clone(),
+            stats.clone(),
+        ));
+        let payloads = ["1", "2", "3", "4"];
+        for (sequence, payload) in payloads.into_iter().enumerate() {
+            let valid = envelope("Vision.Summary", "remote-node", payload);
+            router
+                .admit(event_with_id(
+                    "Frame_Store-1",
+                    &format!("doc-{sequence}"),
+                    &valid,
+                ))
+                .expect("queue admission");
+        }
+        drop(router);
+        worker.await.expect("worker completes");
+
+        let calls = publisher.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.payload.as_ref())
+                .collect::<Vec<_>>(),
+            payloads.map(str::as_bytes)
+        );
+        assert!(calls
+            .iter()
+            .all(|call| call.subject == Subject::from("Vision.Summary")));
+        assert!(calls.iter().all(|call| {
+            call.headers
+                .get_all(BRIDGE_ORIGIN_HEADER)
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                == ["local-node"]
+        }));
+        assert_eq!(stats.snapshot().unavailable, 1);
+        assert_eq!(stats.snapshot().publish_failed, 1);
+        assert_eq!(stats.snapshot().published, 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_origin_header_value_fails_safely_without_panicking_or_publishing() {
+        let stats = EgressStats::default();
+        let (router, rx) = EgressRouter::new(&mappings(), "local\nnode", stats.clone());
+        let publisher = FakePublisher::default();
+        let worker = tokio::spawn(run_egress_worker(
+            rx,
+            "local\nnode".to_owned(),
+            publisher.clone(),
+            stats.clone(),
+        ));
+        for sequence in 0..2 {
+            let valid = envelope("Vision.Summary", "remote-node", "true");
+            router
+                .admit(event_with_id(
+                    "Frame_Store-1",
+                    &format!("invalid-header-{sequence}"),
+                    &valid,
+                ))
+                .expect("queue admission");
+        }
+        drop(router);
+        worker.await.expect("worker continues and closes");
+        assert!(publisher.calls().is_empty());
+        assert_eq!(stats.snapshot().publish_failed, 2);
+    }
+
+    #[test]
+    fn diagnostic_actions_are_fixed_width_and_exclude_all_untrusted_text() {
+        let stats = EgressStats::default();
+        let emitter = RecordingEmitter::default();
+        let (router, rx) = EgressRouter::with_capacity_and_digest(
+            &mappings(),
+            "local-node",
+            stats,
+            1,
+            document_digest,
+            emitter.clone(),
+        );
+        drop(rx);
+        let secret_payload = r#"{"secret":"do-not-log"}"#;
+        let secret_source = "source-secret";
+        let valid = envelope("Vision.Summary", secret_source, secret_payload);
+        let mut untrusted = event_with_id("Frame_Store-1", "document-secret", &valid);
+        untrusted.remote_peer_id = "peer-secret".to_owned();
+        let _ = router.admit(untrusted);
+
+        let rendered = format!("{:?}", emitter.actions());
+        for forbidden in [
+            secret_payload,
+            secret_source,
+            "document-secret",
+            "peer-secret",
+            BRIDGE_ORIGIN_HEADER,
+            "raw-user:raw-password@broker",
+            "source error chain",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert_eq!(
+            emitter.actions(),
+            [EgressAction {
+                kind: EgressActionKind::Lost(EgressFailureKind::QueueClosed),
+                route_index: Some(0),
+                payload_bytes: Some(secret_payload.len()),
+            }]
+        );
+    }
+
+    #[test]
+    fn router_counts_every_fixed_classification_without_dynamic_labels() {
+        let stats = EgressStats::default();
+        let (router, _rx) = EgressRouter::new(&mappings(), "local-node", stats.clone());
+        let malformed = BridgeChangeEvent {
+            collection: "Frame_Store-1".to_owned(),
+            doc_id: "a".to_owned(),
+            remote_peer_id: "peer".to_owned(),
+            json_data: "ordinary".to_owned(),
+        };
+        assert_eq!(
+            router.admit(malformed),
+            Err(EgressActionKind::Skipped(EgressSkipKind::MalformedEnvelope))
+        );
+        let returned = envelope("Vision.Summary", "local-node", "null");
+        assert_eq!(
+            router.admit(event_with_id("Frame_Store-1", "b", &returned)),
+            Err(EgressActionKind::Skipped(EgressSkipKind::ReturnedLocal))
+        );
+        assert_eq!(stats.snapshot().malformed, 1);
+        assert_eq!(stats.snapshot().returned_local, 1);
     }
 }
