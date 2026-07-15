@@ -5,17 +5,14 @@
 //! configured route, and non-local provenance. The payload string is then
 //! moved directly into [`Bytes`] without parsing or serialization.
 
-// Plan 03-02 builds the complete internal seam; Plan 03-03 wires it into the
-// runtime. Keep non-test builds warning-clean during that intentional interval.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use async_nats::{HeaderMap, HeaderValue, Subject};
+use async_nats::connection::State;
+use async_nats::{Client, HeaderMap, HeaderValue, PublishErrorKind, Subject};
 use buffa::bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -24,6 +21,7 @@ use tracing::{debug, warn};
 use crate::nats_bridge::config::SubjectMapping;
 use crate::nats_bridge::envelope::{BridgeEnvelope, BRIDGE_ENVELOPE_KIND, BRIDGE_ENVELOPE_VERSION};
 use crate::nats_bridge::ingress::MAX_INGRESS_PAYLOAD_BYTES;
+use crate::nats_bridge::readiness::BridgeReadiness;
 use crate::node::BridgeChangeEvent;
 
 /// Stable private marker added to bridge-owned Core NATS publications.
@@ -61,10 +59,12 @@ pub(crate) struct EgressItem {
 /// Fixed terminal delivery failure; source error text is deliberately discarded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EgressFailureKind {
+    EventLagged,
     QueueFull,
     QueueClosed,
     Unavailable,
     PublishFailed,
+    MaxPayloadExceeded,
 }
 
 /// Fixed action shape safe for logs and bounded diagnostics.
@@ -141,6 +141,8 @@ struct EgressStatsInner {
     queue_closed: AtomicU64,
     unavailable: AtomicU64,
     publish_failed: AtomicU64,
+    max_payload_exceeded: AtomicU64,
+    event_lagged: AtomicU64,
     published: AtomicU64,
 }
 
@@ -158,6 +160,8 @@ pub(crate) struct EgressStatsSnapshot {
     pub queue_closed: u64,
     pub unavailable: u64,
     pub publish_failed: u64,
+    pub max_payload_exceeded: u64,
+    pub event_lagged: u64,
     pub published: u64,
 }
 
@@ -176,6 +180,8 @@ impl EgressStats {
             queue_closed: self.inner.queue_closed.load(Ordering::Relaxed),
             unavailable: self.inner.unavailable.load(Ordering::Relaxed),
             publish_failed: self.inner.publish_failed.load(Ordering::Relaxed),
+            max_payload_exceeded: self.inner.max_payload_exceeded.load(Ordering::Relaxed),
+            event_lagged: self.inner.event_lagged.load(Ordering::Relaxed),
             published: self.inner.published.load(Ordering::Relaxed),
         }
     }
@@ -198,12 +204,20 @@ impl EgressStats {
 
     fn record_failure(&self, kind: EgressFailureKind) {
         let counter = match kind {
+            EgressFailureKind::EventLagged => &self.inner.event_lagged,
             EgressFailureKind::QueueFull => &self.inner.queue_full,
             EgressFailureKind::QueueClosed => &self.inner.queue_closed,
             EgressFailureKind::Unavailable => &self.inner.unavailable,
             EgressFailureKind::PublishFailed => &self.inner.publish_failed,
+            EgressFailureKind::MaxPayloadExceeded => &self.inner.max_payload_exceeded,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_event_lagged(&self, dropped: u64) {
+        self.inner
+            .event_lagged
+            .fetch_add(dropped, Ordering::Relaxed);
     }
 }
 
@@ -302,6 +316,7 @@ struct EgressDedup {
 }
 
 impl EgressDedup {
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_digest_fn(document_digest)
     }
@@ -483,8 +498,68 @@ impl BridgePublisher for async_nats::Client {
         Box::pin(async move {
             self.publish_with_headers(subject, headers, payload)
                 .await
-                .map_err(|_| EgressFailureKind::PublishFailed)
+                .map_err(|error| match error.kind() {
+                    PublishErrorKind::MaxPayloadExceeded => EgressFailureKind::MaxPayloadExceeded,
+                    PublishErrorKind::InvalidSubject | PublishErrorKind::Send => {
+                        EgressFailureKind::PublishFailed
+                    }
+                })
         })
+    }
+}
+
+/// Production publisher over the sole shared async-nats connection.
+pub(crate) struct NatsBridgePublisher {
+    client: Client,
+    readiness: BridgeReadiness,
+}
+
+impl NatsBridgePublisher {
+    pub fn new(client: Client, readiness: BridgeReadiness) -> Self {
+        Self { client, readiness }
+    }
+}
+
+impl BridgePublisher for NatsBridgePublisher {
+    fn publish<'a>(
+        &'a self,
+        subject: Subject,
+        headers: HeaderMap,
+        payload: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), EgressFailureKind>> + Send + 'a>> {
+        Box::pin(async move {
+            if !self.readiness.snapshot().is_ready()
+                || self.client.connection_state() != State::Connected
+            {
+                return Err(EgressFailureKind::Unavailable);
+            }
+            BridgePublisher::publish(&self.client, subject, headers, payload).await
+        })
+    }
+}
+
+/// Forward private node events without ever awaiting bridge-owned FIFO space.
+pub(crate) async fn run_bridge_event_router(
+    mut events: tokio::sync::broadcast::Receiver<BridgeChangeEvent>,
+    router: EgressRouter,
+    stats: EgressStats,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                let _ = router.admit(event);
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                stats.record_event_lagged(dropped);
+                EgressAction {
+                    kind: EgressActionKind::Lost(EgressFailureKind::EventLagged),
+                    route_index: None,
+                    payload_bytes: None,
+                }
+                .emit();
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
     }
 }
 
@@ -521,7 +596,8 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
                 .emit();
             }
             Err(kind @ EgressFailureKind::Unavailable)
-            | Err(kind @ EgressFailureKind::PublishFailed) => {
+            | Err(kind @ EgressFailureKind::PublishFailed)
+            | Err(kind @ EgressFailureKind::MaxPayloadExceeded) => {
                 stats.record_failure(kind);
                 EgressAction {
                     kind: EgressActionKind::Lost(kind),
@@ -530,7 +606,11 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
                 }
                 .emit();
             }
-            Err(EgressFailureKind::QueueFull | EgressFailureKind::QueueClosed) => {
+            Err(
+                EgressFailureKind::EventLagged
+                | EgressFailureKind::QueueFull
+                | EgressFailureKind::QueueClosed,
+            ) => {
                 unreachable!("publisher cannot report FIFO admission failures")
             }
         }
@@ -937,6 +1017,7 @@ mod tests {
             Err(EgressFailureKind::Unavailable),
             Ok(()),
             Err(EgressFailureKind::PublishFailed),
+            Err(EgressFailureKind::MaxPayloadExceeded),
             Ok(()),
         ]);
         let worker = tokio::spawn(run_egress_worker(
@@ -945,7 +1026,7 @@ mod tests {
             publisher.clone(),
             stats.clone(),
         ));
-        let payloads = ["1", "2", "3", "4"];
+        let payloads = ["1", "2", "3", "4", "5"];
         for (sequence, payload) in payloads.into_iter().enumerate() {
             let valid = envelope("Vision.Summary", "remote-node", payload);
             router
@@ -979,6 +1060,7 @@ mod tests {
         }));
         assert_eq!(stats.snapshot().unavailable, 1);
         assert_eq!(stats.snapshot().publish_failed, 1);
+        assert_eq!(stats.snapshot().max_payload_exceeded, 1);
         assert_eq!(stats.snapshot().published, 2);
     }
 

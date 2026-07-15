@@ -16,7 +16,10 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
-use super::egress::BRIDGE_ORIGIN_HEADER;
+use super::egress::{
+    run_bridge_event_router, run_egress_worker, EgressRouter, EgressStats, NatsBridgePublisher,
+    BRIDGE_ORIGIN_HEADER,
+};
 use super::ingress::{
     ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
     IngressSender, IngressStats,
@@ -274,7 +277,18 @@ pub struct BridgeRuntimeHandle {
     readiness: BridgeReadiness,
     lifecycle: LifecycleControl,
     task: JoinHandle<()>,
+    support_tasks: Vec<JoinHandle<()>>,
     stats: IngressStats,
+    _egress_stats: EgressStats,
+}
+
+/// Public, label-free subset of remote publication outcomes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BridgeEgressSnapshot {
+    pub published: u64,
+    pub unavailable: u64,
+    pub publish_failed: u64,
+    pub max_payload_exceeded: u64,
 }
 
 impl BridgeRuntimeHandle {
@@ -293,9 +307,20 @@ impl BridgeRuntimeHandle {
         self.lifecycle.snapshot()
     }
 
+    /// Observe terminal remote publication outcomes without dynamic labels.
+    pub fn egress_snapshot(&self) -> BridgeEgressSnapshot {
+        let snapshot = self._egress_stats.snapshot();
+        BridgeEgressSnapshot {
+            published: snapshot.published,
+            unavailable: snapshot.unavailable,
+            publish_failed: snapshot.publish_failed,
+            max_payload_exceeded: snapshot.max_payload_exceeded,
+        }
+    }
+
     /// Whether the supervisor has unexpectedly terminated.
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.task.is_finished() || self.support_tasks.iter().any(JoinHandle::is_finished)
     }
 }
 
@@ -309,7 +334,7 @@ impl BridgeRuntime {
     /// owns the Phase 2 subscription and ingress generation.
     pub fn spawn_connection_only(config: EnabledBridgeConfig) -> BridgeRuntimeHandle {
         let stats = IngressStats::default();
-        Self::spawn_supervisor(config, stats, None)
+        Self::spawn_supervisor(config, stats, None, None, Vec::new())
     }
 
     /// Spawn the complete subscription-aware ingress runtime.
@@ -333,22 +358,36 @@ impl BridgeRuntime {
                 .map(|mapping| (mapping.subject().clone(), mapping.collection().to_owned())),
         );
         let (ingress_tx, ingress_rx) = ingress_channel();
+        let bridge_events = node.subscribe_bridge_changes();
+        let egress_stats = EgressStats::default();
+        let (egress_router, egress_rx) =
+            EgressRouter::new(config.mappings(), &local_node_id, egress_stats.clone());
         let configured_subjects = config
             .mappings()
             .iter()
             .map(|mapping| mapping.subject().clone())
             .collect::<Vec<_>>();
-        tokio::spawn(run_ingress_processor(
+        let ingress_task = tokio::spawn(run_ingress_processor(
             ingress_rx,
             local_node_id.clone(),
-            node,
+            Arc::clone(&node),
             stats.clone(),
             configured_subjects,
         ));
+        let router_stats = egress_stats.clone();
+        let router_task = tokio::spawn(async move {
+            run_bridge_event_router(bridge_events, egress_router, router_stats).await;
+        });
         Self::spawn_supervisor(
             config,
             stats,
             Some((ingress_tx, diagnostics, local_node_id)),
+            Some(EgressSupervisor {
+                rx: egress_rx,
+                local_node_id: node.node_id().to_owned(),
+                stats: egress_stats,
+            }),
+            vec![ingress_task, router_task],
         )
     }
 
@@ -356,6 +395,8 @@ impl BridgeRuntime {
         config: EnabledBridgeConfig,
         stats: IngressStats,
         ingress: Option<(IngressSender, IngressDiagnostics, String)>,
+        egress: Option<EgressSupervisor>,
+        support_tasks: Vec<JoinHandle<()>>,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -380,6 +421,10 @@ impl BridgeRuntime {
         let task_lifecycle = lifecycle.clone();
         let task_host = nats_host.clone();
         let task_stats = stats.clone();
+        let handle_egress_stats = egress
+            .as_ref()
+            .map(|state| state.stats.clone())
+            .unwrap_or_default();
         let task = tokio::spawn(async move {
             run_client_supervisor(
                 server_addr,
@@ -392,6 +437,7 @@ impl BridgeRuntime {
                 },
                 config,
                 ingress,
+                egress,
             )
             .await;
         });
@@ -400,7 +446,9 @@ impl BridgeRuntime {
             readiness,
             lifecycle,
             task,
+            support_tasks,
             stats,
+            _egress_stats: handle_egress_stats,
         }
     }
 }
@@ -415,10 +463,33 @@ struct SubscriptionGeneration {
     task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
+struct SubscriptionInputs {
+    ingress_tx: IngressSender,
+    stats: IngressStats,
+    diagnostics: IngressDiagnostics,
+    local_node_id: String,
+    signal_tx: mpsc::Sender<ClientSignal>,
+}
+
 struct SupervisorRuntime {
     readiness: BridgeReadiness,
     lifecycle: LifecycleControl,
     stats: IngressStats,
+}
+
+struct EgressSupervisor {
+    rx: mpsc::Receiver<super::egress::EgressItem>,
+    local_node_id: String,
+    stats: EgressStats,
+}
+
+struct AbortTaskOnDrop(JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -528,6 +599,7 @@ async fn run_client_supervisor(
     runtime: SupervisorRuntime,
     config: EnabledBridgeConfig,
     ingress: Option<(IngressSender, IngressDiagnostics, String)>,
+    egress: Option<EgressSupervisor>,
 ) {
     let SupervisorRuntime {
         readiness,
@@ -583,6 +655,16 @@ async fn run_client_supervisor(
             return;
         }
     };
+
+    let _egress_task = egress.map(|state| {
+        let publisher = NatsBridgePublisher::new(client.clone(), readiness.clone());
+        AbortTaskOnDrop(tokio::spawn(run_egress_worker(
+            state.rx,
+            state.local_node_id,
+            publisher,
+            state.stats,
+        )))
+    });
 
     let mut outage = OutageLogState::default();
     let mut slow_consumers = SlowConsumerLogState::default();
@@ -652,11 +734,13 @@ async fn run_client_supervisor(
                                 generation = build_subscription_generation(
                                     &client,
                                     &config,
-                                    ingress_tx.clone(),
-                                    stats.clone(),
-                                    diagnostics.clone(),
-                                    local_node_id.clone(),
-                                    signal_tx.clone(),
+                                    SubscriptionInputs {
+                                        ingress_tx: ingress_tx.clone(),
+                                        stats: stats.clone(),
+                                        diagnostics: diagnostics.clone(),
+                                        local_node_id: local_node_id.clone(),
+                                        signal_tx: signal_tx.clone(),
+                                    },
                                     next_generation_id,
                                 ).await;
                                 next_generation_id = next_generation_id.saturating_add(1);
@@ -716,11 +800,13 @@ async fn run_client_supervisor(
                             generation = build_subscription_generation(
                                 &client,
                                 &config,
-                                ingress_tx.clone(),
-                                stats.clone(),
-                                diagnostics.clone(),
-                                local_node_id.clone(),
-                                signal_tx.clone(),
+                                SubscriptionInputs {
+                                    ingress_tx: ingress_tx.clone(),
+                                    stats: stats.clone(),
+                                    diagnostics: diagnostics.clone(),
+                                    local_node_id: local_node_id.clone(),
+                                    signal_tx: signal_tx.clone(),
+                                },
                                 next_generation_id,
                             ).await;
                             next_generation_id = next_generation_id.saturating_add(1);
@@ -784,13 +870,16 @@ async fn run_client_supervisor(
 async fn build_subscription_generation(
     client: &Client,
     config: &EnabledBridgeConfig,
-    ingress_tx: IngressSender,
-    stats: IngressStats,
-    diagnostics: IngressDiagnostics,
-    local_node_id: String,
-    signal_tx: mpsc::Sender<ClientSignal>,
+    inputs: SubscriptionInputs,
     generation_id: u64,
 ) -> Option<SubscriptionGeneration> {
+    let SubscriptionInputs {
+        ingress_tx,
+        stats,
+        diagnostics,
+        local_node_id,
+        signal_tx,
+    } = inputs;
     let mut subscribers = Vec::with_capacity(config.mappings().len());
     for mapping in config.mappings() {
         let Ok(subscriber) = client.subscribe(mapping.subject().clone()).await else {

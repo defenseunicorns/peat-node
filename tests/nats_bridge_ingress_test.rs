@@ -29,6 +29,7 @@ use uuid::Version;
 
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CLIENT_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CLIENT_FRAME_BYTES: usize = 8 * 1024;
 const INFO: &[u8] = b"INFO {\"server_id\":\"PEATTEST0000000000000000000000000000000000000000000000000000\",\"server_name\":\"peat-test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":1048576,\"headers\":true}\r\n";
 const BARRIER_SUBJECT: &str = "_PEAT.NATS_BRIDGE.READINESS";
@@ -49,6 +50,11 @@ enum ClientFrame {
         subject: String,
         reply: String,
         payload_len: usize,
+    },
+    Publish {
+        subject: String,
+        headers: Vec<u8>,
+        payload: Vec<u8>,
     },
 }
 
@@ -138,6 +144,14 @@ impl ScriptedPeer {
             .await
             .expect("peer event timeout")
             .expect("scripted peer remains active")
+    }
+
+    async fn event_within(&mut self, duration: Duration) -> Option<PeerEvent> {
+        match timeout(duration, self.events.recv()).await {
+            Ok(Some(event)) => Some(event),
+            Ok(None) => panic!("scripted peer ended before expected event"),
+            Err(_) => None,
+        }
     }
 
     async fn finish(mut self) {
@@ -312,6 +326,12 @@ async fn run_connection(
                     }
                 }
             }
+            ClientFrame::Publish { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "publish preceded readiness barrier",
+                ));
+            }
         }
     }
 
@@ -339,6 +359,7 @@ async fn run_connection(
                     writer.flush().await?;
                 }
                 ClientFrame::Pong => {}
+                ClientFrame::Publish { .. } => {}
                 ClientFrame::Connect { .. } | ClientFrame::Sub { .. } | ClientFrame::Request { .. } => {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected active client frame"));
                 }
@@ -352,7 +373,7 @@ where
     R: AsyncBufReadExt + Unpin,
 {
     let mut bytes = Vec::new();
-    let count = timeout(STEP_TIMEOUT, reader.read_until(b'\n', &mut bytes))
+    let count = timeout(CLIENT_FRAME_TIMEOUT, reader.read_until(b'\n', &mut bytes))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client frame timeout"))??;
     if count == 0 {
@@ -370,6 +391,42 @@ where
     let line = std::str::from_utf8(&bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF-8 client frame"))?
         .trim_end_matches(['\r', '\n']);
+    if line.starts_with("HPUB ") {
+        let mut fields = line.split_ascii_whitespace();
+        let _hpub = fields.next();
+        let subject = fields.next();
+        let header_len = fields.next().and_then(|value| value.parse::<usize>().ok());
+        let total_len = fields.next().and_then(|value| value.parse::<usize>().ok());
+        let (Some(subject), Some(header_len), Some(total_len), None) =
+            (subject, header_len, total_len, fields.next())
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HPUB frame",
+            ));
+        };
+        if header_len > total_len || total_len > MAX_INGRESS_PAYLOAD_BYTES + 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized HPUB body",
+            ));
+        }
+        let mut body = vec![0_u8; total_len + 2];
+        timeout(STEP_TIMEOUT, reader.read_exact(&mut body))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HPUB body timeout"))??;
+        if body[total_len..] != *b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid HPUB terminator",
+            ));
+        }
+        return Ok(ClientFrame::Publish {
+            subject: subject.to_owned(),
+            headers: body[..header_len].to_vec(),
+            payload: body[header_len..total_len].to_vec(),
+        });
+    }
     let frame = parse_client_frame(line)?;
     if let ClientFrame::Request { payload_len, .. } = frame {
         if payload_len > MAX_CLIENT_FRAME_BYTES {
@@ -565,6 +622,21 @@ async fn test_node(dir: &std::path::Path) -> Arc<SidecarNode> {
         })
         .await
         .expect("create test node"),
+    )
+}
+
+async fn mesh_node(node_id: &str, dir: &std::path::Path) -> Arc<SidecarNode> {
+    Arc::new(
+        SidecarNode::new(SidecarConfig {
+            node_id: node_id.to_owned(),
+            app_id: "nats-egress-test".to_owned(),
+            data_dir: dir.to_path_buf(),
+            iroh_udp_port: Some(0),
+            disable_mdns: true,
+            ..Default::default()
+        })
+        .await
+        .expect("create mesh test node"),
     )
 }
 
@@ -780,6 +852,133 @@ async fn origin_marker_only_exact_single_own_value_is_suppressed() {
     })
     .await
     .expect("bounded origin-marker integration test timed out");
+}
+
+#[tokio::test]
+#[serial_test::serial(iroh_two_node)]
+async fn egress_remote_acceptance_continues_after_header_aware_max_payload() {
+    timeout(Duration::from_secs(60), async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 1).await;
+        let dir_a = tempfile::tempdir().expect("node-a directory");
+        let dir_b = tempfile::tempdir().expect("node-b directory");
+        let node_a = mesh_node("egress-node-a", dir_a.path()).await;
+        let node_b = mesh_node("egress-node-b", dir_b.path()).await;
+        let handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "egress-node-b".to_owned(),
+            Arc::clone(&node_b),
+        );
+
+        loop {
+            if matches!(peer.event().await, PeerEvent::Barrier { .. }) {
+                break;
+            }
+        }
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        wait_ready(&handle, true).await;
+
+        let a_port = node_a.bound_udp_port().expect("node-a UDP port");
+        node_b
+            .connect_peer(
+                &node_a.endpoint_addr(),
+                &[format!("127.0.0.1:{a_port}")],
+                "",
+            )
+            .await
+            .expect("connect mesh peers");
+        node_a.start_sync().await.expect("start node-a sync");
+        node_b.start_sync().await.expect("start node-b sync");
+
+        let exact_limit_payload = format!("0{}", " ".repeat(MAX_INGRESS_PAYLOAD_BYTES - 1));
+        let oversize_envelope = BridgeEnvelope {
+            kind: BRIDGE_ENVELOPE_KIND.to_owned(),
+            version: BRIDGE_ENVELOPE_VERSION,
+            subject: "vision.summary".to_owned(),
+            source_node_id: "egress-node-a".to_owned(),
+            payload: exact_limit_payload,
+        };
+        node_a
+            .create_bridge_document(
+                "frames",
+                "max-payload-document",
+                &serde_json::to_string(&oversize_envelope).expect("encode max envelope"),
+            )
+            .await
+            .expect("create max bridge document");
+
+        let sync_deadline = Instant::now() + Duration::from_secs(30);
+        while node_b
+            .get_document("frames", "max-payload-document")
+            .await
+            .expect("read max document")
+            .is_none()
+        {
+            assert!(
+                Instant::now() < sync_deadline,
+                "max document did not synchronize"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let no_publish_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < no_publish_deadline {
+            if let Some(PeerEvent::Frame {
+                frame: ClientFrame::Publish { .. },
+                ..
+            }) = peer.event_within(Duration::from_millis(50)).await
+            {
+                panic!("header-inclusive max payload unexpectedly emitted HPUB");
+            }
+        }
+
+        let exact_payload = b" {\"frame\":1.0,\"label\":\"\\u03bb\"} \n".to_vec();
+        let fitting_envelope = BridgeEnvelope {
+            kind: BRIDGE_ENVELOPE_KIND.to_owned(),
+            version: BRIDGE_ENVELOPE_VERSION,
+            subject: "vision.summary".to_owned(),
+            source_node_id: "egress-node-a".to_owned(),
+            payload: String::from_utf8(exact_payload.clone()).expect("UTF-8 payload"),
+        };
+        node_a
+            .create_bridge_document(
+                "frames",
+                "fitting-document",
+                &serde_json::to_string(&fitting_envelope).expect("encode fitting envelope"),
+            )
+            .await
+            .expect("create fitting bridge document");
+
+        let fitting_sync_deadline = Instant::now() + Duration::from_secs(30);
+        while node_b
+            .get_document("frames", "fitting-document")
+            .await
+            .expect("read fitting document")
+            .is_none()
+        {
+            assert!(
+                Instant::now() < fitting_sync_deadline,
+                "fitting document did not synchronize"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(handle.readiness().snapshot().is_ready());
+        assert!(!handle.is_finished());
+        assert_eq!(handle.egress_snapshot().max_payload_exceeded, 1);
+        let publish_deadline = Instant::now() + STEP_TIMEOUT;
+        while handle.egress_snapshot().published == 0 {
+            assert!(
+                Instant::now() < publish_deadline,
+                "fitting event was not accepted by publisher: {:?}",
+                handle.egress_snapshot()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(handle.egress_snapshot().published, 1);
+        assert_eq!(handle.egress_snapshot().unavailable, 0);
+        assert_eq!(handle.egress_snapshot().publish_failed, 0);
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded remote egress integration test timed out");
 }
 
 #[tokio::test]
