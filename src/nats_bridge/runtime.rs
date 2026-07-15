@@ -324,12 +324,12 @@ pub struct BridgeShutdownReport {
 }
 
 impl BridgeShutdownReport {
-    fn clean(joined_tasks: usize) -> Self {
+    fn clean(joined_tasks: usize, aborted_tasks: usize) -> Self {
         Self {
             phase: BridgeShutdownPhase::Complete,
             stage: BridgeShutdownStage::Complete,
             joined_tasks,
-            aborted_tasks: 0,
+            aborted_tasks,
             failure: None,
         }
     }
@@ -441,8 +441,15 @@ impl BridgeRuntimeHandle {
             task.abort();
         }
         for task in &mut self.producer_tasks {
-            let _ = task.await;
-            joined = joined.saturating_add(1);
+            match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(_) => {
+                    joined = joined.saturating_add(1);
+                    aborted = aborted.saturating_add(1);
+                }
+                Err(_) => {
+                    aborted = aborted.saturating_add(1);
+                }
+            }
         }
         self.producer_tasks.clear();
 
@@ -494,18 +501,26 @@ impl BridgeRuntimeHandle {
         let failure = supervisor_outcome
             .failure
             .or(exclusion_failure)
-            .or(delivery_failure)
-            .or_else(|| (aborted > 0).then_some(BridgeShutdownFailure::DeadlineExceeded));
+            .or(delivery_failure);
+        let failure_stage = match failure {
+            Some(BridgeShutdownFailure::LedgerIoUnjoined(LedgerWorkerKind::Exclusion)) => {
+                BridgeShutdownStage::LedgerExclusion
+            }
+            Some(BridgeShutdownFailure::LedgerIoUnjoined(LedgerWorkerKind::Delivery)) => {
+                BridgeShutdownStage::LedgerDelivery
+            }
+            _ => supervisor_outcome.stage,
+        };
         let report = if let Some(failure) = failure {
             BridgeShutdownReport {
                 phase: BridgeShutdownPhase::Aborting,
-                stage: supervisor_outcome.stage,
+                stage: failure_stage,
                 joined_tasks: joined,
                 aborted_tasks: aborted,
                 failure: Some(failure),
             }
         } else {
-            BridgeShutdownReport::clean(joined)
+            BridgeShutdownReport::clean(joined, aborted)
         };
         if report.is_clean() {
             Ok(report)
@@ -1624,7 +1639,7 @@ mod tests {
         assert!(report.is_clean());
         assert!(!readiness.snapshot().accepting);
         assert_eq!(report.joined_tasks, 3);
-        assert_eq!(report.aborted_tasks, 0);
+        assert_eq!(report.aborted_tasks, 1);
         assert!(handle.task.is_none());
         assert!(handle.producer_tasks.is_empty());
         assert!(handle.consumer_tasks.is_empty());
