@@ -277,6 +277,12 @@ pub(crate) struct BridgeChangeEvent {
 }
 
 const BRIDGE_CHANGE_CAPACITY: usize = 256;
+// A valid 1 MiB JSON payload can nearly double when it is escaped into the
+// durable envelope. Keep a small fixed allowance for the other envelope
+// fields, but never retain an arbitrarily large remote document in the
+// broadcast ring.
+const MAX_BRIDGE_EVENT_JSON_BYTES: usize = 2 * 1_048_576 + 4_096;
+const MAX_BRIDGE_EVENT_IDENTITY_BYTES: usize = 1_024;
 const LOCAL_REVISION_CAPACITY: usize = 4096;
 const MAX_REVISION_HEADS: usize = 64;
 const REVISION_DIGEST_DOMAIN: &[u8] = b"peat-node:local-revision:v1";
@@ -1447,6 +1453,21 @@ impl SidecarNode {
                         }
                     };
 
+                    // The upstream document and origin notification are
+                    // attacker-controlled. Enforce every retained field's
+                    // byte ceiling before cloning key slices or moving the
+                    // serialized document into the 256-slot broadcast ring.
+                    // Oversized events fail closed; the listener remains live
+                    // for later valid remote changes.
+                    if json_data.len() > MAX_BRIDGE_EVENT_JSON_BYTES
+                        || collection.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                        || doc_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                        || remote_peer_id.len() > MAX_BRIDGE_EVENT_IDENTITY_BYTES
+                    {
+                        warn!("bridge change exceeds retained event bounds");
+                        continue;
+                    }
+
                     let _ = tx.send(BridgeChangeEvent {
                         collection: collection.to_owned(),
                         doc_id: doc_id.to_owned(),
@@ -2207,6 +2228,30 @@ mod tests {
             Err(broadcast::error::RecvError::Lagged(1))
         ));
         assert!(rx.recv().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_change_oversized_remote_document_is_suppressed_and_later_valid_continues() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let oversized = serde_json::json!({
+            "forged": "x".repeat(MAX_BRIDGE_EVENT_JSON_BYTES + 1),
+        });
+        put_remote(
+            &node,
+            "frames:oversized",
+            &serde_json::to_string(&oversized).unwrap(),
+            "peer-a",
+        );
+        put_remote(&node, "frames:later-valid", r#"{"valid":true}"#, "peer-a");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("later valid event must not be stalled")
+            .expect("bridge event channel remains open");
+        assert_eq!(event.doc_id, "later-valid");
+        assert_eq!(event.json_data, r#"{"valid":true}"#);
+        expect_no_bridge_event(&mut rx).await;
     }
 
     #[tokio::test]
