@@ -416,6 +416,14 @@ fn barrier_allowed_after_latest_delivery(lifecycle: LifecycleSnapshot) -> bool {
     lifecycle.connected && lifecycle.connected_sequence > lifecycle.invalidation_sequence
 }
 
+fn disconnected_reason(lifecycle: LifecycleSnapshot) -> LifecycleReason {
+    if lifecycle.connection_epoch == 0 {
+        LifecycleReason::BrokerUnavailable
+    } else {
+        LifecycleReason::Disconnected
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationAction {
     BuildAll {
@@ -567,12 +575,20 @@ async fn run_client_supervisor(
                         }
                     } else {
                         outage.begin(Instant::now());
-                        LifecycleAction::status(
-                            LifecycleReason::Disconnected,
-                            &nats_host,
-                            nats_port,
-                            &readiness.snapshot(),
-                        ).emit();
+                        match disconnected_reason(delivered) {
+                            LifecycleReason::BrokerUnavailable => LifecycleAction::unavailable(
+                                &nats_host,
+                                nats_port,
+                                &readiness.snapshot(),
+                            ).emit(),
+                            LifecycleReason::Disconnected => LifecycleAction::status(
+                                LifecycleReason::Disconnected,
+                                &nats_host,
+                                nats_port,
+                                &readiness.snapshot(),
+                            ).emit(),
+                            _ => unreachable!("disconnect classification has two outcomes"),
+                        }
                     }
                 }
 
@@ -1181,6 +1197,25 @@ mod tests {
         assert!(
             slow_rx.is_empty(),
             "lifecycle control is separate from telemetry"
+        );
+    }
+
+    #[test]
+    fn disconnect_reason_distinguishes_initial_unavailability_from_connection_loss() {
+        let readiness = BridgeReadiness::new(["vision.summary".into()]);
+        let lifecycle = LifecycleControl::new(readiness);
+
+        lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
+        assert_eq!(
+            disconnected_reason(lifecycle.snapshot()),
+            LifecycleReason::BrokerUnavailable
+        );
+
+        lifecycle.delivered(DeliveredLifecycleEvent::Connected);
+        lifecycle.delivered(DeliveredLifecycleEvent::Disconnected);
+        assert_eq!(
+            disconnected_reason(lifecycle.snapshot()),
+            LifecycleReason::Disconnected
         );
     }
 
