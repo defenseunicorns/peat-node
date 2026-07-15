@@ -1231,10 +1231,34 @@ async fn reconnect_replays_the_complete_literal_subscription_set_before_readines
         let envelope: BridgeEnvelope =
             serde_json::from_str(&document).expect("decode post-reconnect envelope");
         assert_eq!(envelope.payload.as_bytes(), payload);
+        let operations = handle.operations_snapshot();
+        assert_eq!(operations.reconnects, 1, "initial connect is not reconnect");
+        assert_eq!(operations.received, 1);
+        assert_eq!(operations.stored, 1);
+        assert!(operations.ready);
+        assert_eq!(operations.publish_failures, 0);
         peer.finish().await;
     })
     .await
     .expect("bounded reconnect integration test timed out");
+}
+
+#[test]
+fn mapped_mutation_never_awaits_while_holding_the_mesh_document_guard() {
+    let source = include_str!("../src/node.rs");
+    let write_start = source
+        .find("async fn write_document(")
+        .expect("canonical mutation entry point");
+    let write_body = &source[write_start..];
+    let lock = write_body.find("lock_doc").expect("per-key mutation lock");
+    let unlock = write_body[lock..]
+        .find("        Ok(())")
+        .map(|offset| lock + offset)
+        .expect("canonical mutation end");
+    assert!(
+        !write_body[lock..unlock].contains(".await"),
+        "peat-mesh std document guard must never cross an await"
+    );
 }
 
 #[tokio::test]

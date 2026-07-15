@@ -578,6 +578,12 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
         );
         assert_eq!(runtime_b.egress_snapshot().published, 2);
         assert_eq!(runtime_b.egress_snapshot().publish_failed, 0);
+        let operations = runtime_b.operations_snapshot();
+        assert_eq!(operations.remote_published, 2);
+        assert_eq!(operations.publish_failures, 0);
+        assert_eq!(operations.queue_loss, 0);
+        assert_eq!(operations.ledger_failures, 0);
+        assert!(operations.ready);
         assert!(!runtime_a.is_finished());
         assert!(!runtime_b.is_finished());
 

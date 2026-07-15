@@ -138,6 +138,9 @@ async fn shutdown_unavailable_authenticated_nats_cleans_node_and_logs_safely() {
     );
     assert!(captured.contains("NATS bridge shutdown failed"));
     assert!(captured.contains("peat-node cleanup complete"));
+    assert!(captured.contains("NATS bridge operations"));
+    assert!(captured.contains("final_snapshot=true"));
+    assert!(captured.contains("shutdown_failure=1"));
     assert!(
         saw_not_ready,
         "missing bridge_ready=false event: {captured}"
