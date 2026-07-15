@@ -1,6 +1,7 @@
 //! Integration tests for SidecarNode — CRDT document operations.
 
-use peat_node::node::{SidecarConfig, SidecarNode};
+use peat_node::nats_bridge::envelope::BridgeEnvelope;
+use peat_node::node::{CreateBridgeDocumentError, SidecarConfig, SidecarNode};
 
 async fn test_node(dir: &std::path::Path) -> SidecarNode {
     test_node_with_encryption(dir, None).await
@@ -243,6 +244,157 @@ async fn encrypted_put_get_round_trip() {
 
     let result = node.get_document("secure", "doc-1").await.unwrap();
     assert_eq!(result, Some(r#"{"secret":"data"}"#.to_string()));
+}
+
+fn bridge_envelope(payload: &str) -> String {
+    serde_json::to_string(
+        &BridgeEnvelope::from_payload("vision.summary", "test-node", payload.as_bytes())
+            .expect("test payload should be valid"),
+    )
+    .expect("envelope should serialize")
+}
+
+fn assert_bridge_payload(stored: &str, expected_payload: &str) {
+    let envelope: BridgeEnvelope = serde_json::from_str(stored).expect("stored bridge envelope");
+    assert_eq!(envelope.payload.as_bytes(), expected_payload.as_bytes());
+}
+
+#[tokio::test]
+async fn bridge_create_plain_round_trip_preserves_payload_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let payload = "  {\"value\":1.0,\"label\":\"λ\"}\n ";
+
+    node.create_bridge_document("frames", "bridge-plain", &bridge_envelope(payload))
+        .await
+        .unwrap();
+
+    let stored = node
+        .get_document("frames", "bridge-plain")
+        .await
+        .unwrap()
+        .expect("bridge document should exist");
+    assert_bridge_payload(&stored, payload);
+}
+
+#[tokio::test]
+async fn bridge_create_encrypted_round_trip_preserves_payload_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node_with_encryption(dir.path(), Some(test_encryption_key())).await;
+    let payload = r#"{"label":"\u03bb","value":1.0} "#;
+
+    node.create_bridge_document(
+        "secure-frames",
+        "bridge-encrypted",
+        &bridge_envelope(payload),
+    )
+    .await
+    .unwrap();
+
+    let stored = node
+        .get_document("secure-frames", "bridge-encrypted")
+        .await
+        .unwrap()
+        .expect("encrypted bridge document should exist");
+    assert_bridge_payload(&stored, payload);
+}
+
+#[tokio::test]
+async fn bridge_create_collision_preserves_first_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let first = bridge_envelope(r#"{"frame":1}"#);
+    let replacement = bridge_envelope(r#"{"frame":2}"#);
+
+    node.create_bridge_document("frames", "same-id", &first)
+        .await
+        .unwrap();
+    let error = node
+        .create_bridge_document("frames", "same-id", &replacement)
+        .await
+        .expect_err("create-only write must reject collisions");
+
+    assert_eq!(error, CreateBridgeDocumentError::AlreadyExists);
+    let stored = node
+        .get_document("frames", "same-id")
+        .await
+        .unwrap()
+        .expect("first document should remain");
+    assert_bridge_payload(&stored, r#"{"frame":1}"#);
+}
+
+#[tokio::test]
+async fn bridge_create_emits_exactly_one_observer_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let mut rx = node.subscribe();
+    let envelope = bridge_envelope(r#"{"frame":1}"#);
+
+    node.create_bridge_document("frames", "one-event", &envelope)
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("observer event timeout")
+        .expect("observer event receive error");
+    assert_eq!(event.collection, "frames");
+    assert_eq!(event.doc_id, "one-event");
+    assert!(matches!(
+        event.change_type,
+        peat_node::node::ChangeType::Upsert
+    ));
+    assert_bridge_payload(
+        event
+            .json_data
+            .as_deref()
+            .expect("event should contain JSON"),
+        r#"{"frame":1}"#,
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .is_err(),
+        "one create must not emit a duplicate observer event"
+    );
+}
+
+#[tokio::test]
+async fn bridge_create_errors_are_fixed_and_payload_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = test_node(dir.path()).await;
+    let secret_payload = "secret-parser-excerpt";
+
+    let invalid = node
+        .create_bridge_document("frames", "bad", secret_payload)
+        .await
+        .expect_err("malformed envelope should fail");
+    assert_eq!(invalid, CreateBridgeDocumentError::InvalidInput);
+
+    let envelope = bridge_envelope(r#"{"frame":1}"#);
+    node.create_bridge_document("frames", "collision", &envelope)
+        .await
+        .unwrap();
+    let collision = node
+        .create_bridge_document("frames", "collision", &envelope)
+        .await
+        .expect_err("collision should fail");
+    assert_eq!(collision, CreateBridgeDocumentError::AlreadyExists);
+
+    let rendered = format!("{invalid:?} {invalid} {collision:?} {collision}");
+    for forbidden in [
+        secret_payload,
+        "{\"frame\":1}",
+        "ENC:v1:",
+        "/tmp/",
+        "caused by",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "unsafe error text: {rendered}"
+        );
+    }
 }
 
 #[tokio::test]

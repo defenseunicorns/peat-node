@@ -262,6 +262,75 @@ pub enum ChangeType {
     Delete,
 }
 
+/// Fixed, source-free classifications returned by bridge create operations.
+///
+/// Ingress uses these variants to decide whether an operation is permanent or
+/// retryable without exposing payload text, encryption details, or store
+/// error chains through bridge diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateBridgeDocumentError {
+    AlreadyExists,
+    InvalidInput,
+    Encryption,
+    Conversion,
+    StoreRead,
+    StoreWrite,
+}
+
+impl std::fmt::Display for CreateBridgeDocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AlreadyExists => "bridge document already exists",
+            Self::InvalidInput => "bridge document input is invalid",
+            Self::Encryption => "bridge document encryption failed",
+            Self::Conversion => "bridge document conversion failed",
+            Self::StoreRead => "bridge document store read failed",
+            Self::StoreWrite => "bridge document store write failed",
+        })
+    }
+}
+
+impl std::error::Error for CreateBridgeDocumentError {}
+
+#[derive(Clone, Copy)]
+enum DocumentWriteMode {
+    Upsert,
+    CreateOnly,
+}
+
+enum DocumentWriteError {
+    AlreadyExists,
+    InvalidInput(serde_json::Error),
+    Encryption(anyhow::Error),
+    Conversion(anyhow::Error),
+    StoreRead(anyhow::Error),
+    StoreWrite(anyhow::Error),
+}
+
+impl DocumentWriteError {
+    fn classification(&self) -> CreateBridgeDocumentError {
+        match self {
+            Self::AlreadyExists => CreateBridgeDocumentError::AlreadyExists,
+            Self::InvalidInput(_) => CreateBridgeDocumentError::InvalidInput,
+            Self::Encryption(_) => CreateBridgeDocumentError::Encryption,
+            Self::Conversion(_) => CreateBridgeDocumentError::Conversion,
+            Self::StoreRead(_) => CreateBridgeDocumentError::StoreRead,
+            Self::StoreWrite(_) => CreateBridgeDocumentError::StoreWrite,
+        }
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::AlreadyExists => anyhow::anyhow!("document already exists"),
+            Self::InvalidInput(error) => anyhow::anyhow!("invalid JSON: {error}"),
+            Self::Encryption(error)
+            | Self::Conversion(error)
+            | Self::StoreRead(error)
+            | Self::StoreWrite(error) => error,
+        }
+    }
+}
+
 impl SidecarNode {
     /// Create a new SidecarNode, bootstrapping the full P2P sync stack.
     pub async fn new(config: SidecarConfig) -> anyhow::Result<Self> {
@@ -1431,29 +1500,8 @@ impl SidecarNode {
         doc_id: &str,
         json_data: &str,
     ) -> anyhow::Result<()> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_data).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
-
-        let key = format!("{collection}:{doc_id}");
-        let store = self.backend.store();
-        let existing = store.get(&key)?;
-
-        let doc = match &self.cipher {
-            Some(c) => {
-                // Ciphertext is opaque — wrap in {"value":"<ciphertext>"} so
-                // json_to_automerge has a map root to work with.
-                let ciphertext = c.encrypt(json_data)?;
-                let wrapped = serde_json::json!({ "value": ciphertext });
-                json_to_automerge(&wrapped, existing.as_ref())?
-            }
-            None => {
-                // Write user JSON directly as structured Automerge fields for
-                // field-level CRDT merging (peat-node#7).
-                json_to_automerge(&parsed, existing.as_ref())?
-            }
-        };
-
-        store.put(&key, &doc)?;
+        self.write_document(collection, doc_id, json_data, DocumentWriteMode::Upsert)
+            .map_err(DocumentWriteError::into_anyhow)?;
 
         // `store.put` fires the AutomergeStore observer, which the
         // `forward_store_changes` task re-emits as a `ChangeEvent` on
@@ -1463,6 +1511,72 @@ impl SidecarNode {
         // counting subscribers. The forwarder is the single source of
         // truth for upsert events — local and remote-sync alike.
 
+        Ok(())
+    }
+
+    /// Persist one immutable bridge envelope through the canonical store path.
+    ///
+    /// This is a Rust-only API for native bridge ingress. It deliberately does
+    /// not emit a change directly: the successful `store.put` below remains
+    /// the single source for observer events and local-origin mesh fanout.
+    pub async fn create_bridge_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        envelope_json: &str,
+    ) -> Result<(), CreateBridgeDocumentError> {
+        self.write_document(
+            collection,
+            doc_id,
+            envelope_json,
+            DocumentWriteMode::CreateOnly,
+        )
+        .map_err(|error| error.classification())
+    }
+
+    fn write_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        json_data: &str,
+        mode: DocumentWriteMode,
+    ) -> Result<(), DocumentWriteError> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_data).map_err(DocumentWriteError::InvalidInput)?;
+
+        let key = format!("{collection}:{doc_id}");
+        let store = self.backend.store();
+        let existing = store.get(&key).map_err(DocumentWriteError::StoreRead)?;
+        if matches!(mode, DocumentWriteMode::CreateOnly) && existing.is_some() {
+            return Err(DocumentWriteError::AlreadyExists);
+        }
+        let conversion_base = match mode {
+            DocumentWriteMode::Upsert => existing.as_ref(),
+            DocumentWriteMode::CreateOnly => None,
+        };
+
+        let doc = match &self.cipher {
+            Some(cipher) => {
+                // Ciphertext is opaque — wrap in {"value":"<ciphertext>"} so
+                // json_to_automerge has a map root to work with.
+                let ciphertext = cipher
+                    .encrypt(json_data)
+                    .map_err(DocumentWriteError::Encryption)?;
+                let wrapped = serde_json::json!({ "value": ciphertext });
+                json_to_automerge(&wrapped, conversion_base)
+                    .map_err(DocumentWriteError::Conversion)?
+            }
+            None => {
+                // Write JSON directly as structured Automerge fields for
+                // field-level CRDT merging (peat-node#7).
+                json_to_automerge(&parsed, conversion_base)
+                    .map_err(DocumentWriteError::Conversion)?
+            }
+        };
+
+        store
+            .put(&key, &doc)
+            .map_err(DocumentWriteError::StoreWrite)?;
         Ok(())
     }
 
