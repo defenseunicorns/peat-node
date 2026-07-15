@@ -249,6 +249,8 @@ struct EgressStatsInner {
     flush_failed: AtomicU64,
     ledger_unavailable: AtomicU64,
     event_lagged: AtomicU64,
+    reserved: AtomicU64,
+    completed: AtomicU64,
     published: AtomicU64,
 }
 
@@ -269,6 +271,8 @@ pub(crate) struct EgressStatsSnapshot {
     pub flush_failed: u64,
     pub ledger_unavailable: u64,
     pub event_lagged: u64,
+    pub reserved: u64,
+    pub completed: u64,
     pub published: u64,
 }
 
@@ -290,6 +294,8 @@ impl EgressStats {
             flush_failed: self.inner.flush_failed.load(Ordering::Relaxed),
             ledger_unavailable: self.inner.ledger_unavailable.load(Ordering::Relaxed),
             event_lagged: self.inner.event_lagged.load(Ordering::Relaxed),
+            reserved: self.inner.reserved.load(Ordering::Relaxed),
+            completed: self.inner.completed.load(Ordering::Relaxed),
             published: self.inner.published.load(Ordering::Relaxed),
         }
     }
@@ -483,7 +489,9 @@ impl DeliveryCoordinator {
                 self.record_action(EgressActionKind::Skipped(kind), route_index, None);
                 return Err(EgressActionKind::Skipped(kind));
             }
-            Ok(ReserveResult::Reserved) => {}
+            Ok(ReserveResult::Reserved) => {
+                self.stats.inner.reserved.fetch_add(1, Ordering::Relaxed);
+            }
             Err(_) => {
                 self.readiness.set_delivery_healthy(false);
                 let kind = EgressFailureKind::LedgerUnavailable;
@@ -691,6 +699,7 @@ pub(crate) async fn run_egress_worker<P: BridgePublisher>(
                     });
                     continue;
                 }
+                stats.inner.completed.fetch_add(1, Ordering::Relaxed);
                 stats.inner.published.fetch_add(1, Ordering::Relaxed);
                 diagnostics.record(EgressAction {
                     kind: EgressActionKind::Published,

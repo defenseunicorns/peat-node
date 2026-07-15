@@ -62,6 +62,8 @@ pub struct BridgeOperationsSnapshot {
     pub event_lagged: u64,
     pub queue_loss: u64,
     pub ledger_failures: u64,
+    pub delivery_reservations: u64,
+    pub delivery_completions: u64,
     pub delivery_reservations_uncertain: u64,
     pub reconciliation_triggers: u64,
     pub reconciliation_coalesced: u64,
@@ -173,17 +175,11 @@ fn aggregate(
         event_lagged: egress.event_lagged,
         queue_loss: egress.queue_full.saturating_add(egress.queue_closed),
         ledger_failures: egress.ledger_unavailable,
-        // Every reserved item not completed is deliberately uncertain and is
-        // never retried. Queue/publish/flush/ledger-terminal loss is its exact
-        // observable lower bound without retaining document identities here.
-        delivery_reservations_uncertain: egress
-            .queue_full
-            .saturating_add(egress.queue_closed)
-            .saturating_add(egress.unavailable)
-            .saturating_add(egress.publish_failed)
-            .saturating_add(egress.max_payload_exceeded)
-            .saturating_add(egress.flush_failed)
-            .saturating_add(egress.ledger_unavailable),
+        delivery_reservations: egress.reserved,
+        delivery_completions: egress.completed,
+        // Reserve-first at-most-once semantics make every non-completed
+        // reservation uncertain, including queue and publication failures.
+        delivery_reservations_uncertain: egress.reserved.saturating_sub(egress.completed),
         reconciliation_triggers: reconcile.triggers,
         reconciliation_coalesced: reconcile.coalesced,
         reconciliation_scans: reconcile.scans,
@@ -220,6 +216,9 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
             event_lagged = snapshot.event_lagged,
             queue_loss = snapshot.queue_loss,
             ledger_failures = snapshot.ledger_failures,
+            delivery_reservations = snapshot.delivery_reservations,
+            delivery_completions = snapshot.delivery_completions,
+            delivery_reservations_uncertain = snapshot.delivery_reservations_uncertain,
             reconciliation_scans = snapshot.reconciliation_scans,
             shutdown_clean = snapshot.shutdown_clean,
             shutdown_failure = snapshot.shutdown_failure,
@@ -247,6 +246,9 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
             event_lagged = snapshot.event_lagged,
             queue_loss = snapshot.queue_loss,
             ledger_failures = snapshot.ledger_failures,
+            delivery_reservations = snapshot.delivery_reservations,
+            delivery_completions = snapshot.delivery_completions,
+            delivery_reservations_uncertain = snapshot.delivery_reservations_uncertain,
             reconciliation_scans = snapshot.reconciliation_scans,
             shutdown_clean = snapshot.shutdown_clean,
             shutdown_failure = snapshot.shutdown_failure,
