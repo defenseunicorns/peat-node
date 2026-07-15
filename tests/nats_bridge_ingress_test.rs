@@ -32,10 +32,13 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_CLIENT_FRAME_BYTES: usize = 8 * 1024;
 const INFO: &[u8] = b"INFO {\"server_id\":\"PEATTEST0000000000000000000000000000000000000000000000000000\",\"server_name\":\"peat-test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":1048576,\"headers\":true}\r\n";
 const BARRIER_SUBJECT: &str = "_PEAT.NATS_BRIDGE.READINESS";
+const BRIDGE_ORIGIN_HEADER: &str = "Peat-Nats-Bridge-Origin";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ClientFrame {
-    Connect,
+    Connect {
+        echo: Option<bool>,
+    },
     Sub {
         subject: String,
         sid: String,
@@ -65,8 +68,19 @@ enum PeerCommand {
     ConfirmNoResponders,
     DenySubscription,
     WithholdBarrier,
-    Send { subject: String, payload: Vec<u8> },
-    SendSized { subject: String, payload_len: usize },
+    Send {
+        subject: String,
+        payload: Vec<u8>,
+    },
+    SendHeaders {
+        subject: String,
+        headers: Vec<(String, String)>,
+        payload: Vec<u8>,
+    },
+    SendSized {
+        subject: String,
+        payload_len: usize,
+    },
     Disconnect,
     Stop,
 }
@@ -202,7 +216,7 @@ async fn run_connection(
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event receiver dropped"))?;
         match frame {
-            ClientFrame::Connect | ClientFrame::Pong => {}
+            ClientFrame::Connect { .. } | ClientFrame::Pong => {}
             ClientFrame::Sub { subject, sid } => {
                 if expected_subjects.contains(&subject) {
                     subscriptions.insert(subject, sid);
@@ -307,6 +321,9 @@ async fn run_connection(
                 Some(PeerCommand::Send { subject, payload }) => {
                     send_message(&mut writer, &subscriptions, &subject, &payload).await?;
                 }
+                Some(PeerCommand::SendHeaders { subject, headers, payload }) => {
+                    send_header_message(&mut writer, &subscriptions, &subject, &headers, &payload).await?;
+                }
                 Some(PeerCommand::SendSized { subject, payload_len }) => {
                     send_sized_message(&mut writer, &subscriptions, &subject, payload_len).await?;
                 }
@@ -322,7 +339,7 @@ async fn run_connection(
                     writer.flush().await?;
                 }
                 ClientFrame::Pong => {}
-                ClientFrame::Connect | ClientFrame::Sub { .. } | ClientFrame::Request { .. } => {
+                ClientFrame::Connect { .. } | ClientFrame::Sub { .. } | ClientFrame::Request { .. } => {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected active client frame"));
                 }
             }
@@ -378,7 +395,12 @@ where
 
 fn parse_client_frame(line: &str) -> io::Result<ClientFrame> {
     if line.starts_with("CONNECT ") {
-        return Ok(ClientFrame::Connect);
+        let connect = line.strip_prefix("CONNECT ").expect("prefix checked");
+        let json: serde_json::Value = serde_json::from_str(connect)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid CONNECT JSON"))?;
+        return Ok(ClientFrame::Connect {
+            echo: json.get("echo").and_then(serde_json::Value::as_bool),
+        });
     }
     if line == "PING" {
         return Ok(ClientFrame::Ping);
@@ -446,6 +468,43 @@ where
     writer
         .write_all(format!("MSG {subject} {sid} {}\r\n", payload.len()).as_bytes())
         .await?;
+    writer.write_all(payload).await?;
+    writer.write_all(b"\r\n").await?;
+    writer.flush().await
+}
+
+async fn send_header_message<W>(
+    writer: &mut W,
+    subscriptions: &BTreeMap<String, String>,
+    subject: &str,
+    headers: &[(String, String)],
+    payload: &[u8],
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let sid = subscriptions
+        .get(subject)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unsubscribed subject"))?;
+    let mut header_block = b"NATS/1.0\r\n".to_vec();
+    for (name, value) in headers {
+        header_block.extend_from_slice(name.as_bytes());
+        header_block.extend_from_slice(b": ");
+        header_block.extend_from_slice(value.as_bytes());
+        header_block.extend_from_slice(b"\r\n");
+    }
+    header_block.extend_from_slice(b"\r\n");
+    let total_len = header_block.len() + payload.len();
+    writer
+        .write_all(
+            format!(
+                "HMSG {subject} {sid} {} {total_len}\r\n",
+                header_block.len()
+            )
+            .as_bytes(),
+        )
+        .await?;
+    writer.write_all(&header_block).await?;
     writer.write_all(payload).await?;
     writer.write_all(b"\r\n").await?;
     writer.flush().await
@@ -568,6 +627,21 @@ async fn wait_oversized(handle: &BridgeRuntimeHandle, oversized_payloads: u64) {
     }
 }
 
+async fn wait_self_suppressed(handle: &BridgeRuntimeHandle, self_suppressed: u64) {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let snapshot = handle.stats().snapshot();
+        if snapshot.self_suppressed == self_suppressed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unexpected self-suppressed count: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_lifecycle(
     handle: &BridgeRuntimeHandle,
     predicate: impl Fn(LifecycleSnapshot) -> bool,
@@ -584,6 +658,128 @@ async fn wait_lifecycle(
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn connect_uses_no_echo_on_the_shared_bridge_connection() {
+    timeout(TEST_TIMEOUT, async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 1).await;
+        let dir = tempfile::tempdir().expect("temporary node directory");
+        let node = test_node(dir.path()).await;
+        let _handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "divergent-caller-id".to_owned(),
+            node,
+        );
+
+        loop {
+            match peer.event().await {
+                PeerEvent::Frame {
+                    frame: ClientFrame::Connect { echo },
+                    ..
+                } => {
+                    assert_eq!(echo, Some(false));
+                }
+                PeerEvent::Barrier { .. } => break,
+                PeerEvent::Frame { .. } => {}
+            }
+        }
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded no-echo integration test timed out");
+}
+
+#[tokio::test]
+async fn origin_marker_only_exact_single_own_value_is_suppressed() {
+    timeout(TEST_TIMEOUT, async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 1).await;
+        let dir = tempfile::tempdir().expect("temporary node directory");
+        let node = test_node(dir.path()).await;
+        let handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "effective-test-node".to_owned(),
+            Arc::clone(&node),
+        );
+        loop {
+            if matches!(peer.event().await, PeerEvent::Barrier { .. }) {
+                break;
+            }
+        }
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        wait_ready(&handle, true).await;
+
+        peer.command(PeerCommand::SendHeaders {
+            subject: "vision.summary".to_owned(),
+            headers: vec![(
+                BRIDGE_ORIGIN_HEADER.to_owned(),
+                "effective-test-node".to_owned(),
+            )],
+            payload: br#"{"suppressed":true}"#.to_vec(),
+        })
+        .await;
+        wait_self_suppressed(&handle, 1).await;
+        assert_eq!(handle.stats().snapshot().received, 0);
+        assert!(node
+            .list_documents("frames")
+            .await
+            .expect("list frames")
+            .is_empty());
+
+        peer.command(PeerCommand::Send {
+            subject: "vision.summary".to_owned(),
+            payload: br#"{"case":"absent"}"#.to_vec(),
+        })
+        .await;
+        wait_stats(&handle, 1, 1).await;
+        let cases = [
+            vec![(BRIDGE_ORIGIN_HEADER.to_owned(), "foreign-node".to_owned())],
+            vec![(BRIDGE_ORIGIN_HEADER.to_owned(), String::new())],
+            vec![(BRIDGE_ORIGIN_HEADER.to_owned(), "%malformed%".to_owned())],
+            vec![(
+                BRIDGE_ORIGIN_HEADER.to_owned(),
+                "EFFECTIVE-TEST-NODE".to_owned(),
+            )],
+            vec![
+                (
+                    BRIDGE_ORIGIN_HEADER.to_owned(),
+                    "effective-test-node".to_owned(),
+                ),
+                (
+                    BRIDGE_ORIGIN_HEADER.to_owned(),
+                    "effective-test-node".to_owned(),
+                ),
+            ],
+            vec![
+                (
+                    BRIDGE_ORIGIN_HEADER.to_owned(),
+                    "effective-test-node".to_owned(),
+                ),
+                (BRIDGE_ORIGIN_HEADER.to_owned(), "foreign-node".to_owned()),
+            ],
+        ];
+        for (index, headers) in cases.into_iter().enumerate() {
+            peer.command(PeerCommand::SendHeaders {
+                subject: "vision.summary".to_owned(),
+                headers,
+                payload: format!(r#"{{"case":{index}}}"#).into_bytes(),
+            })
+            .await;
+            let expected = u64::try_from(index + 2).expect("small case count");
+            wait_stats(&handle, expected, expected).await;
+        }
+        let documents = node.list_documents("frames").await.expect("list frames");
+        assert_eq!(documents.len(), 7);
+        let ids = documents.iter().collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 7);
+        let stats = handle.stats().snapshot();
+        assert_eq!(stats.self_suppressed, 1);
+        assert_eq!(stats.oversized_payloads, 0);
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded origin-marker integration test timed out");
 }
 
 #[tokio::test]

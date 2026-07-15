@@ -16,6 +16,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use super::config::EnabledBridgeConfig;
+use super::egress::BRIDGE_ORIGIN_HEADER;
 use super::ingress::{
     ingress_channel, is_payload_oversized, run_ingress_processor, IngressDiagnostics, IngressItem,
     IngressSender, IngressStats,
@@ -317,6 +318,13 @@ impl BridgeRuntime {
         source_node_id: String,
         node: Arc<SidecarNode>,
     ) -> BridgeRuntimeHandle {
+        let local_node_id = node.node_id().to_owned();
+        if source_node_id != local_node_id {
+            warn!(
+                error_kind = "node_identity_mismatch",
+                "NATS bridge ignored divergent caller node identity"
+            );
+        }
         let stats = IngressStats::default();
         let diagnostics = IngressDiagnostics::new(
             config
@@ -332,18 +340,22 @@ impl BridgeRuntime {
             .collect::<Vec<_>>();
         tokio::spawn(run_ingress_processor(
             ingress_rx,
-            source_node_id,
+            local_node_id.clone(),
             node,
             stats.clone(),
             configured_subjects,
         ));
-        Self::spawn_supervisor(config, stats, Some((ingress_tx, diagnostics)))
+        Self::spawn_supervisor(
+            config,
+            stats,
+            Some((ingress_tx, diagnostics, local_node_id)),
+        )
     }
 
     fn spawn_supervisor(
         config: EnabledBridgeConfig,
         stats: IngressStats,
-        ingress: Option<(IngressSender, IngressDiagnostics)>,
+        ingress: Option<(IngressSender, IngressDiagnostics, String)>,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -515,7 +527,7 @@ async fn run_client_supervisor(
     nats_port: u16,
     runtime: SupervisorRuntime,
     config: EnabledBridgeConfig,
-    ingress: Option<(IngressSender, IngressDiagnostics)>,
+    ingress: Option<(IngressSender, IngressDiagnostics, String)>,
 ) {
     let SupervisorRuntime {
         readiness,
@@ -528,6 +540,7 @@ async fn run_client_supervisor(
     let retry_host = nats_host.clone();
     let event_lifecycle = lifecycle.clone();
     let options = ConnectOptions::new()
+        .no_echo()
         .retry_on_initial_connect()
         .max_reconnects(None)
         .subscription_capacity(1)
@@ -628,7 +641,7 @@ async fn run_client_supervisor(
                         nats_port,
                         &readiness.snapshot(),
                     ).emit();
-                    if let Some((ingress_tx, diagnostics)) = ingress.as_ref() {
+                    if let Some((ingress_tx, diagnostics, local_node_id)) = ingress.as_ref() {
                         let action = connected_generation_action(
                             generation.as_ref(),
                             config.mappings().len(),
@@ -642,6 +655,7 @@ async fn run_client_supervisor(
                                     ingress_tx.clone(),
                                     stats.clone(),
                                     diagnostics.clone(),
+                                    local_node_id.clone(),
                                     signal_tx.clone(),
                                     next_generation_id,
                                 ).await;
@@ -696,7 +710,7 @@ async fn run_client_supervisor(
                         }
                         if let GenerationAction::RebuildAll { subject_count, .. } = action {
                             debug_assert_eq!(subject_count, config.mappings().len());
-                            let Some((ingress_tx, diagnostics)) = ingress.as_ref() else {
+                            let Some((ingress_tx, diagnostics, local_node_id)) = ingress.as_ref() else {
                                 continue;
                             };
                             generation = build_subscription_generation(
@@ -705,6 +719,7 @@ async fn run_client_supervisor(
                                 ingress_tx.clone(),
                                 stats.clone(),
                                 diagnostics.clone(),
+                                local_node_id.clone(),
                                 signal_tx.clone(),
                                 next_generation_id,
                             ).await;
@@ -772,6 +787,7 @@ async fn build_subscription_generation(
     ingress_tx: IngressSender,
     stats: IngressStats,
     diagnostics: IngressDiagnostics,
+    local_node_id: String,
     signal_tx: mpsc::Sender<ClientSignal>,
     generation_id: u64,
 ) -> Option<SubscriptionGeneration> {
@@ -792,6 +808,7 @@ async fn build_subscription_generation(
                 ingress_tx.clone(),
                 stats.clone(),
                 diagnostics.clone(),
+                local_node_id.clone(),
             ));
         }
         if readers.next().await.is_some() {
@@ -812,8 +829,13 @@ async fn read_subscription(
     ingress_tx: IngressSender,
     stats: IngressStats,
     diagnostics: IngressDiagnostics,
+    local_node_id: String,
 ) {
     while let Some(message) = subscriber.next().await {
+        if has_exact_own_origin(&message.headers, &local_node_id) {
+            stats.record_self_suppressed();
+            continue;
+        }
         let payload_bytes = message.payload.len();
         if is_payload_oversized(payload_bytes) {
             stats.record_oversized_payload();
@@ -832,6 +854,17 @@ async fn read_subscription(
             return;
         }
     }
+}
+
+fn has_exact_own_origin(headers: &Option<async_nats::HeaderMap>, local_node_id: &str) -> bool {
+    let Some(headers) = headers else {
+        return false;
+    };
+    let mut values = headers.get_all(BRIDGE_ORIGIN_HEADER);
+    let Some(value) = values.next() else {
+        return false;
+    };
+    value.as_str() == local_node_id && values.next().is_none()
 }
 
 fn start_barrier(
@@ -984,6 +1017,7 @@ mod tests {
     use super::*;
     use crate::nats_bridge::config::BridgeConfig;
     use crate::nats_bridge::ingress::INGRESS_QUEUE_CAPACITY;
+    use async_nats::HeaderMap;
 
     fn enabled_config() -> EnabledBridgeConfig {
         let mappings = vec![
@@ -997,6 +1031,33 @@ mod tests {
             panic!("mappings should enable config");
         };
         config
+    }
+
+    #[test]
+    fn origin_marker_predicate_requires_one_byte_exact_value() {
+        let local = "effective-test-node";
+        assert!(!has_exact_own_origin(&None, local));
+
+        for value in [
+            "",
+            "foreign-node",
+            "%malformed%",
+            " effective-test-node ",
+            "EFFECTIVE-TEST-NODE",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(BRIDGE_ORIGIN_HEADER, value);
+            assert!(!has_exact_own_origin(&Some(headers), local));
+        }
+
+        let mut exact = HeaderMap::new();
+        exact.insert(BRIDGE_ORIGIN_HEADER, local);
+        assert!(has_exact_own_origin(&Some(exact), local));
+
+        let mut repeated = HeaderMap::new();
+        repeated.append(BRIDGE_ORIGIN_HEADER, local);
+        repeated.append(BRIDGE_ORIGIN_HEADER, local);
+        assert!(!has_exact_own_origin(&Some(repeated), local));
     }
 
     fn generation(id: u64) -> SubscriptionGeneration {

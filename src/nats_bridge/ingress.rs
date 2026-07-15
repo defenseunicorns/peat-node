@@ -57,6 +57,7 @@ pub struct IngressStats {
 
 #[derive(Default)]
 struct IngressStatsInner {
+    self_suppressed: AtomicU64,
     received: AtomicU64,
     stored: AtomicU64,
     invalid_utf8: AtomicU64,
@@ -69,6 +70,7 @@ struct IngressStatsInner {
 /// Point-in-time values for the bounded ingress counter set.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IngressStatsSnapshot {
+    pub self_suppressed: u64,
     pub received: u64,
     pub stored: u64,
     pub invalid_utf8: u64,
@@ -82,6 +84,7 @@ impl IngressStats {
     /// Read every counter without introducing payload- or subject-derived labels.
     pub fn snapshot(&self) -> IngressStatsSnapshot {
         IngressStatsSnapshot {
+            self_suppressed: self.inner.self_suppressed.load(Ordering::Relaxed),
             received: self.inner.received.load(Ordering::Relaxed),
             stored: self.inner.stored.load(Ordering::Relaxed),
             invalid_utf8: self.inner.invalid_utf8.load(Ordering::Relaxed),
@@ -90,6 +93,11 @@ impl IngressStats {
             final_store_failures: self.inner.final_store_failures.load(Ordering::Relaxed),
             slow_consumer_events: self.inner.slow_consumer_events.load(Ordering::Relaxed),
         }
+    }
+
+    /// Record one exact own-origin marker rejected before ingress allocation.
+    pub fn record_self_suppressed(&self) {
+        self.inner.self_suppressed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one Core NATS slow-consumer event without adding a dynamic label.
@@ -1047,6 +1055,7 @@ mod tests {
         assert_eq!(
             stats.snapshot(),
             IngressStatsSnapshot {
+                self_suppressed: 0,
                 received: 4,
                 stored: 1,
                 invalid_utf8: 1,
