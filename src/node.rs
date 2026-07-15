@@ -2372,6 +2372,44 @@ impl SidecarNode {
         }
     }
 
+    /// Bounded canonical document read used by bridge reconciliation.
+    pub(crate) fn get_bridge_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if collection.len() > MAX_BRIDGE_IDENTITY_BYTES || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+        {
+            return Ok(None);
+        }
+        let key = format!("{collection}:{doc_id}");
+        let Some(doc) = self.backend.store().get(&key)? else {
+            return Ok(None);
+        };
+        let encoded = doc.save_nocompress();
+        if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
+            return Ok(None);
+        }
+        drop(encoded);
+        if preflight_event_document(&doc).is_err() {
+            return Ok(None);
+        }
+        let json = automerge_to_json(&doc);
+        let value = if let Some(encrypted) = json
+            .get("value")
+            .and_then(|value| value.as_str())
+            .filter(|value| crate::crypto::is_encrypted(value))
+        {
+            let Some(cipher) = &self.cipher else {
+                return Ok(None);
+            };
+            cipher.decrypt(encrypted)?
+        } else {
+            serde_json::to_string(&json)?
+        };
+        Ok((value.len() <= MAX_BRIDGE_EVENT_JSON_BYTES).then_some(value))
+    }
+
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
         let stripe = mutation_guard_stripe(collection, doc_id);

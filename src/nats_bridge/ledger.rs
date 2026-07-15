@@ -317,8 +317,6 @@ impl LocalExclusionLedger {
             .map(|_| ())
     }
 
-    // Reconciliation consumes this in Plan 04-02 Task 2.
-    #[allow(dead_code)]
     pub(crate) async fn contains(&self, digest: LedgerDigest) -> Result<bool, LedgerError> {
         Ok(matches!(
             self.worker.lookup(digest).await?,

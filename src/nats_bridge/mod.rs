@@ -10,4 +10,5 @@ pub mod envelope;
 pub mod ingress;
 pub(crate) mod ledger;
 pub mod readiness;
+pub(crate) mod reconcile;
 pub mod runtime;
