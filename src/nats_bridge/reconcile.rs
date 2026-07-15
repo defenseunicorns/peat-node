@@ -3,6 +3,10 @@
 //! Pinned peat-mesh returns one complete key vector per collection. That
 //! inherited transient is explicit; bridge-owned retained work is limited to
 //! 64-key processing batches, one hydrated body, and 16 hydrations per second.
+//! A missing exclusion entry only makes a snapshot eligible for the exact
+//! envelope classifier; it is not historical-origin proof. Envelope-shaped
+//! documents created before the exclusion journal existed remain explicitly
+//! ambiguous, and `source_node_id` is never promoted into provenance.
 
 use std::future::Future;
 use std::pin::Pin;
