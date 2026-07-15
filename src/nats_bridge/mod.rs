@@ -6,5 +6,6 @@
 
 pub mod config;
 pub mod envelope;
+pub mod ingress;
 pub mod readiness;
 pub mod runtime;
