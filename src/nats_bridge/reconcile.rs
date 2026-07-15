@@ -47,7 +47,6 @@ struct ReconcileStatsInner {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[cfg(test)]
 pub(crate) struct ReconcileSnapshot {
     pub triggers: u64,
     pub coalesced: u64,
@@ -58,7 +57,6 @@ pub(crate) struct ReconcileSnapshot {
 }
 
 impl ReconcileStats {
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> ReconcileSnapshot {
         ReconcileSnapshot {
             triggers: self.0.triggers.load(Ordering::Relaxed),

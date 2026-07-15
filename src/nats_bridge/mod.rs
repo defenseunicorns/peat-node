@@ -9,6 +9,7 @@ pub(crate) mod egress;
 pub mod envelope;
 pub mod ingress;
 pub(crate) mod ledger;
+pub mod operations;
 pub mod readiness;
 pub(crate) mod reconcile;
 pub mod runtime;

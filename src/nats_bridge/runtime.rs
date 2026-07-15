@@ -27,6 +27,7 @@ use super::ingress::{
     IngressSender, IngressStats,
 };
 use super::ledger::{DeliveryLedger, LedgerError, LocalExclusionLedger};
+use super::operations::{spawn_periodic_operations, BridgeOperations, BridgeOperationsSnapshot};
 use super::readiness::{BridgeReadiness, BridgeStatus};
 use super::reconcile::{spawn_reconciler, ReconcileReason, ReconcileStats, ReconcileTrigger};
 use crate::node::{BridgeLedgerHealth, SidecarNode};
@@ -374,6 +375,8 @@ pub struct BridgeRuntimeHandle {
     stats: IngressStats,
     _egress_stats: EgressStats,
     _reconcile_stats: ReconcileStats,
+    operations: BridgeOperations,
+    operations_task: Option<JoinHandle<()>>,
     shutdown_timeout: Duration,
 }
 
@@ -411,6 +414,11 @@ impl BridgeRuntimeHandle {
             publish_failed: snapshot.publish_failed,
             max_payload_exceeded: snapshot.max_payload_exceeded,
         }
+    }
+
+    /// Complete fixed-cardinality internal operational snapshot.
+    pub fn operations_snapshot(&self) -> BridgeOperationsSnapshot {
+        self.operations.snapshot(self.lifecycle.snapshot())
     }
 
     /// Whether the supervisor has unexpectedly terminated.
@@ -522,6 +530,11 @@ impl BridgeRuntimeHandle {
         } else {
             BridgeShutdownReport::clean(joined, aborted)
         };
+        if let Some(task) = self.operations_task.take() {
+            let _ = task.await;
+        }
+        self.operations.record_shutdown(&report);
+        self.operations.emit_final(self.lifecycle.snapshot());
         if report.is_clean() {
             Ok(report)
         } else {
@@ -540,6 +553,9 @@ impl Drop for BridgeRuntimeHandle {
             task.abort();
         }
         for task in self.producer_tasks.iter().chain(self.consumer_tasks.iter()) {
+            task.abort();
+        }
+        if let Some(task) = &self.operations_task {
             task.abort();
         }
         if let Some(exclusion) = &self.exclusion {
@@ -772,7 +788,18 @@ impl BridgeRuntime {
             }
         });
         let handle_reconcile_trigger = reconcile_trigger.clone();
+        let operations = BridgeOperations::new(
+            stats.clone(),
+            handle_egress_stats.clone(),
+            reconcile_stats.clone(),
+            readiness.clone(),
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(None);
+        let operations_task = Some(spawn_periodic_operations(
+            operations.clone(),
+            lifecycle.subscribe(),
+            shutdown_rx.clone(),
+        ));
         let task = tokio::spawn(async move {
             run_client_supervisor(
                 server_addr,
@@ -805,6 +832,8 @@ impl BridgeRuntime {
             stats,
             _egress_stats: handle_egress_stats,
             _reconcile_stats: reconcile_stats,
+            operations,
+            operations_task,
             shutdown_timeout,
         }
     }
@@ -1598,6 +1627,15 @@ mod tests {
         readiness.set_connected();
         readiness.mark_all_subscriptions_established();
         let lifecycle = LifecycleControl::new(readiness.clone());
+        let stats = IngressStats::default();
+        let egress_stats = EgressStats::default();
+        let reconcile_stats = ReconcileStats::default();
+        let operations = BridgeOperations::new(
+            stats.clone(),
+            egress_stats.clone(),
+            reconcile_stats.clone(),
+            readiness.clone(),
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(None);
         BridgeRuntimeHandle {
             readiness,
@@ -1609,9 +1647,11 @@ mod tests {
             reconcile_trigger: None,
             exclusion: None,
             delivery: None,
-            stats: IngressStats::default(),
-            _egress_stats: EgressStats::default(),
-            _reconcile_stats: ReconcileStats::default(),
+            stats,
+            _egress_stats: egress_stats,
+            _reconcile_stats: reconcile_stats,
+            operations,
+            operations_task: None,
             shutdown_timeout: timeout,
         }
     }
