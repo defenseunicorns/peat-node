@@ -15,6 +15,7 @@ use peat_node::nats_bridge::config::{BridgeConfig, EnabledBridgeConfig};
 use peat_node::nats_bridge::envelope::{
     BridgeEnvelope, BRIDGE_ENVELOPE_KIND, BRIDGE_ENVELOPE_VERSION,
 };
+use peat_node::nats_bridge::ingress::MAX_INGRESS_PAYLOAD_BYTES;
 use peat_node::nats_bridge::runtime::{
     BridgeRuntime, BridgeRuntimeHandle, DeliveredLifecycleEvent, LifecycleSnapshot,
 };
@@ -65,6 +66,7 @@ enum PeerCommand {
     DenySubscription,
     WithholdBarrier,
     Send { subject: String, payload: Vec<u8> },
+    SendSized { subject: String, payload_len: usize },
     Disconnect,
     Stop,
 }
@@ -305,6 +307,9 @@ async fn run_connection(
                 Some(PeerCommand::Send { subject, payload }) => {
                     send_message(&mut writer, &subscriptions, &subject, &payload).await?;
                 }
+                Some(PeerCommand::SendSized { subject, payload_len }) => {
+                    send_sized_message(&mut writer, &subscriptions, &subject, payload_len).await?;
+                }
                 Some(PeerCommand::Disconnect) => return Ok(true),
                 Some(PeerCommand::Stop) | None => return Ok(false),
                 Some(PeerCommand::ConfirmNoResponders | PeerCommand::DenySubscription | PeerCommand::WithholdBarrier) => {
@@ -446,6 +451,32 @@ where
     writer.flush().await
 }
 
+async fn send_sized_message<W>(
+    writer: &mut W,
+    subscriptions: &BTreeMap<String, String>,
+    subject: &str,
+    payload_len: usize,
+) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    const CHUNK: &[u8; 4096] = &[b'x'; 4096];
+    let sid = subscriptions
+        .get(subject)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unsubscribed subject"))?;
+    writer
+        .write_all(format!("MSG {subject} {sid} {payload_len}\r\n").as_bytes())
+        .await?;
+    let mut remaining = payload_len;
+    while remaining > 0 {
+        let count = remaining.min(CHUNK.len());
+        writer.write_all(&CHUNK[..count]).await?;
+        remaining -= count;
+    }
+    writer.write_all(b"\r\n").await?;
+    writer.flush().await
+}
+
 fn subjects() -> BTreeSet<String> {
     ["vision.summary", "node.health"]
         .into_iter()
@@ -517,6 +548,21 @@ async fn wait_received(handle: &BridgeRuntimeHandle, received: u64) {
         assert!(
             Instant::now() < deadline,
             "unexpected received count: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_oversized(handle: &BridgeRuntimeHandle, oversized_payloads: u64) {
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    loop {
+        let snapshot = handle.stats().snapshot();
+        if snapshot.oversized_payloads == oversized_payloads {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unexpected oversized count: {snapshot:?}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -909,6 +955,76 @@ async fn readiness_disconnect_cancels_withheld_barrier_before_timeout() {
     })
     .await
     .expect("bounded disconnect cancellation test timed out");
+}
+
+#[tokio::test]
+async fn oversized_message_is_rejected_before_ingress_and_later_json_is_stored() {
+    timeout(TEST_TIMEOUT, async {
+        let mut peer = ScriptedPeer::start(subjects(), None, 1).await;
+        let dir = tempfile::tempdir().expect("temporary node directory");
+        let node = test_node(dir.path()).await;
+        let mut changes = node.subscribe();
+        let handle = BridgeRuntime::spawn(
+            enabled_config(&peer.url),
+            "effective-test-node".to_owned(),
+            Arc::clone(&node),
+        );
+
+        loop {
+            if let PeerEvent::Barrier { subjects: seen, .. } = peer.event().await {
+                assert_eq!(seen, subjects());
+                break;
+            }
+        }
+        peer.command(PeerCommand::ConfirmNoResponders).await;
+        wait_ready(&handle, true).await;
+
+        peer.command(PeerCommand::SendSized {
+            subject: "vision.summary".to_owned(),
+            payload_len: MAX_INGRESS_PAYLOAD_BYTES + 1,
+        })
+        .await;
+        wait_oversized(&handle, 1).await;
+        let rejected = handle.stats().snapshot();
+        assert_eq!(rejected.received, 0);
+        assert_eq!(rejected.stored, 0);
+        assert_eq!(rejected.invalid_utf8, 0);
+        assert_eq!(rejected.invalid_json, 0);
+        assert_eq!(rejected.final_store_failures, 0);
+        assert!(
+            changes.try_recv().is_err(),
+            "oversize emitted an observer event"
+        );
+        assert!(node
+            .list_documents("frames")
+            .await
+            .expect("list frame documents")
+            .is_empty());
+
+        let valid = b" {\"after_oversize\":1.0} \n".to_vec();
+        peer.command(PeerCommand::Send {
+            subject: "vision.summary".to_owned(),
+            payload: valid.clone(),
+        })
+        .await;
+        wait_stats(&handle, 1, 1).await;
+        let event = timeout(STEP_TIMEOUT, changes.recv())
+            .await
+            .expect("post-oversize observer timeout")
+            .expect("post-oversize observer event");
+        let document = node
+            .get_document("frames", &event.doc_id)
+            .await
+            .expect("read post-oversize document")
+            .expect("post-oversize document exists");
+        let envelope: BridgeEnvelope =
+            serde_json::from_str(&document).expect("decode post-oversize envelope");
+        assert_eq!(envelope.payload.as_bytes(), valid);
+        assert_eq!(handle.stats().snapshot().oversized_payloads, 1);
+        peer.finish().await;
+    })
+    .await
+    .expect("bounded oversized ingress test timed out");
 }
 
 #[tokio::test]

@@ -166,30 +166,83 @@ permission for every configured mapping. Under the developer-approved residual
 risk dated 2026-07-15, `ING-01: partial` and internal bridge readiness must not
 be used as proof that every application `SUB` was authorized.
 
-Each valid UTF-8, syntactically valid JSON message creates one immutable Peat
-document with a fresh UUID v4 in its mapped collection. The durable envelope
-has exactly five fields: fixed `kind`, numeric `version`, the original literal
-`subject`, the effective operator-visible `source_node_id`, and `payload`. The
-payload field preserves the original UTF-8 JSON text byte-for-byte, including
-whitespace, key order, numeric spelling, escapes, and Unicode. The envelope is
-stored and synchronized through the existing Peat document path; it is not
-published to NATS.
+Ingress admits payloads of at most 1,048,576 bytes (1 MiB). A larger frame is
+rejected before the bridge clones it into an ingress item or awaits the shared
+queue; every rejection increments the label-free `oversized_payloads` counter
+and produces only bounded, rate-limited route/length diagnostics. Rejection
+does not stop the subscription reader from accepting a later within-cap frame.
 
-Ingress memory is bounded by one 256-item process-wide FIFO plus
-`O(configured mappings)` subscriber/reader slack. Each async-nats subscriber
-has capacity 1, and readers await shared FIFO capacity rather than deliberately
-dropping at the bridge boundary. Core NATS remains at-most-once: sustained
-overload can still trigger client slow-consumer loss. Such events are counted
-and warned about at a rate-limited cadence without changing readiness, and
-lost Core NATS messages cannot be replayed.
+Accepted input is the bounded `serde_json::Value` subset, not every
+grammar-valid JSON value. Default recursion protection accepts at most 127
+nested arrays/objects and rejects the 128th. Numbers must fit serde_json's
+enabled `Number` modes, including finite `f64` fallback (`1e308` is accepted;
+`1e309` is rejected). Every accepted UTF-8 JSON message creates one immutable
+Peat document with a fresh UUID v4. The five-field envelope contains fixed
+`kind`, numeric `version`, literal `subject`, effective operator-visible
+`source_node_id`, and `payload`; the payload preserves every accepted byte,
+including whitespace, key order, numeric spelling, escapes, and Unicode.
 
-Peat storage is serial and preserves FIFO processing. A transient store failure
-gets three total attempts using the same generated document ID and envelope,
-with 50 ms then 200 ms delays. Final loss is reported once with only safe route
-metadata, payload byte length, document ID, bounded attempt values, and a fixed
-error classification. Payload text, NATS credentials, unrestricted parser or
-store errors, and source chains are never logged. Invalid UTF-8 and malformed
-JSON are counted separately and never stored or relayed.
+For `M` configured mappings and a compliant broker, **1 MiB × (257 + 2M)** is
+the **bridge-owned post-dispatch raw-body subtotal** only: 256 bodies in the
+shared FIFO, one serial processor `IngressItem`, and per mapping at most one
+blocked-reader clone plus one capacity-1 async-nats subscriber body. This is
+not a maximum total raw-body value, a process-memory bound, or a memory
+ceiling. Readers await shared FIFO capacity rather than deliberately dropping
+at that boundary.
+
+Before dispatch and before the bridge can inspect or enforce its 1 MiB policy,
+async-nats connection parser/read buffering retains the broker-declared
+transport frame. That pre-policy retention is additional to the subtotal.
+Consequently a hostile or misbehaving broker has no strict bridge-enforced
+bound on total raw-body or process retention; broker payload policy remains an
+operational requirement.
+
+The active serial processor also has payload-dependent transient allocations:
+its raw `Vec`, the serde_json validation tree, the copied
+`BridgeEnvelope.payload` `String`, the escaped serialized-envelope `String`,
+the node-side parsed `Value`, optional ciphertext/base64/wrapper values, and
+Automerge conversion/document allocations. Serial processing limits this
+amplification to one active item. Small fixed route/item structs and allocator
+metadata are separate fixed overhead; none of the payload-dependent terms
+above is included in that label.
+
+The regression budget for this one-active-item work is a
+**scoped Rust-global-allocator live-byte delta** of 41,943,040 bytes (40 MiB).
+The 2026-07-15 calibration maximum was 32,863,033 bytes, so the committed
+threshold adds 9,080,007 bytes (27.6%) of conservative allocator/platform
+headroom. Reproduce the ordinary fixed-threshold assertion with:
+
+```bash
+cargo test --test nats_bridge_memory_test -- --nocapture
+```
+
+Recalibration is intentionally separate and ignored by default:
+
+```bash
+cargo test --test nats_bridge_memory_test calibrate_scoped_allocator_delta -- --ignored --nocapture
+```
+
+The scoped measurement covers only Rust global-allocator activity on the
+enabled current OS thread during a no-yield window. It explicitly excludes
+mmap allocations, native-library and kernel buffers, allocations on other OS
+threads, RSS, async-nats transport retention, and whole-process memory; it is
+not a transport or process-memory bound.
+
+Core NATS remains at-most-once: sustained overload can still trigger client
+slow-consumer loss. Such events are counted and warned about at a rate-limited
+cadence without changing readiness, and lost Core NATS messages cannot be
+replayed.
+
+Peat storage is serial and preserves FIFO processing. The envelope is stored
+and synchronized through the existing Peat document path; it is not published
+to NATS. A transient store failure gets three total attempts using the same
+generated document ID and envelope, with 50 ms then 200 ms delays. Final loss
+is reported once with only safe route metadata, payload byte length, document
+ID, bounded attempt values, and a fixed error classification. Payload text,
+NATS credentials, unrestricted parser or store errors, parser source text, and
+source chains are never logged. Invalid UTF-8, malformed JSON, excessive
+nesting, and out-of-range numbers are counted safely and never stored or
+relayed.
 
 Phase 2 ends after local NATS ingestion and Peat storage/mesh synchronization.
 Publishing remote-origin documents to local NATS and preventing local loops is
