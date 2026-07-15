@@ -999,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn nats_resolved_config_redacts_all_authenticated_user_info() {
         let cases = [
             "nats://alice:password@broker.example",
