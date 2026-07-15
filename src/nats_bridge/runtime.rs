@@ -346,11 +346,13 @@ impl BridgeRuntime {
                 server_addr,
                 task_host,
                 nats_port,
-                task_readiness,
-                task_lifecycle,
+                SupervisorRuntime {
+                    readiness: task_readiness,
+                    lifecycle: task_lifecycle,
+                    stats: task_stats,
+                },
                 config,
                 ingress_tx,
-                task_stats,
             )
             .await;
         });
@@ -372,6 +374,12 @@ enum ClientSignal {
 struct SubscriptionGeneration {
     id: u64,
     task: JoinHandle<()>,
+}
+
+struct SupervisorRuntime {
+    readiness: BridgeReadiness,
+    lifecycle: LifecycleControl,
+    stats: IngressStats,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,12 +478,15 @@ async fn run_client_supervisor(
     server_addr: async_nats::ServerAddr,
     nats_host: String,
     nats_port: u16,
-    readiness: BridgeReadiness,
-    lifecycle: LifecycleControl,
+    runtime: SupervisorRuntime,
     config: EnabledBridgeConfig,
     ingress_tx: Option<IngressSender>,
-    stats: IngressStats,
 ) {
+    let SupervisorRuntime {
+        readiness,
+        lifecycle,
+        stats,
+    } = runtime;
     let (signal_tx, mut signal_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
     let (slow_consumer_tx, mut slow_consumer_rx) = mpsc::channel(SUPERVISOR_SIGNAL_CAPACITY);
     let mut lifecycle_rx = lifecycle.subscribe();
