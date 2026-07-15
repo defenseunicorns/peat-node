@@ -302,17 +302,17 @@ preflight; the exact version matches peat-mesh and introduces no second
 Automerge version.
 
 Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
-queue-closed, unavailable-client, publish, and negotiated `max_payload`
-failures are terminal losses for that document; later events continue. There
-is no bridge-owned retry, disconnected backlog, broker acknowledgement,
-per-item flush, replay, or reconciliation in this phase. Success means
-async-nats accepted the publish into its bounded client command path, not that
-the broker or a subscriber received it. The two supervisor signal FIFOs each
-hold 64 events, each configured async-nats subscriber holds one message, the
-shared ingress FIFO holds 256, the private and public node broadcasts each
-hold 256, and lifecycle/readiness use watch channels that retain only their
-latest snapshot. The pinned async-nats client separately uses its bounded
-128-event callback queue described above.
+queue-closed, unavailable-client, publish, flush, and negotiated `max_payload`
+failures are terminal losses for the already-reserved document; later events
+continue. There is no per-item retry or disconnected publication backlog.
+Success means async-nats accepted the publish, the bounded bridge flush
+completed, and the local delivery journal reached `Completed`; neither flush
+nor drain is a broker or subscriber delivery acknowledgement. The two
+supervisor signal FIFOs each hold 64 events, each configured async-nats
+subscriber holds one message, the shared ingress FIFO holds 256, the private
+and public node broadcasts each hold 256, and lifecycle/readiness use watch
+channels that retain only their latest snapshot. The pinned async-nats client
+separately uses its bounded 128-event callback queue described above.
 
 Egress classification and delivery counters remain label-free monotonic
 counters. Diagnostic emission allocates exactly 16 fixed classification
@@ -343,15 +343,8 @@ Provision broker headroom for the NATS header. The bridge reports a fixed
 `max_payload` loss classification and never truncates, rewrites, or retries the
 payload.
 
-Remote duplicate suppression retains exactly 4,096 SHA-256 document digests
-(4,096 × 32 = 131,072 bytes) for the process lifetime. Its domain-separated,
-big-endian length-framed input is `(collection, document ID)`; it retains no
-attacker-controlled strings. A digest collision is treated as a duplicate.
-The digest is inserted before FIFO admission, so queue or publication failure
-cannot turn a later notification into an implicit retry. There is no eviction:
-after the table fills, all previously unseen documents fail closed until
-restart, while an existing digest remains a duplicate. Restart clears this
-in-memory table and does not provide durable exactly-once behavior.
+Remote duplicate suppression is persistent and node-local. It is described in
+[Delivery ledger and reconciliation](#delivery-ledger-and-reconciliation).
 
 Origin attribution has a separate local-revision guard with exactly 4,096
 SHA-256 slots (also 4,096 × 32 = 131,072 retained digest bytes). Its
@@ -408,10 +401,103 @@ source chains are never logged. Invalid UTF-8, malformed JSON, excessive
 nesting, and out-of-range numbers are counted safely and never stored or
 relayed.
 
-Phase 3 ends with remote-only Core NATS egress and in-memory loop safety.
-Bounded shutdown draining, persisted reconciliation, and the complete metrics
-surface are Phase 4. This Core NATS bridge provides no durable input,
-acknowledgement, replay, ordering, exactly-once delivery, or zero-loss overload
+### Delivery ledger and reconciliation
+
+The bridge anchors a fixed `nats-bridge-ledger-v1` directory beneath
+`PEAT_NODE_DATA_DIR` and opens it through a directory file descriptor with
+no-follow checks on every path component, the directory, child, and active
+file. It never follows or replaces a symlink supplied at those boundaries.
+The directory contains two independent version-1 journals:
+
+- `local-exclusion-v1` contains only `LocalExcluded`. A mapped local mutation
+  first awaits this durable record, then takes the peat-mesh document guard and
+  performs the non-awaiting store mutation. No `.await` occurs while that
+  standard lock is held. If the exclusion writer is unhealthy, the mapped
+  mutation stores nothing.
+- `remote-delivery-v1` contains `Reserved` and `Completed`. An eligible remote
+  document is durably `Reserved` before FIFO admission or NATS publication and
+  becomes `Completed` only after publish acceptance and the bounded flush.
+
+The files retain fixed 32-byte, domain-separated, length-framed SHA-256
+digests of `(collection, document ID)`, never the raw values. Each journal
+accepts at most 262,144 unique entries and 524,288 fixed 80-byte records; the
+maximum active file is 41,943,072 bytes. Each journal worker has a fixed
+64-command queue. Compaction writes and syncs a replacement, syncs the
+directory, then reopens the anchored active file. A torn final record is
+truncated to the last complete verified record. Complete corruption is
+preserved for operator recovery and is never silently rebuilt.
+
+Exclusion and delivery health are deliberately isolated. Delivery open,
+write, sync, corruption, or capacity failure clears remote readiness and stops
+egress and reconciliation, but a healthy exclusion writer may still admit
+local ingress after its durable `LocalExcluded` record. Exclusion failure
+rejects mapped local mutation; it is never bypassed merely to keep ingestion
+available.
+
+Reserve-first is the selected at-most-once crash tradeoff. A crash after
+`Reserved` but before publish, flush, or `Completed` leaves an uncertain entry
+that is suppressed after restart. That is a documented loss window, not a
+retry. Publishing before reservation would choose a duplicate window and is
+not this implementation. Core NATS still supplies no durable input, replay,
+subscriber acknowledgement, global ordering, or exactly-once delivery.
+
+One single-flight reconciliation scanner runs after startup readiness, after
+reconnect readiness, and after detected private-event lag. Repeated triggers
+coalesce. It processes retained bridge work in 64-key batches, hydrates at
+most 16 documents per second, holds one body at a time, and yields between
+batches. The pinned peat-mesh `keys_with_prefix` API first returns one complete
+whole-key vector per collection. That inherited transient is explicitly not
+bounded by the 64-key bridge batch and is not a process-memory or RSS ceiling.
+
+Reconciliation treats durable `LocalExcluded`, `Reserved`, and `Completed`
+entries as suppressed. A missing local exclusion is not proof of remote
+origin: bridge-shaped documents created before this journal existed remain
+ambiguous during an upgrade and can be considered eligible. A foreign
+`source_node_id` is envelope provenance, not historical origin proof. After
+upgrade, canonical local ingress and RPC mutations record exclusion before the
+store change and therefore remain excluded across restart.
+
+### Bridge shutdown and operational observations
+
+`PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS` /
+`--nats-shutdown-timeout-secs` is one total shutdown budget, default 10
+seconds, startup-validated from 1 through 300 seconds. Shutdown immediately
+clears readiness and admission, closes reconciliation triggers, and stops
+reconnect work. Every subsequent producer stop, admitted ingress/egress drain,
+client flush, client drain, consumer join, and exclusion/delivery worker join
+consumes the same absolute deadline; stages do not receive fresh timeouts.
+Shutdown never starts a reconciliation scan.
+
+At deadline expiry, remaining controlled Tokio tasks are aborted and joined,
+node cleanup continues, and shutdown returns a fixed payload-safe failure.
+Ledger workers cooperate with stop/join, but a regular-file kernel syscall
+cannot be forcibly cancelled. If it does not return within the shared budget,
+`LedgerIoUnjoined` identifies the exclusion or delivery worker. Such a report
+is non-clean and never claims zero surviving work. A Core NATS flush or drain
+remains transport lifecycle work, not subscriber acknowledgement.
+
+No Connect proto, status field, or metrics endpoint is added. The enabled
+bridge exposes one internal typed, fixed-cardinality cumulative snapshot and
+structured tracing. It emits serious readiness/lifecycle transitions
+immediately, a cumulative summary every 60 seconds with missed ticks skipped,
+and exactly one final snapshot after controlled producers and consumers stop
+and shutdown counters settle. A disabled bridge creates no observation task
+or emission. Counters reset on process restart; only the journals persist.
+
+The label-free counters cover received, stored, invalid input,
+self-suppressed, final store failure, slow consumer, completed
+remote-published, publish/flush/max-payload failure, reconnect (excluding the
+initial connect), exact event lag, queue loss, ledger failure and uncertain
+reservation outcomes, reconciliation trigger/coalescing/scan/hydration/
+suppression/failure, and clean/failure/timeout/abort/unjoined shutdown
+outcomes. Readiness separately exposes accepting, connected, subscription,
+delivery-health, and exclusion-health inputs. Logs contain only fixed enums,
+booleans, and cumulative integers; subjects, document IDs, peers, payloads,
+credentials, marker values, raw errors, and other attacker-controlled labels
+are excluded.
+
+This Core NATS bridge provides no durable input, subscriber acknowledgement,
+replay, global ordering, exactly-once delivery, or zero-loss overload
 guarantee; JetStream is out of scope.
 
 ## Agent watcher (optional)
