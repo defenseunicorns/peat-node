@@ -1,0 +1,184 @@
+# Two independent Core NATS sites joined only by the Peat mesh.
+#
+# Local proof (build override required):
+#   PEAT_NODE_IMAGE=ghcr.io/defenseunicorns/peat-node:v0.0.0 \
+#     docker compose -f docker-compose.yml -f docker-compose.local.yml \
+#     --profile local up --build
+#
+# Physical profiles require a released multi-architecture image and an explicit
+# reciprocal endpoint-ID/LAN-address PEAT_A_PEERS or PEAT_B_PEERS override. The
+# preflight services reject mutable images and the service-DNS local defaults.
+
+x-peat-environment: &peat-environment
+  PEAT_NODE_LISTEN: tcp://0.0.0.0:50051
+  PEAT_NODE_DATA_DIR: /data/peat-node
+  PEAT_NODE_APP_ID: nats-bridge-e2e
+  PEAT_NODE_SHARED_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+  PEAT_NODE_NATS_MAPPING: vision.summary=frames
+  PEAT_NODE_DISABLE_MDNS: "true"
+  PEAT_NODE_AUTO_SYNC: "true"
+  RUST_LOG: peat_node=info,peat_mesh=info,peat_protocol=info,iroh=warn
+
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD", "curl", "--silent", "--show-error", "--max-time", "2", "http://127.0.0.1:50051/"]
+  interval: 2s
+  timeout: 3s
+  retries: 30
+  start_period: 5s
+
+x-broker-healthcheck: &broker-healthcheck
+  test: ["CMD", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:8222/healthz"]
+  interval: 2s
+  timeout: 3s
+  retries: 30
+  start_period: 2s
+
+services:
+  nats-a:
+    image: nats:2.14.3-alpine
+    command: ["--http_port", "8222"]
+    profiles: [local, site-a]
+    networks: [site-a]
+    healthcheck: *broker-healthcheck
+
+  nats-b:
+    image: nats:2.14.3-alpine
+    command: ["--http_port", "8222"]
+    profiles: [local, site-b]
+    networks: [site-b]
+    healthcheck: *broker-healthcheck
+
+  peat-a:
+    image: ${PEAT_NODE_IMAGE:?Set PEAT_NODE_IMAGE to ghcr.io/defenseunicorns/peat-node:vX.Y.Z}
+    profiles: [local, site-a]
+    environment:
+      <<: *peat-environment
+      PEAT_NODE_NODE_ID: edge-a
+      PEAT_NODE_NATS_URL: nats://nats-a:4222
+      PEAT_NODE_IROH_UDP_PORT: "51071"
+      PEAT_NODE_PEERS: ${PEAT_A_PEERS:-84f5efd74c84c3ae848be186d7c2f169b94acda724ec6ee1506b321d9a504a4f@peat-b:51072}
+    ports:
+      - target: 51071
+        published: "51071"
+        protocol: udp
+    volumes:
+      - peat-a-data:/data/peat-node
+    networks: [site-a, mesh]
+    depends_on:
+      nats-a:
+        condition: service_healthy
+    healthcheck: *node-healthcheck
+
+  peat-b:
+    image: ${PEAT_NODE_IMAGE:?Set PEAT_NODE_IMAGE to ghcr.io/defenseunicorns/peat-node:vX.Y.Z}
+    profiles: [local, site-b]
+    environment:
+      <<: *peat-environment
+      PEAT_NODE_NODE_ID: edge-b
+      PEAT_NODE_NATS_URL: nats://nats-b:4222
+      PEAT_NODE_IROH_UDP_PORT: "51072"
+      PEAT_NODE_PEERS: ${PEAT_B_PEERS:-fb3854f189c31fb61df2ace61f34ef7817fc90ccefbcfb94c3346e03b8b143fb@peat-a:51071}
+    ports:
+      - target: 51072
+        published: "51072"
+        protocol: udp
+    volumes:
+      - peat-b-data:/data/peat-node
+    networks: [site-b, mesh]
+    depends_on:
+      nats-b:
+        condition: service_healthy
+    healthcheck: *node-healthcheck
+
+  publisher:
+    image: natsio/nats-box:0.19.5
+    profiles: [local, site-a]
+    environment:
+      NATS_URL: nats://nats-a:4222
+      NATS_SUBJECT: vision.summary
+      PUBLISH_COUNT: ${PUBLISH_COUNT:-0}
+      PUBLISH_INTERVAL_SECS: ${PUBLISH_INTERVAL_SECS:-30}
+      FIXTURE: /work/vision-summary.json
+    volumes:
+      - ./vision-summary.json:/work/vision-summary.json:ro
+      - ./publish-vision.sh:/work/publish-vision.sh:ro
+    command: ["/work/publish-vision.sh"]
+    networks: [site-a]
+    depends_on:
+      nats-a:
+        condition: service_healthy
+
+  receiver:
+    image: natsio/nats-box:0.19.5
+    profiles: [local, site-b]
+    environment:
+      NATS_URL: nats://nats-b:4222
+      NATS_SUBJECT: vision.summary
+      FIXTURE: /work/vision-summary.json
+      DELIVERY_RECORD: /results/deliveries
+    volumes:
+      - ./vision-summary.json:/work/vision-summary.json:ro
+      - ./verify-vision.sh:/work/verify-vision.sh:ro
+      - receiver-results:/results
+    command:
+      - sh
+      - -ec
+      - >-
+        nats --server "$$NATS_URL" sub --count 2 --wait 2m
+        --translate "/work/verify-vision.sh $$DELIVERY_RECORD" "$$NATS_SUBJECT"
+    networks: [site-b]
+    depends_on:
+      nats-b:
+        condition: service_healthy
+
+  preflight-site-a:
+    image: natsio/nats-box:0.19.5
+    profiles: [site-a]
+    environment:
+      PEERS: ${PEAT_A_PEERS:-}
+      NODE_IMAGE: ${PEAT_NODE_IMAGE:-}
+    command:
+      - sh
+      - -ec
+      - >-
+        case "$$NODE_IMAGE" in
+          ghcr.io/defenseunicorns/peat-node:v[0-9]*.[0-9]*.[0-9]*) ;;
+          *) echo 'PEAT_NODE_IMAGE must be an explicit vX.Y.Z release image' >&2; exit 2 ;;
+        esac;
+        case "$$PEERS" in
+          [0-9a-f][0-9a-f]*@*.*.*.*:51072) ;;
+          *) echo 'PEAT_A_PEERS must be endpoint-id@LAN-IP:51072' >&2; exit 2 ;;
+        esac
+    networks: [site-a]
+
+  preflight-site-b:
+    image: natsio/nats-box:0.19.5
+    profiles: [site-b]
+    environment:
+      PEERS: ${PEAT_B_PEERS:-}
+      NODE_IMAGE: ${PEAT_NODE_IMAGE:-}
+    command:
+      - sh
+      - -ec
+      - >-
+        case "$$NODE_IMAGE" in
+          ghcr.io/defenseunicorns/peat-node:v[0-9]*.[0-9]*.[0-9]*) ;;
+          *) echo 'PEAT_NODE_IMAGE must be an explicit vX.Y.Z release image' >&2; exit 2 ;;
+        esac;
+        case "$$PEERS" in
+          [0-9a-f][0-9a-f]*@*.*.*.*:51071) ;;
+          *) echo 'PEAT_B_PEERS must be endpoint-id@LAN-IP:51071' >&2; exit 2 ;;
+        esac
+    networks: [site-b]
+
+networks:
+  site-a:
+    internal: true
+  site-b:
+    internal: true
+  mesh: {}
+
+volumes:
+  peat-a-data: {}
+  peat-b-data: {}
+  receiver-results: {}
