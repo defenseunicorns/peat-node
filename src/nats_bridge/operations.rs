@@ -199,6 +199,7 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
         info!(
             reason,
             final_snapshot,
+            enabled = snapshot.enabled,
             bridge_ready = snapshot.ready,
             accepting = snapshot.accepting,
             connected = snapshot.connected,
@@ -219,9 +220,16 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
             delivery_reservations = snapshot.delivery_reservations,
             delivery_completions = snapshot.delivery_completions,
             delivery_reservations_uncertain = snapshot.delivery_reservations_uncertain,
+            reconciliation_triggers = snapshot.reconciliation_triggers,
+            reconciliation_coalesced = snapshot.reconciliation_coalesced,
             reconciliation_scans = snapshot.reconciliation_scans,
+            reconciliation_hydrated = snapshot.reconciliation_hydrated,
+            reconciliation_suppressed = snapshot.reconciliation_suppressed,
+            reconciliation_failures = snapshot.reconciliation_failures,
             shutdown_clean = snapshot.shutdown_clean,
             shutdown_failure = snapshot.shutdown_failure,
+            shutdown_timeout = snapshot.shutdown_timeout,
+            shutdown_aborted_tasks = snapshot.shutdown_aborted_tasks,
             ledger_io_unjoined = snapshot.ledger_io_unjoined,
             "NATS bridge operations"
         );
@@ -229,6 +237,7 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
         warn!(
             reason,
             final_snapshot,
+            enabled = snapshot.enabled,
             bridge_ready = snapshot.ready,
             accepting = snapshot.accepting,
             connected = snapshot.connected,
@@ -249,9 +258,16 @@ fn emit(snapshot: BridgeOperationsSnapshot, reason: &'static str, final_snapshot
             delivery_reservations = snapshot.delivery_reservations,
             delivery_completions = snapshot.delivery_completions,
             delivery_reservations_uncertain = snapshot.delivery_reservations_uncertain,
+            reconciliation_triggers = snapshot.reconciliation_triggers,
+            reconciliation_coalesced = snapshot.reconciliation_coalesced,
             reconciliation_scans = snapshot.reconciliation_scans,
+            reconciliation_hydrated = snapshot.reconciliation_hydrated,
+            reconciliation_suppressed = snapshot.reconciliation_suppressed,
+            reconciliation_failures = snapshot.reconciliation_failures,
             shutdown_clean = snapshot.shutdown_clean,
             shutdown_failure = snapshot.shutdown_failure,
+            shutdown_timeout = snapshot.shutdown_timeout,
+            shutdown_aborted_tasks = snapshot.shutdown_aborted_tasks,
             ledger_io_unjoined = snapshot.ledger_io_unjoined,
             "NATS bridge operations"
         );
@@ -263,6 +279,7 @@ pub(crate) fn spawn_periodic_operations(
     mut lifecycle: watch::Receiver<LifecycleSnapshot>,
     mut shutdown: watch::Receiver<Option<Instant>>,
 ) -> JoinHandle<()> {
+    let mut readiness = operations.readiness.subscribe();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval_at(
             Instant::now() + OPERATIONS_SUMMARY_INTERVAL,
@@ -275,6 +292,11 @@ pub(crate) fn spawn_periodic_operations(
                 changed = lifecycle.changed() => {
                     if changed.is_err() { return; }
                     operations.emit_transition(*lifecycle.borrow_and_update(), "lifecycle");
+                }
+                changed = readiness.changed() => {
+                    if changed.is_err() { return; }
+                    let _ = readiness.borrow_and_update();
+                    operations.emit_transition(*lifecycle.borrow(), "readiness");
                 }
                 changed = shutdown.changed() => {
                     if changed.is_err() || shutdown.borrow_and_update().is_some() { return; }

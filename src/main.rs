@@ -471,10 +471,7 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-async fn shutdown_bridge_and_node(
-    bridge: &mut Option<BridgeRuntimeHandle>,
-    node: &SidecarNode,
-) -> anyhow::Result<()> {
+async fn shutdown_bridge(bridge: &mut Option<BridgeRuntimeHandle>) -> anyhow::Result<()> {
     let bridge_result = match bridge {
         Some(handle) => handle.shutdown().await.map(|report| {
             info!(
@@ -495,6 +492,10 @@ async fn shutdown_bridge_and_node(
         );
     }
 
+    bridge_result.map_err(|_| anyhow::anyhow!("NATS bridge shutdown failed"))
+}
+
+async fn shutdown_node(node: &SidecarNode) -> anyhow::Result<()> {
     let node_result = node.shutdown().await;
     if node_result.is_ok() {
         info!("peat-node cleanup complete");
@@ -505,12 +506,7 @@ async fn shutdown_bridge_and_node(
         );
     }
 
-    match (bridge_result, node_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(_), Ok(())) => Err(anyhow::anyhow!("NATS bridge shutdown failed")),
-        (Ok(()), Err(_)) => Err(anyhow::anyhow!("peat-node cleanup failed")),
-        (Err(_), Err(_)) => Err(anyhow::anyhow!("bridge and node cleanup failed")),
-    }
+    node_result.map_err(|_| anyhow::anyhow!("peat-node cleanup failed"))
 }
 
 #[tokio::main]
@@ -763,89 +759,105 @@ async fn main() -> anyhow::Result<()> {
     let router = service.register(Router::new());
 
     // Parse listen address and start server
-    let (serve_result, cleanup_result) = if let Some(path) = args.listen.strip_prefix("unix://") {
-        let uds_path = PathBuf::from(path);
-        if uds_path.exists() {
-            tokio::fs::remove_file(&uds_path).await?;
-        }
-        if let Some(parent) = uds_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+    let (serve_result, bridge_result, node_result) =
+        if let Some(path) = args.listen.strip_prefix("unix://") {
+            let uds_path = PathBuf::from(path);
+            if uds_path.exists() {
+                tokio::fs::remove_file(&uds_path).await?;
+            }
+            if let Some(parent) = uds_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
 
-        info!(path = %uds_path.display(), "listening on Unix socket");
+            info!(path = %uds_path.display(), "listening on Unix socket");
 
-        let listener = tokio::net::UnixListener::bind(&uds_path)?;
-        let connect_service = connectrpc::ConnectRpcService::new(router);
+            let listener = tokio::net::UnixListener::bind(&uds_path)?;
+            let connect_service = connectrpc::ConnectRpcService::new(router);
 
-        let mut connections = tokio::task::JoinSet::new();
-        let serve_result = loop {
-            tokio::select! {
-                () = shutdown_signal() => break Ok(()),
-                accepted = listener.accept() => {
-                    let (stream, _) = match accepted {
-                        Ok(accepted) => accepted,
-                        Err(_) => break Err(anyhow::anyhow!("Unix listener failed")),
-                    };
-                    let svc = connect_service.clone();
-                    connections.spawn(async move {
-                        let io = hyper_util::rt::TokioIo::new(stream);
-                        let _ = hyper_util::server::conn::auto::Builder::new(
-                            hyper_util::rt::TokioExecutor::new(),
-                        )
-                        .serve_connection(
-                            io,
-                            hyper::service::service_fn(move |req| {
-                                let mut s = svc.clone();
-                                async move { tower::Service::call(&mut s, req).await }
-                            }),
-                        )
-                        .await;
-                    });
+            let mut connections = tokio::task::JoinSet::new();
+            let serve_result = loop {
+                tokio::select! {
+                    () = shutdown_signal() => break Ok(()),
+                    accepted = listener.accept() => {
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(_) => break Err(anyhow::anyhow!("Unix listener failed")),
+                        };
+                        let svc = connect_service.clone();
+                        connections.spawn(async move {
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let _ = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(
+                                io,
+                                hyper::service::service_fn(move |req| {
+                                    let mut s = svc.clone();
+                                    async move { tower::Service::call(&mut s, req).await }
+                                }),
+                            )
+                            .await;
+                        });
+                    }
                 }
-            }
-        };
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-        let cleanup_result = shutdown_bridge_and_node(&mut bridge_runtime, &node).await;
-        (serve_result, cleanup_result)
-    } else {
-        // TCP
-        let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
-        let addr: std::net::SocketAddr = addr_str.parse()?;
-
-        info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
-
-        let bound = connectrpc::Server::bind(addr)
+            };
+            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+            connections.abort_all();
+            let connection_result = tokio::time::timeout(
+                Duration::from_secs(args.nats_shutdown_timeout_secs),
+                async { while connections.join_next().await.is_some() {} },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("Connect server bind failed"))?;
-        let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel();
-        let mut server_task = tokio::spawn(async move {
-            bound
-                .serve_with_graceful_shutdown(router, async {
-                    let _ = server_stop_rx.await;
-                })
-                .await
-        });
-        shutdown_signal().await;
-        let _ = server_stop_tx.send(());
+            .map_err(|_| anyhow::anyhow!("Unix connection shutdown timed out"));
+            let node_result = shutdown_node(&node).await;
+            (
+                serve_result.and(connection_result),
+                bridge_result,
+                node_result,
+            )
+        } else {
+            // TCP
+            let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
+            let addr: std::net::SocketAddr = addr_str.parse()?;
 
-        // Quiesce the bridge immediately after the listener stop signal. The
-        // Connect server drains independently and is bounded below.
-        let cleanup_result = shutdown_bridge_and_node(&mut bridge_runtime, &node).await;
-        let server_deadline = Duration::from_secs(args.nats_shutdown_timeout_secs);
-        let serve_result = match tokio::time::timeout(server_deadline, &mut server_task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(_))) | Ok(Err(_)) => Err(anyhow::anyhow!("Connect server failed")),
-            Err(_) => {
-                server_task.abort();
-                let _ = server_task.await;
-                Err(anyhow::anyhow!("Connect server shutdown timed out"))
-            }
+            info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
+
+            let bound = connectrpc::Server::bind(addr)
+                .await
+                .map_err(|_| anyhow::anyhow!("Connect server bind failed"))?;
+            let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel();
+            let mut server_task = tokio::spawn(async move {
+                bound
+                    .serve_with_graceful_shutdown(router, async {
+                        let _ = server_stop_rx.await;
+                    })
+                    .await
+            });
+            shutdown_signal().await;
+            let _ = server_stop_tx.send(());
+
+            // Quiesce the bridge immediately after the listener stop signal. The
+            // Connect server drains independently and is bounded below.
+            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+            let server_deadline = Duration::from_secs(args.nats_shutdown_timeout_secs);
+            let serve_result = match tokio::time::timeout(server_deadline, &mut server_task).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => Err(anyhow::anyhow!("Connect server failed")),
+                Err(_) => {
+                    server_task.abort();
+                    Err(anyhow::anyhow!("Connect server shutdown timed out"))
+                }
+            };
+            let node_result = shutdown_node(&node).await;
+            (serve_result, bridge_result, node_result)
         };
-        (serve_result, cleanup_result)
-    };
-    serve_result?;
-    cleanup_result?;
+    match (serve_result, bridge_result, node_result) {
+        (Ok(()), Ok(()), Ok(())) => {}
+        (Err(_), Ok(()), Ok(())) => return Err(anyhow::anyhow!("server shutdown failed")),
+        (Ok(()), Err(_), Ok(())) => return Err(anyhow::anyhow!("NATS bridge shutdown failed")),
+        (Ok(()), Ok(()), Err(_)) => return Err(anyhow::anyhow!("peat-node cleanup failed")),
+        _ => return Err(anyhow::anyhow!("multiple shutdown stages failed")),
+    }
 
     info!("peat-node stopped");
     Ok(())
