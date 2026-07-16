@@ -500,6 +500,31 @@ This Core NATS bridge provides no durable input, subscriber acknowledgement,
 replay, global ordering, exactly-once delivery, or zero-loss overload
 guarantee; JetStream is out of scope.
 
+### Executable validation and edge smoke
+
+The bridge's delivery contract is Core NATS at-most-once. In one place, the
+complete REL-04 exclusions are: no durable input, replay, subscriber
+acknowledgement or subscriber-delivery proof, global ordering, exactly-once
+delivery, or zero-loss overload guarantee. Peat document persistence and
+reconciliation do not upgrade Core NATS into any of those mechanisms.
+Publish, flush, and drain are transport lifecycle signals, not subscriber
+acknowledgement. JetStream remains out of scope.
+
+Validation is split deliberately by evidence level:
+
+- Automated TEST-03 is `./test/nats-bridge-e2e.sh`; it owns the bounded local
+  lifecycle and produces a single PASS/FAIL result.
+- The [local Compose walkthrough](../examples/compose/nats-bridge/README.md)
+  expands that same topology and proof for inspection and troubleshooting.
+- Physical TEST-04 is the
+  [Jetson and second-host smoke guide](NATS_BRIDGE_EDGE_SMOKE.md). Its run
+  record must come from the two actual hosts; TEST-03 is not a substitute.
+
+These observations demonstrate only the run performed. Reserve-first remains
+the documented uncertain suppressed loss window, not a retry, and neither
+validation path implies durable, acknowledged, ordered, at-least-once, or
+exactly-once subscriber delivery.
+
 ## Agent watcher (optional)
 
 The watcher polls a co-located service (e.g. UDS Remote Agent) and mirrors its
