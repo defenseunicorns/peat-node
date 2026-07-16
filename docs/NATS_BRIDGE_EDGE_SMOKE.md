@@ -21,8 +21,8 @@ Generate one 32-byte base64 shared key on a trusted host and transfer it securel
 ```sh
 export PEAT_SHARED_KEY="$(docker run --rm natsio/nats-box:0.19.5 sh -ec 'head -c 32 /dev/urandom | base64')"
 docker pull "$PEAT_NODE_IMAGE"
-A_ID="$(docker run --rm "$PEAT_NODE_IMAGE" derive-id --shared-key "$PEAT_SHARED_KEY" --node-id edge-a)"
-B_ID="$(docker run --rm "$PEAT_NODE_IMAGE" derive-id --shared-key "$PEAT_SHARED_KEY" --node-id edge-b)"
+A_ID="$(docker run --rm "$PEAT_NODE_IMAGE" peat-node derive-id --shared-key "$PEAT_SHARED_KEY" --node-id edge-a)"
+B_ID="$(docker run --rm "$PEAT_NODE_IMAGE" peat-node derive-id --shared-key "$PEAT_SHARED_KEY" --node-id edge-b)"
 ```
 
 `edge-a` and `edge-b` are stable identity inputs, not cosmetic names; changing either changes its endpoint ID. On each host create an untracked secret override so the checked-in topology uses the generated key:
