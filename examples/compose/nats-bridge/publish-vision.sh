@@ -42,7 +42,9 @@ fi
 sequence=0
 while [ "$PUBLISH_COUNT" -eq 0 ] || [ "$sequence" -lt "$PUBLISH_COUNT" ]; do
   sequence=$((sequence + 1))
-  nats --server "$NATS_URL" pub --force-stdin --templates=false \
+  # nats-box 0.19.5 interprets `--templates=false` as positional input;
+  # `--no-templates` is its canonical negative boolean spelling.
+  nats --server "$NATS_URL" pub --force-stdin --no-templates \
     "$NATS_SUBJECT" < "$FIXTURE"
   printf 'published sequence=%s cadence_seconds=%s\n' \
     "$sequence" "$PUBLISH_INTERVAL_SECS"
