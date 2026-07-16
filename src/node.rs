@@ -17,10 +17,12 @@ use std::time::{Duration, Instant};
 use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
 use crate::nats_bridge::config::MAX_BRIDGE_IDENTITY_BYTES;
+use crate::nats_bridge::egress::DeliveryCoordinator;
 use crate::nats_bridge::ledger::{
     document_digest, BridgeLedger, DeliveryLedger, LedgerError, LedgerOpenError,
     LocalExclusionLedger,
 };
+use crate::nats_bridge::reconcile::{CandidateError, CandidateOutcome};
 use automerge::{ObjId, ObjType, ReadDoc, ScalarValueRef, ValueRef, ROOT};
 use base64::Engine as _;
 use peat_mesh::discovery::{
@@ -2408,6 +2410,44 @@ impl SidecarNode {
             serde_json::to_string(&json)?
         };
         Ok((value.len() <= MAX_BRIDGE_EVENT_JSON_BYTES).then_some(value))
+    }
+
+    /// Atomically hydrate and offer one reconciliation candidate relative to
+    /// mediated local mutation. The striped guard stays held through the
+    /// post-hydration exclusion check and durable delivery reservation, so a
+    /// local write cannot appear in the gap between provenance validation and
+    /// egress admission.
+    pub(crate) async fn deliver_bridge_reconciliation_candidate(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        exclusion: &LocalExclusionLedger,
+        coordinator: &DeliveryCoordinator,
+    ) -> Result<CandidateOutcome, CandidateError> {
+        let stripe = mutation_guard_stripe(collection, doc_id);
+        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
+        let Some(json_data) = self
+            .get_bridge_document(collection, doc_id)
+            .map_err(|_| CandidateError::Read)?
+        else {
+            return Ok(CandidateOutcome::Missing);
+        };
+        if exclusion
+            .contains(document_digest(collection, doc_id))
+            .await
+            .map_err(|_| CandidateError::Exclusion)?
+        {
+            return Ok(CandidateOutcome::LocalExcluded);
+        }
+        let _ = coordinator
+            .deliver(BridgeChangeEvent {
+                collection: collection.to_owned(),
+                doc_id: doc_id.to_owned(),
+                remote_peer_id: String::new(),
+                json_data,
+            })
+            .await;
+        Ok(CandidateOutcome::Offered)
     }
 
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {

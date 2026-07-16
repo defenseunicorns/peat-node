@@ -20,7 +20,9 @@ use super::config::SubjectMapping;
 use super::egress::DeliveryCoordinator;
 use super::ledger::{document_digest, DeliveryLedger, LocalExclusionLedger};
 use super::readiness::BridgeReadiness;
-use crate::node::{BridgeChangeEvent, SidecarNode};
+#[cfg(test)]
+use crate::node::BridgeChangeEvent;
+use crate::node::SidecarNode;
 
 pub(crate) const RECONCILE_BATCH_KEYS: usize = 64;
 pub(crate) const RECONCILE_HYDRATIONS_PER_SECOND: u64 = 16;
@@ -95,25 +97,57 @@ impl ReconcileTrigger {
 }
 
 trait ReconcileReader: Send + Sync + 'static {
-    fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
-    fn get_document<'a>(
+    fn keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>>;
+    fn deliver_candidate<'a>(
         &'a self,
         collection: &'a str,
         doc_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>>;
+        exclusion: &'a LocalExclusionLedger,
+        coordinator: &'a DeliveryCoordinator,
+    ) -> Pin<Box<dyn Future<Output = Result<CandidateOutcome, CandidateError>> + Send + 'a>>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateOutcome {
+    Missing,
+    LocalExcluded,
+    Offered,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateError {
+    Read,
+    Exclusion,
 }
 
 impl ReconcileReader for SidecarNode {
-    fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-        self.document_store().keys_with_prefix(prefix)
+    fn keys_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>> {
+        let reader = self.document_store();
+        let prefix = prefix.to_owned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || reader.keys_with_prefix(&prefix))
+                .await
+                .map_err(|_| anyhow::anyhow!("bridge reconciliation key scan stopped"))?
+        })
     }
 
-    fn get_document<'a>(
+    fn deliver_candidate<'a>(
         &'a self,
         collection: &'a str,
         doc_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>> {
-        Box::pin(async move { self.get_bridge_document(collection, doc_id) })
+        exclusion: &'a LocalExclusionLedger,
+        coordinator: &'a DeliveryCoordinator,
+    ) -> Pin<Box<dyn Future<Output = Result<CandidateOutcome, CandidateError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.deliver_bridge_reconciliation_candidate(collection, doc_id, exclusion, coordinator)
+                .await
+        })
     }
 }
 
@@ -233,7 +267,7 @@ async fn scan_once<R, C>(
         let prefix = format!("{}:", mapping.collection());
         // This complete Vec is inherited from pinned peat-mesh. Batching
         // below bounds retained bridge work but deliberately makes no RSS claim.
-        let keys = match reader.keys_with_prefix(&prefix) {
+        let keys = match reader.keys_with_prefix(&prefix).await {
             Ok(keys) => keys,
             Err(_) => {
                 stats.0.failures.fetch_add(1, Ordering::Relaxed);
@@ -277,23 +311,28 @@ async fn scan_once<R, C>(
                 if !can_scan(readiness, exclusion, delivery, closed) {
                     return;
                 }
-                let json_data = match reader.get_document(mapping.collection(), doc_id).await {
-                    Ok(Some(json)) => json,
-                    Ok(None) => continue,
-                    Err(_) => {
+                match reader
+                    .deliver_candidate(mapping.collection(), doc_id, exclusion, coordinator)
+                    .await
+                {
+                    Ok(CandidateOutcome::Missing) => continue,
+                    Ok(CandidateOutcome::LocalExcluded) => {
+                        stats.0.suppressed.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Ok(CandidateOutcome::Offered) => {
+                        stats.0.hydrated.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(CandidateError::Read) => {
                         stats.0.failures.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                };
-                stats.0.hydrated.fetch_add(1, Ordering::Relaxed);
-                let _ = coordinator
-                    .deliver(BridgeChangeEvent {
-                        collection: mapping.collection().to_owned(),
-                        doc_id: doc_id.to_owned(),
-                        remote_peer_id: String::new(),
-                        json_data,
-                    })
-                    .await;
+                    Err(CandidateError::Exclusion) => {
+                        readiness.set_exclusion_healthy(false);
+                        stats.0.failures.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
             }
             tokio::task::yield_now().await;
         }
@@ -332,28 +371,119 @@ mod tests {
     }
 
     impl ReconcileReader for FakeReader {
-        fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
-            Ok(self
-                .keys
-                .iter()
-                .filter(|key| key.starts_with(prefix))
-                .cloned()
-                .collect())
+        fn keys_with_prefix<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(self
+                    .keys
+                    .iter()
+                    .filter(|key| key.starts_with(prefix))
+                    .cloned()
+                    .collect())
+            })
         }
 
-        fn get_document<'a>(
+        fn deliver_candidate<'a>(
             &'a self,
             collection: &'a str,
             doc_id: &'a str,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + Send + 'a>> {
+            exclusion: &'a LocalExclusionLedger,
+            coordinator: &'a DeliveryCoordinator,
+        ) -> Pin<Box<dyn Future<Output = Result<CandidateOutcome, CandidateError>> + Send + 'a>>
+        {
             Box::pin(async move {
                 self.hydrated.fetch_add(1, Ordering::Relaxed);
-                Ok(self
+                let document = self
                     .docs
                     .lock()
                     .unwrap()
                     .get(&format!("{collection}:{doc_id}"))
-                    .cloned())
+                    .cloned();
+                let Some(json_data) = document else {
+                    return Ok(CandidateOutcome::Missing);
+                };
+                if exclusion
+                    .contains(document_digest(collection, doc_id))
+                    .await
+                    .map_err(|_| CandidateError::Exclusion)?
+                {
+                    return Ok(CandidateOutcome::LocalExcluded);
+                }
+                let _ = coordinator
+                    .deliver(BridgeChangeEvent {
+                        collection: collection.to_owned(),
+                        doc_id: doc_id.to_owned(),
+                        remote_peer_id: String::new(),
+                        json_data,
+                    })
+                    .await;
+                Ok(CandidateOutcome::Offered)
+            })
+        }
+    }
+
+    struct InterleavingReader {
+        keys: Vec<String>,
+        docs: HashMap<String, String>,
+        exclusion: LocalExclusionLedger,
+        raced: AtomicBool,
+    }
+
+    impl ReconcileReader for InterleavingReader {
+        fn keys_with_prefix<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>> {
+            Box::pin(async move {
+                Ok(self
+                    .keys
+                    .iter()
+                    .filter(|key| key.starts_with(prefix))
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn deliver_candidate<'a>(
+            &'a self,
+            collection: &'a str,
+            doc_id: &'a str,
+            exclusion: &'a LocalExclusionLedger,
+            coordinator: &'a DeliveryCoordinator,
+        ) -> Pin<Box<dyn Future<Output = Result<CandidateOutcome, CandidateError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let Some(json_data) = self.docs.get(&format!("{collection}:{doc_id}")).cloned()
+                else {
+                    return Ok(CandidateOutcome::Missing);
+                };
+                if doc_id == "raced" && !self.raced.swap(true, Ordering::AcqRel) {
+                    // The scan's initial lookup observed absence. A mediated
+                    // local write now durably excludes the same identity before
+                    // its envelope becomes eligible for delivery.
+                    self.exclusion
+                        .record_local_excluded(document_digest(collection, doc_id))
+                        .await
+                        .map_err(|_| CandidateError::Exclusion)?;
+                }
+                if exclusion
+                    .contains(document_digest(collection, doc_id))
+                    .await
+                    .map_err(|_| CandidateError::Exclusion)?
+                {
+                    return Ok(CandidateOutcome::LocalExcluded);
+                }
+                let _ = coordinator
+                    .deliver(BridgeChangeEvent {
+                        collection: collection.to_owned(),
+                        doc_id: doc_id.to_owned(),
+                        remote_peer_id: String::new(),
+                        json_data,
+                    })
+                    .await;
+                Ok(CandidateOutcome::Offered)
             })
         }
     }
@@ -487,6 +617,52 @@ mod tests {
         trigger.trigger(ReconcileReason::ReconnectReady);
         tokio::task::yield_now().await;
         assert_eq!(stats.snapshot().scans, before);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn post_hydration_local_exclusion_wins_and_following_remote_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let journals = BridgeLedger::open(dir.path()).unwrap();
+        let exclusion = journals.exclusion();
+        let delivery = journals.delivery();
+        let reader = Arc::new(InterleavingReader {
+            keys: vec!["frames:raced".into(), "frames:valid".into()],
+            docs: [
+                ("frames:raced".into(), envelope()),
+                ("frames:valid".into(), envelope()),
+            ]
+            .into_iter()
+            .collect(),
+            exclusion: exclusion.clone(),
+            raced: AtomicBool::new(false),
+        });
+        let readiness = ready();
+        let (coordinator, mut rx) = DeliveryCoordinator::new(
+            &mappings(),
+            "local",
+            EgressStats::default(),
+            delivery.clone(),
+            readiness.clone(),
+        );
+        let (trigger, stats, task) = spawn_reconciler_with(
+            reader,
+            mappings(),
+            exclusion,
+            delivery,
+            coordinator,
+            readiness,
+            FakeClock::default(),
+        );
+        trigger.trigger(ReconcileReason::StartupReady);
+        let item = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(item.digest, document_digest("frames", "valid"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(stats.snapshot().suppressed, 1);
+        trigger.close();
         task.abort();
     }
 }
