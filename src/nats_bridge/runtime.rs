@@ -445,17 +445,32 @@ impl BridgeRuntimeHandle {
 
         let mut joined = 0usize;
         let mut aborted = 0usize;
+        let mut failure = None;
+        let mut failure_stage = BridgeShutdownStage::Complete;
         for task in &self.producer_tasks {
             task.abort();
         }
         for task in &mut self.producer_tasks {
             match tokio::time::timeout_at(deadline, &mut *task).await {
-                Ok(_) => {
+                Ok(Ok(())) => {
                     joined = joined.saturating_add(1);
                     aborted = aborted.saturating_add(1);
                 }
-                Err(_) => {
+                Ok(Err(error)) => {
+                    joined = joined.saturating_add(1);
                     aborted = aborted.saturating_add(1);
+                    if !error.is_cancelled() && failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::TaskPanicked);
+                        failure_stage = BridgeShutdownStage::Producers;
+                    }
+                }
+                Err(_) => {
+                    task.abort();
+                    aborted = aborted.saturating_add(1);
+                    if failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::DeadlineExceeded);
+                        failure_stage = BridgeShutdownStage::Producers;
+                    }
                 }
             }
         }
@@ -463,6 +478,7 @@ impl BridgeRuntimeHandle {
 
         let supervisor = self.task.as_mut().expect("shutdown is called once");
         let supervisor_result = tokio::time::timeout_at(deadline, &mut *supervisor).await;
+        let supervisor_joined = supervisor_result.is_ok();
         let supervisor_outcome = match supervisor_result {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => SupervisorShutdown {
@@ -471,7 +487,6 @@ impl BridgeRuntimeHandle {
             },
             Err(_) => {
                 supervisor.abort();
-                let _ = supervisor.await;
                 aborted = aborted.saturating_add(1);
                 SupervisorShutdown {
                     stage: BridgeShutdownStage::Consumers,
@@ -480,16 +495,33 @@ impl BridgeRuntimeHandle {
             }
         };
         self.task.take();
-        joined = joined.saturating_add(1);
+        if supervisor_joined {
+            joined = joined.saturating_add(1);
+        }
+        if let Some(supervisor_failure) = supervisor_outcome.failure {
+            if failure.is_none() {
+                failure = Some(supervisor_failure);
+                failure_stage = supervisor_outcome.stage;
+            }
+        }
 
         for task in &mut self.consumer_tasks {
             match tokio::time::timeout_at(deadline, &mut *task).await {
-                Ok(_) => joined = joined.saturating_add(1),
+                Ok(Ok(())) => joined = joined.saturating_add(1),
+                Ok(Err(_)) => {
+                    joined = joined.saturating_add(1);
+                    if failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::TaskPanicked);
+                        failure_stage = BridgeShutdownStage::Consumers;
+                    }
+                }
                 Err(_) => {
                     task.abort();
-                    let _ = task.await;
-                    joined = joined.saturating_add(1);
                     aborted = aborted.saturating_add(1);
+                    if failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::DeadlineExceeded);
+                        failure_stage = BridgeShutdownStage::Consumers;
+                    }
                 }
             }
         }
@@ -506,19 +538,35 @@ impl BridgeRuntimeHandle {
         let delivery_failure =
             join_ledger_worker(self.delivery.take(), LedgerWorkerKind::Delivery, deadline).await;
 
-        let failure = supervisor_outcome
-            .failure
-            .or(exclusion_failure)
-            .or(delivery_failure);
-        let failure_stage = match failure {
-            Some(BridgeShutdownFailure::LedgerIoUnjoined(LedgerWorkerKind::Exclusion)) => {
-                BridgeShutdownStage::LedgerExclusion
+        if failure.is_none() {
+            if let Some(ledger_failure) = exclusion_failure {
+                failure = Some(ledger_failure);
+                failure_stage = BridgeShutdownStage::LedgerExclusion;
+            } else if let Some(ledger_failure) = delivery_failure {
+                failure = Some(ledger_failure);
+                failure_stage = BridgeShutdownStage::LedgerDelivery;
             }
-            Some(BridgeShutdownFailure::LedgerIoUnjoined(LedgerWorkerKind::Delivery)) => {
-                BridgeShutdownStage::LedgerDelivery
+        }
+        if let Some(mut task) = self.operations_task.take() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(())) => joined = joined.saturating_add(1),
+                Ok(Err(_)) => {
+                    joined = joined.saturating_add(1);
+                    if failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::TaskPanicked);
+                        failure_stage = BridgeShutdownStage::Consumers;
+                    }
+                }
+                Err(_) => {
+                    task.abort();
+                    aborted = aborted.saturating_add(1);
+                    if failure.is_none() {
+                        failure = Some(BridgeShutdownFailure::DeadlineExceeded);
+                        failure_stage = BridgeShutdownStage::Consumers;
+                    }
+                }
             }
-            _ => supervisor_outcome.stage,
-        };
+        }
         let report = if let Some(failure) = failure {
             BridgeShutdownReport {
                 phase: BridgeShutdownPhase::Aborting,
@@ -530,9 +578,6 @@ impl BridgeRuntimeHandle {
         } else {
             BridgeShutdownReport::clean(joined, aborted)
         };
-        if let Some(task) = self.operations_task.take() {
-            let _ = task.await;
-        }
         self.operations.record_shutdown(&report);
         self.operations.emit_final(self.lifecycle.snapshot());
         if report.is_clean() {
@@ -586,6 +631,33 @@ where
     }
 }
 
+fn spawn_ledger_health_monitor(
+    mut health: watch::Receiver<bool>,
+    readiness: BridgeReadiness,
+    kind: LedgerWorkerKind,
+    stats: EgressStats,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if health.changed().await.is_err() {
+                return;
+            }
+            if !*health.borrow_and_update() {
+                match kind {
+                    LedgerWorkerKind::Exclusion => {
+                        readiness.set_exclusion_healthy(false);
+                    }
+                    LedgerWorkerKind::Delivery => {
+                        readiness.set_delivery_healthy(false);
+                    }
+                }
+                stats.record_ledger_health_failure();
+                return;
+            }
+        }
+    })
+}
+
 trait LedgerJoin: Send + 'static {
     fn join_worker(self) -> Result<(), LedgerError>;
 }
@@ -618,11 +690,14 @@ impl BridgeRuntime {
             None,
             None,
             Vec::new(),
-            BridgeLedgerHealth {
-                exclusion_healthy: true,
-                delivery_healthy: true,
-            },
             Duration::from_secs(10),
+            LedgerRuntimeSetup {
+                health: BridgeLedgerHealth {
+                    exclusion_healthy: true,
+                    delivery_healthy: true,
+                },
+                ownership: LedgerOwnership::default(),
+            },
         )
     }
 
@@ -691,7 +766,8 @@ impl BridgeRuntime {
             stats,
             Some((ingress_tx, diagnostics, local_node_id.clone())),
             delivery
-                .zip(exclusion)
+                .clone()
+                .zip(exclusion.clone())
                 .map(|(delivery, exclusion)| EgressSetup {
                     delivery,
                     exclusion,
@@ -702,8 +778,14 @@ impl BridgeRuntime {
                     local_node_id: local_node_id.clone(),
                 }),
             vec![ingress_task],
-            ledger_health,
             shutdown_timeout,
+            LedgerRuntimeSetup {
+                health: ledger_health,
+                ownership: LedgerOwnership {
+                    exclusion,
+                    delivery,
+                },
+            },
         );
         Ok(handle)
     }
@@ -714,8 +796,8 @@ impl BridgeRuntime {
         ingress: Option<(IngressSender, IngressDiagnostics, String)>,
         egress: Option<EgressSetup>,
         support_tasks: Vec<JoinHandle<()>>,
-        ledger_health: BridgeLedgerHealth,
         shutdown_timeout: Duration,
+        ledgers: LedgerRuntimeSetup,
     ) -> BridgeRuntimeHandle {
         let server_addr = config.server_addr().clone();
         let nats_host = server_addr.host().to_owned();
@@ -726,8 +808,8 @@ impl BridgeRuntime {
                 .iter()
                 .map(|mapping| mapping.subject().clone()),
         );
-        readiness.set_exclusion_healthy(ledger_health.exclusion_healthy);
-        readiness.set_delivery_healthy(ledger_health.delivery_healthy);
+        readiness.set_exclusion_healthy(ledgers.health.exclusion_healthy);
+        readiness.set_delivery_healthy(ledgers.health.delivery_healthy);
         let lifecycle = LifecycleControl::new(readiness.clone());
 
         LifecycleAction::status(
@@ -746,12 +828,18 @@ impl BridgeRuntime {
             .as_ref()
             .map(|state| state.stats.clone())
             .unwrap_or_default();
+        if !ledgers.health.exclusion_healthy {
+            handle_egress_stats.record_ledger_health_failure();
+        }
+        if !ledgers.health.delivery_healthy {
+            handle_egress_stats.record_ledger_health_failure();
+        }
         let mut reconcile_stats = ReconcileStats::default();
         let mut reconcile_trigger = None;
         let mut producer_tasks = Vec::new();
         let consumer_tasks = support_tasks;
-        let handle_exclusion = egress.as_ref().map(|state| state.exclusion.clone());
-        let handle_delivery = egress.as_ref().map(|state| state.delivery.clone());
+        let handle_exclusion = ledgers.ownership.exclusion;
+        let handle_delivery = ledgers.ownership.delivery;
         let egress = egress.map(|setup| {
             let (coordinator, rx) = DeliveryCoordinator::new(
                 config.mappings(),
@@ -794,6 +882,22 @@ impl BridgeRuntime {
             reconcile_stats.clone(),
             readiness.clone(),
         );
+        if let Some(ledger) = handle_exclusion.as_ref() {
+            producer_tasks.push(spawn_ledger_health_monitor(
+                ledger.subscribe_health(),
+                readiness.clone(),
+                LedgerWorkerKind::Exclusion,
+                handle_egress_stats.clone(),
+            ));
+        }
+        if let Some(ledger) = handle_delivery.as_ref() {
+            producer_tasks.push(spawn_ledger_health_monitor(
+                ledger.subscribe_health(),
+                readiness.clone(),
+                LedgerWorkerKind::Delivery,
+                handle_egress_stats.clone(),
+            ));
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(None);
         let operations_task = Some(spawn_periodic_operations(
             operations.clone(),
@@ -885,6 +989,17 @@ struct EgressSetup {
     local_node_id: String,
 }
 
+#[derive(Default)]
+struct LedgerOwnership {
+    exclusion: Option<LocalExclusionLedger>,
+    delivery: Option<DeliveryLedger>,
+}
+
+struct LedgerRuntimeSetup {
+    health: BridgeLedgerHealth,
+    ownership: LedgerOwnership,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BarrierTags {
     connection_epoch: u64,
@@ -901,6 +1016,12 @@ impl BarrierAttempt {
     async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
+    }
+
+    async fn stop_at(self, deadline: Instant) -> bool {
+        let mut task = self.task;
+        task.abort();
+        tokio::time::timeout_at(deadline, &mut task).await.is_ok()
     }
 }
 
@@ -990,6 +1111,12 @@ impl SubscriptionGeneration {
     async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
+    }
+
+    async fn stop_at(self, deadline: Instant) -> bool {
+        let mut task = self.task;
+        task.abort();
+        tokio::time::timeout_at(deadline, &mut task).await.is_ok()
     }
 }
 
@@ -1098,10 +1225,20 @@ async fn run_client_supervisor(
                     trigger.close();
                 }
                 if let Some(attempt) = barrier.take() {
-                    attempt.stop().await;
+                    if !attempt.stop_at(deadline).await {
+                        return SupervisorShutdown {
+                            stage: BridgeShutdownStage::Producers,
+                            failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                        };
+                    }
                 }
                 if let Some(active) = generation.take() {
-                    active.stop().await;
+                    if !active.stop_at(deadline).await {
+                        return SupervisorShutdown {
+                            stage: BridgeShutdownStage::Producers,
+                            failure: Some(BridgeShutdownFailure::DeadlineExceeded),
+                        };
+                    }
                 }
                 drop(ingress.take());
 
@@ -1114,7 +1251,6 @@ async fn run_client_supervisor(
                         },
                         Err(_) => {
                             task.abort();
-                            let _ = task.await;
                             return SupervisorShutdown {
                                 stage: BridgeShutdownStage::Consumers,
                                 failure: Some(BridgeShutdownFailure::DeadlineExceeded),
@@ -1702,7 +1838,42 @@ mod tests {
             Some(BridgeShutdownFailure::DeadlineExceeded)
         );
         assert_eq!(error.report.aborted_tasks, 2);
-        assert_eq!(error.report.joined_tasks, 2);
+        assert_eq!(error.report.joined_tasks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_reports_non_cooperative_aborted_task_as_unjoined() {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let task_entered = Arc::clone(&entered);
+        let task_release = Arc::clone(&release);
+        let producer = tokio::spawn(async move {
+            task_entered.wait();
+            task_release.wait();
+        });
+        entered.wait();
+        let mut handle = synthetic_shutdown_handle(
+            Duration::from_millis(20),
+            |mut rx| {
+                tokio::spawn(async move {
+                    rx.changed().await.unwrap();
+                    SupervisorShutdown {
+                        stage: BridgeShutdownStage::Complete,
+                        failure: None,
+                    }
+                })
+            },
+            vec![producer],
+            vec![],
+        );
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(
+            error.report.failure,
+            Some(BridgeShutdownFailure::DeadlineExceeded)
+        );
+        assert_eq!(error.report.joined_tasks, 1);
+        assert_eq!(error.report.aborted_tasks, 1);
+        release.wait();
     }
 
     #[tokio::test]
@@ -1723,6 +1894,33 @@ mod tests {
             "NATS bridge shutdown did not complete cleanly"
         );
         assert!(!format!("{error:?} {error}").contains("secret payload"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_consumer_panic_cannot_report_clean() {
+        let consumer = tokio::spawn(async { panic!("private consumer detail") });
+        tokio::task::yield_now().await;
+        let mut handle = synthetic_shutdown_handle(
+            Duration::from_secs(1),
+            |mut rx| {
+                tokio::spawn(async move {
+                    rx.changed().await.unwrap();
+                    SupervisorShutdown {
+                        stage: BridgeShutdownStage::Complete,
+                        failure: None,
+                    }
+                })
+            },
+            vec![],
+            vec![consumer],
+        );
+        let error = handle.shutdown().await.unwrap_err();
+        assert_eq!(
+            error.report.failure,
+            Some(BridgeShutdownFailure::TaskPanicked)
+        );
+        assert_eq!(error.report.joined_tasks, 2);
+        assert!(!format!("{error:?} {error}").contains("private consumer detail"));
     }
 
     struct UnjoinedLedger;
@@ -1777,6 +1975,96 @@ mod tests {
             error.to_string(),
             "invalid effective NATS bridge node identity"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_corruption_still_owns_and_joins_exclusion_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let journals = crate::nats_bridge::ledger::BridgeLedger::open(dir.path()).unwrap();
+        journals.join().unwrap();
+        let delivery_path = dir
+            .path()
+            .join("nats-bridge-ledger-v1")
+            .join("remote-delivery-v1");
+        let mut bytes = std::fs::read(&delivery_path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&delivery_path, bytes).unwrap();
+        let node = Arc::new(
+            SidecarNode::new(crate::node::SidecarConfig {
+                node_id: "partial-ledger-runtime".to_owned(),
+                app_id: "partial-ledger-runtime".to_owned(),
+                data_dir: dir.path().to_path_buf(),
+                disable_mdns: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let mut handle = BridgeRuntime::try_spawn(
+            enabled_config(),
+            node.node_id().to_owned(),
+            Arc::clone(&node),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert!(handle.exclusion.is_some());
+        assert!(handle.delivery.is_none());
+        assert!(!handle.readiness().snapshot().delivery_healthy);
+        let exclusion = handle.exclusion.as_ref().unwrap().clone();
+        let _ = handle.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while exclusion.is_healthy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!exclusion.is_healthy());
+        assert!(exclusion
+            .contains(crate::nats_bridge::ledger::document_digest(
+                "frames",
+                "after-shutdown"
+            ))
+            .await
+            .is_err());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exclusion_worker_failure_immediately_clears_readiness_and_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            SidecarNode::new(crate::node::SidecarConfig {
+                node_id: "ledger-health-runtime".to_owned(),
+                app_id: "ledger-health-runtime".to_owned(),
+                data_dir: dir.path().to_path_buf(),
+                disable_mdns: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let mut handle = BridgeRuntime::try_spawn(
+            enabled_config(),
+            node.node_id().to_owned(),
+            Arc::clone(&node),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        handle.exclusion.as_ref().unwrap().stop_for_test();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.readiness().snapshot().exclusion_healthy {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!handle.readiness().snapshot().is_ready());
+        assert!(handle.operations_snapshot().ledger_failures >= 1);
+        let _ = handle.shutdown().await;
+        node.shutdown().await.unwrap();
     }
 
     fn enabled_config() -> EnabledBridgeConfig {

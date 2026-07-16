@@ -16,7 +16,7 @@ use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 const LEDGER_DIR: &str = "nats-bridge-ledger-v1";
 const EXCLUSION_FILE: &str = "local-exclusion-v1";
@@ -156,6 +156,7 @@ enum Command {
 struct Worker {
     sender: std_mpsc::SyncSender<Command>,
     healthy: Arc<AtomicBool>,
+    health: watch::Sender<bool>,
     stopped: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -166,8 +167,10 @@ impl Worker {
         let (sender, receiver) = std_mpsc::sync_channel(COMMAND_CAPACITY);
         let (open_tx, open_rx) = std_mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
+        let (health, _) = watch::channel(false);
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_healthy = Arc::clone(&healthy);
+        let worker_health = health.clone();
         let worker_stopped = Arc::clone(&stopped);
         let path = data_dir.to_path_buf();
         let join = std::thread::Builder::new()
@@ -183,6 +186,7 @@ impl Worker {
                 match opened {
                     Ok(mut journal) => {
                         worker_healthy.store(true, Ordering::Release);
+                        worker_health.send_replace(true);
                         let _ = open_tx.send(Ok(()));
                         while let Ok(command) = receiver.recv() {
                             if worker_stopped.load(Ordering::Acquire) {
@@ -197,6 +201,7 @@ impl Worker {
                                     let result = journal.record(digest, state);
                                     if result.is_err() {
                                         worker_healthy.store(false, Ordering::Release);
+                                        worker_health.send_replace(false);
                                     }
                                     let _ = response.send(result);
                                 }
@@ -233,6 +238,7 @@ impl Worker {
                     }
                 }
                 worker_healthy.store(false, Ordering::Release);
+                worker_health.send_replace(false);
                 worker_stopped.store(true, Ordering::Release);
             })
             .map_err(|_| LedgerError::Unavailable)?;
@@ -240,6 +246,7 @@ impl Worker {
         Ok(Arc::new(Self {
             sender,
             healthy,
+            health,
             stopped,
             join: Mutex::new(Some(join)),
         }))
@@ -247,6 +254,10 @@ impl Worker {
 
     fn is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    fn subscribe_health(&self) -> watch::Receiver<bool> {
+        self.health.subscribe()
     }
 
     async fn record(&self, digest: LedgerDigest, state: RecordState) -> Result<bool, LedgerError> {
@@ -307,6 +318,10 @@ impl LocalExclusionLedger {
         self.worker.is_healthy()
     }
 
+    pub(crate) fn subscribe_health(&self) -> watch::Receiver<bool> {
+        self.worker.subscribe_health()
+    }
+
     pub(crate) async fn record_local_excluded(
         &self,
         digest: LedgerDigest,
@@ -365,6 +380,10 @@ pub(crate) struct DeliveryLedger {
 impl DeliveryLedger {
     pub(crate) fn is_healthy(&self) -> bool {
         self.worker.is_healthy()
+    }
+
+    pub(crate) fn subscribe_health(&self) -> watch::Receiver<bool> {
+        self.worker.subscribe_health()
     }
 
     pub(crate) async fn check_and_reserve(

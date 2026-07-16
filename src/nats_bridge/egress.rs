@@ -334,6 +334,12 @@ impl EgressStats {
             .event_lagged
             .fetch_add(dropped, Ordering::Relaxed);
     }
+
+    pub(crate) fn record_ledger_health_failure(&self) {
+        self.inner
+            .ledger_unavailable
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Finite collection-to-subject table derived only from validated startup config.
