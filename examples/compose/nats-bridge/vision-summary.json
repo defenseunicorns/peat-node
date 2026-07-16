@@ -1,0 +1,10 @@
+{
+  "frame_id": "sim-000001",
+  "captured_at": "2026-07-16T12:34:56.000Z",
+  "camera": "jetson-orin-nano-01",
+  "objects": [
+    {"track": "vehicle-\u03bb-17", "label": "utility_vehicle", "confidence": 0.8750},
+    {"track": "person-002", "label": "person", "confidence": 1.0}
+  ],
+  "summary": "2 objects; north gate clear"
+}
