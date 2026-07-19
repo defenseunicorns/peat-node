@@ -131,7 +131,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -142,7 +142,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1151,7 +1151,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.118",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1519,7 +1519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3564,7 +3564,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3874,9 +3874,9 @@ dependencies = [
 
 [[package]]
 name = "peat-mesh"
-version = "0.9.0-rc.46"
+version = "0.9.0-rc.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91bf9bdaa33eed19da7a30b7f636d491404379f2351d0cd32040978e0fbbea10"
+checksum = "46e52efe3cc252baa3af8800a639a76a8f3ebe792a76cd38d8f9f2933408e4fb"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3918,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "peat-node"
-version = "0.4.9"
+version = "0.4.10"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3960,9 +3960,9 @@ dependencies = [
 
 [[package]]
 name = "peat-protocol"
-version = "0.9.0-rc.29"
+version = "0.9.0-rc.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79ba9c7562389cf3702046d4f4702dea8119e320630a134721d7f5fc1dafe6dd"
+checksum = "b48d3f119e4f37b715d50ddede81c9d159784723b980a45920fbeeb89153b1cd"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4002,9 +4002,9 @@ dependencies = [
 
 [[package]]
 name = "peat-schema"
-version = "0.9.0-rc.29"
+version = "0.9.0-rc.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb0ed12df3697fb5fa8420b069127c79421bcc0262ca40ee6ac5e92da2402168"
+checksum = "36414da866abb5a5d98188f8c9c86e0dbd9df111c12c8d3d56a6caaee6d43812"
 dependencies = [
  "chrono",
  "prost",
@@ -4513,7 +4513,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4901,7 +4901,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4969,7 +4969,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5109,7 +5109,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5450,7 +5450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5646,10 +5646,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6373,7 +6373,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

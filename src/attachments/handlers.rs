@@ -30,7 +30,9 @@ use peat_protocol::storage::file_distribution::{
     DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
     TransferPriority, TransferState,
 };
-use peat_protocol::storage::{read_distribution_document, write_receiver_node_status};
+use peat_protocol::storage::{
+    read_distribution_document, write_receiver_node_status, IROH_DISTRIBUTION_COLLECTION,
+};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
@@ -143,6 +145,26 @@ pub async fn send_attachments(
         priority,
     )
     .await?;
+
+    // `FileDistribution::distribute` persists one internal Automerge document
+    // per file. Push each document explicitly: the generic store-change
+    // listener remains useful for ordinary writes and transitive gossip, but
+    // attachment delivery must not wait for a best-effort broadcast event.
+    // A later periodic/full sync still recovers an individual fanout error, so
+    // preserve the accepted distribution and surface the failure in logs.
+    for item in &ingested {
+        let key = format!(
+            "{}:{}",
+            IROH_DISTRIBUTION_COLLECTION, item.distribution_handle.distribution_id
+        );
+        if let Err(error) = node.sync_document_with_all_peers(&key).await {
+            warn!(
+                distribution_id = %item.distribution_handle.distribution_id,
+                %error,
+                "initial attachment distribution fanout failed; background sync will retry"
+            );
+        }
+    }
 
     // 6. Insert the record. check_resubmit cleared any prior FAILED /
     //    CANCELLED entry — insert overwrites cleanly.
@@ -350,11 +372,7 @@ pub async fn cancel_attachment_distribution(
             ),
             ..Default::default()
         };
-        runtime.apply_progress(
-            handle_rec.file_index,
-            DistributionState::Cancelled,
-            progress,
-        );
+        runtime.apply_cancellation(handle_rec.file_index, progress);
         maybe_finalize_bundle(node.bundle_registry(), &runtime, &bundle_id);
     } else {
         // No runtime entry (e.g., 7a-era bundle inserted before the

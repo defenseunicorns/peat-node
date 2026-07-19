@@ -1167,6 +1167,20 @@ impl SidecarNode {
         Ok(())
     }
 
+    /// Push one locally-created document to every connected peer now.
+    ///
+    /// Most writes reach this coordinator through the store-change fanout
+    /// task. Callers with a protocol-level delivery contract, such as
+    /// attachment distribution documents, use this direct path so delivery
+    /// does not depend on a best-effort broadcast listener observing the
+    /// creation event.
+    pub async fn sync_document_with_all_peers(&self, doc_key: &str) -> anyhow::Result<()> {
+        self.backend
+            .coordinator()
+            .sync_document_with_all_peers(doc_key)
+            .await
+    }
+
     pub async fn stop_sync(&self) -> anyhow::Result<()> {
         self.sync_active.store(false, Ordering::Relaxed);
         info!("sync stopped");

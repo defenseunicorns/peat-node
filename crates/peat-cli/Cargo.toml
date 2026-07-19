@@ -32,15 +32,12 @@ tempfile = "3"
 # workspace can't end up with two peat-mesh / iroh versions in one process
 # (iroh has process-global crypto + ALPN registries that explode under
 # version skew, see peat#923/#924).
-peat-mesh = { version = "=0.9.0-rc.46", features = ["automerge-backend"] }
-peat-protocol = { version = ">=0.9.0-rc.29, <0.9.1", features = ["automerge-backend"] }
-# peat-schema runtime type registry. Floor bumped to rc.22 — the ADR-066
-# hierarchy rename (peat#957) renames `platoon_id`→`cohort_id` on
-# `CellState` and the `CommandScope` enum variants; below rc.22 the typed
-# round-trip tests round-trip the old field name. The floor still pins
-# `TypeDescriptor::proto3_zero()` (rc.21, peat#953/#954), which
-# `apply_proto3_defaults` in `cli/writes.rs` consumes as its defaults source.
-peat-schema = { version = ">=0.9.0-rc.29, <0.9.1" }
+peat-mesh = { version = "=0.9.0-rc.48", features = ["automerge-backend"] }
+peat-protocol = { version = ">=0.9.0-rc.31, <0.9.1", features = ["automerge-backend"] }
+# peat-schema runtime type registry. rc.31 retains the ADR-066 hierarchy
+# vocabulary and `TypeDescriptor::proto3_zero()` contracts consumed by
+# `apply_proto3_defaults` in `cli/writes.rs`, aligned with peat-protocol rc.31.
+peat-schema = { version = ">=0.9.0-rc.31, <0.9.1" }
 iroh = "1.0.2"
 # Pinned to match peat-mesh's `automerge` dep so the `Automerge` type peat-cli
 # names (from store.get / scan_prefix) is ABI-compatible with what the backend
