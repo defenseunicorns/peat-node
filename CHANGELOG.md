@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-07-19
+
+### Fixed
+
+- Make an accepted attachment cancellation authoritative over the protocol
+  substrate's concurrent cancellation-as-failure progress frame, so status is
+  reported consistently as `CANCELLED`.
+- Explicitly fan out newly-created attachment distribution documents so
+  multi-peer delivery does not depend on observing a best-effort local-change
+  broadcast.
+
+### Changed
+
+- **Bumped to peat-mesh 0.9.0-rc.48 and peat-protocol/peat-schema rc.31.**
+  peat-mesh rc.47 bounds receive-path cache and dirty-buffer memory while a
+  node ingests remote document corpora. rc.48 probes IPv6 reachability per
+  candidate address and preserves offline Unique Local Addresses, avoiding
+  formation-auth timeouts caused by advertising an unusable IPv6 route.
+  peat-protocol/schema rc.31 restores three-node convergence coverage and
+  carries no peat-node API or wire-contract change.
+
 ## [0.4.9] - 2026-07-07
 
 ### Changed
