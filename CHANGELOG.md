@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Route attachment distribution documents through peat-node's ordered relay
+  worker and bound strict-priority bursts so sync feedback cannot indefinitely
+  starve attachment or subsequent document fanout.
+
 ## [0.4.10] - 2026-07-19
 
 ### Fixed

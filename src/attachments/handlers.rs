@@ -147,23 +147,17 @@ pub async fn send_attachments(
     .await?;
 
     // `FileDistribution::distribute` persists one internal Automerge document
-    // per file. Push each document explicitly: the generic store-change
+    // per file. Enqueue each document explicitly: the generic store-change
     // listener remains useful for ordinary writes and transitive gossip, but
-    // attachment delivery must not wait for a best-effort broadcast event.
-    // A later periodic/full sync still recovers an individual fanout error, so
-    // preserve the accepted distribution and surface the failure in logs.
+    // attachment delivery must not depend on a best-effort broadcast event.
+    // Using the same ordered worker preserves per-peer ordering; its bounded
+    // priority bursts prevent higher-QoS feedback from starving this Bulk doc.
     for item in &ingested {
         let key = format!(
             "{}:{}",
             IROH_DISTRIBUTION_COLLECTION, item.distribution_handle.distribution_id
         );
-        if let Err(error) = node.sync_document_with_all_peers(&key).await {
-            warn!(
-                distribution_id = %item.distribution_handle.distribution_id,
-                %error,
-                "initial attachment distribution fanout failed; background sync will retry"
-            );
-        }
+        node.queue_document_sync_with_all_peers(&key);
     }
 
     // 6. Insert the record. check_resubmit cleared any prior FAILED /
