@@ -138,7 +138,11 @@ path = "src/main.rs"
 # rc.48 (peat-mesh#304): IPv6 reachability is probed per candidate address and
 #   ULAs skip the internet reachability probe. This prevents broken global IPv6
 #   routes from being advertised while preserving offline tactical IPv6 links.
-peat-mesh = { version = "=0.9.0-rc.48", features = ["automerge-backend", "kubernetes"] }
+#
+# rc.49 (peat-mesh#306/#307): retry distribution documents whose Automerge key
+#   arrives before metadata materializes, so multi-receiver attachment delivery
+#   cannot permanently skip a partially synchronized document.
+peat-mesh = { version = "=0.9.0-rc.49", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,

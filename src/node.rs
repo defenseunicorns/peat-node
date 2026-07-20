@@ -128,6 +128,9 @@ impl Default for SidecarConfig {
 pub struct SidecarNode {
     node_id: String,
     backend: Arc<AutomergeBackend>,
+    /// Ordered relay queue shared by store-change fanout and explicit
+    /// protocol-triggered fanout (for example attachment distribution docs).
+    relay_fanout: Arc<crate::fanout::PriorityFanout>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     cipher: Option<StoreCipher>,
@@ -406,8 +409,9 @@ impl SidecarNode {
             Arc::clone(backend.coordinator()),
             Arc::clone(backend.transport()),
         ));
+        let change_fanout = Arc::clone(&fanout);
         tokio::spawn(async move {
-            Self::sync_on_change(sync_rx, fanout).await;
+            Self::sync_on_change(sync_rx, change_fanout).await;
         });
 
         // PRD-006: bundle handle table is always present (the cheap empty
@@ -791,6 +795,7 @@ impl SidecarNode {
         Ok(Self {
             node_id: config.node_id,
             backend,
+            relay_fanout: fanout,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             cipher,
@@ -1167,18 +1172,15 @@ impl SidecarNode {
         Ok(())
     }
 
-    /// Push one locally-created document to every connected peer now.
+    /// Queue one locally-created document for delivery to every connected peer.
     ///
-    /// Most writes reach this coordinator through the store-change fanout
-    /// task. Callers with a protocol-level delivery contract, such as
-    /// attachment distribution documents, use this direct path so delivery
-    /// does not depend on a best-effort broadcast listener observing the
-    /// creation event.
-    pub async fn sync_document_with_all_peers(&self, doc_key: &str) -> anyhow::Result<()> {
-        self.backend
-            .coordinator()
-            .sync_document_with_all_peers(doc_key)
-            .await
+    /// Most writes enter this queue through the best-effort store-change
+    /// listener. Protocols with an explicit delivery contract enqueue here as
+    /// well, so they cannot miss a broadcast event or bypass the queue's
+    /// ordering and bounded-fairness guarantees.
+    pub fn queue_document_sync_with_all_peers(&self, doc_key: &str) {
+        debug!(doc_key, "queueing explicit all-peer document fanout");
+        self.relay_fanout.enqueue(doc_key, FanoutKind::AllPeers);
     }
 
     pub async fn stop_sync(&self) -> anyhow::Result<()> {
