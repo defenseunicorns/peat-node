@@ -760,7 +760,7 @@ impl AnchoredDir {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
 
-        let mut absolute = if data_dir.is_absolute() {
+        let absolute = if data_dir.is_absolute() {
             data_dir.to_path_buf()
         } else {
             std::env::current_dir()
@@ -771,9 +771,11 @@ impl AnchoredDir {
         // Resolve that fixed alias without permitting a configured, mutable
         // symlink component to enter the anchored walk.
         #[cfg(target_os = "macos")]
-        if let Ok(suffix) = absolute.strip_prefix("/var") {
-            absolute = Path::new("/private/var").join(suffix);
-        }
+        let absolute = if let Ok(suffix) = absolute.strip_prefix("/var") {
+            Path::new("/private/var").join(suffix)
+        } else {
+            absolute
+        };
         let root = unsafe {
             libc::open(
                 c"/".as_ptr(),

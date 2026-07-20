@@ -1308,6 +1308,6 @@ mod tests {
             assert!(!rendered.contains(forbidden));
         }
         assert!(captured.contains("store_write"));
-        assert!(captured.contains("payload_bytes=87"));
+        assert!(rendered.contains("payload_bytes: Some(87)"));
     }
 }
