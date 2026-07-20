@@ -11,9 +11,11 @@
 //!
 //! This queue is the relay-side analog of peat-mesh's coordinator fanout
 //! queue. The listener enqueues `(doc_key, FanoutKind)` non-blockingly; a
-//! single worker drains it **highest-QoS-first** and performs the actual
-//! fanout via the released peat-mesh coordinator API. Single worker preserves
-//! the per-(peer, channel) ordering + backpressure the inline loop gave.
+//! single worker drains it in bounded **highest-QoS-first** bursts and performs
+//! the actual fanout via the released peat-mesh coordinator API. Periodically
+//! serving the oldest pending entry prevents sustained higher-QoS feedback
+//! traffic from starving Bulk documents. The single worker preserves the
+//! per-(peer, channel) ordering + backpressure the inline loop gave.
 //!
 //! Why a peat-node-local queue rather than peat-mesh's `enqueue_fanout`:
 //! peat-mesh's queue fans every document to *all* peers, but the relay must
@@ -28,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use peat_mesh::qos::QoSClass;
 use peat_mesh::storage::{AutomergeSyncCoordinator, MeshSyncTransport, SyncTransport};
 use tokio::sync::Notify;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Which peers a queued change fans out to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,7 +68,7 @@ impl FanoutKind {
 #[derive(Default)]
 struct Inner {
     /// Pending keys ordered `(qos_rank ASC, seq ASC)`: `first()` is the
-    /// highest-priority, earliest-enqueued entry (what the worker pops);
+    /// highest-priority, earliest-enqueued entry (the normal pop);
     /// `last()` is the lowest-priority, latest (the eviction victim).
     /// `qos_rank = QoSClass as u8` — `Critical = 1` (highest) … `Bulk = 5`.
     pending: BTreeSet<(u8, u64, String)>,
@@ -77,6 +79,8 @@ struct Inner {
     next_seq: u64,
     /// Per-QoS-class shed counters (index = `QoSClass as u8`; slot 0 unused).
     dropped_by_class: [u64; 6],
+    /// Number of strict-priority pops since the last oldest-entry fairness pop.
+    priority_burst: usize,
 }
 
 /// QoS-priority relay fanout queue + its drain-worker wakeup.
@@ -93,6 +97,9 @@ impl PriorityFanout {
     /// churn, so this tracks distinct in-flight documents, not change rate.
     /// Matches peat-mesh's `MAX_PENDING_FANOUT`.
     const MAX_PENDING: usize = 4096;
+    /// Bound strict-priority service so a continuously re-enqueued higher-QoS
+    /// document cannot starve an older Bulk distribution document forever.
+    const MAX_PRIORITY_BURST: usize = 8;
 
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -162,7 +169,26 @@ impl PriorityFanout {
     /// Pop the highest-priority pending `(doc_key, kind)`, or `None` if empty.
     fn pop(&self) -> Option<(String, FanoutKind)> {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let key = q.pending.iter().next().cloned()?;
+        let Some(highest_priority) = q.pending.iter().next().cloned() else {
+            q.priority_burst = 0;
+            return None;
+        };
+        let oldest = q
+            .pending
+            .iter()
+            .min_by_key(|(_, seq, _)| *seq)
+            .cloned()
+            .expect("non-empty pending queue must have an oldest entry");
+        let key = if highest_priority == oldest {
+            q.priority_burst = 0;
+            highest_priority
+        } else if q.priority_burst >= Self::MAX_PRIORITY_BURST {
+            q.priority_burst = 0;
+            oldest
+        } else {
+            q.priority_burst += 1;
+            highest_priority
+        };
         q.pending.remove(&key);
         let (_, _, kind) = q.entries.remove(&key.2)?;
         Some((key.2, kind))
@@ -188,20 +214,28 @@ impl PriorityFanout {
     ) {
         loop {
             match self.pop() {
-                Some((key, FanoutKind::AllPeers)) => {
-                    if let Err(e) = coordinator.sync_document_with_all_peers(&key).await {
-                        warn!(doc_key = %key, "sync to peers failed: {e}");
-                    }
-                }
-                Some((key, FanoutKind::ExcludeSource(source))) => {
-                    for peer in transport.connected_peers() {
-                        if peer.to_string() == source {
-                            continue;
+                Some((key, kind)) => {
+                    debug!(doc_key = %key, fanout = ?kind, "draining relay fanout entry");
+                    match kind {
+                        FanoutKind::AllPeers => {
+                            if let Err(e) = coordinator.sync_document_with_all_peers(&key).await {
+                                warn!(doc_key = %key, "sync to peers failed: {e}");
+                            }
                         }
-                        if let Err(e) = coordinator.sync_document_with_peer(&key, peer).await {
-                            warn!(doc_key = %key, %peer, "fanout sync failed: {e}");
+                        FanoutKind::ExcludeSource(source) => {
+                            for peer in transport.connected_peers() {
+                                if peer.to_string() == source {
+                                    continue;
+                                }
+                                if let Err(e) =
+                                    coordinator.sync_document_with_peer(&key, peer).await
+                                {
+                                    warn!(doc_key = %key, %peer, "fanout sync failed: {e}");
+                                }
+                            }
                         }
                     }
+                    debug!(doc_key = %key, "relay fanout attempt completed");
                 }
                 None => {
                     // Drained: exit if closed, otherwise park for the next
@@ -275,6 +309,32 @@ mod tests {
         assert_eq!(q.pop().unwrap().0, "beacons:n");
         assert_eq!(q.pop().unwrap().0, "sitreps:b");
         assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn continuously_reenqueued_normal_doc_cannot_starve_bulk_distribution() {
+        let q = PriorityFanout::new();
+        q.enqueue("file_distributions:attachment", FanoutKind::AllPeers);
+        q.enqueue("beacons:chattering-doc", FanoutKind::AllPeers);
+
+        // A remote-origin feedback loop can re-enqueue the Normal document
+        // immediately after every completed fanout. Strict priority would
+        // select it forever and leave the older attachment distribution
+        // document pending indefinitely (peat-node#189).
+        for _ in 0..PriorityFanout::MAX_PRIORITY_BURST {
+            assert_eq!(
+                q.pop().unwrap().0,
+                "beacons:chattering-doc",
+                "Normal traffic retains its bounded priority burst"
+            );
+            q.enqueue("beacons:chattering-doc", FanoutKind::AllPeers);
+        }
+
+        assert_eq!(
+            q.pop().unwrap().0,
+            "file_distributions:attachment",
+            "the oldest pending entry must receive service after the priority burst"
+        );
     }
 
     #[test]

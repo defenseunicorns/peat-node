@@ -159,6 +159,43 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+async fn assert_document_json(
+    client: &reqwest::Client,
+    base: &str,
+    collection: &str,
+    doc_id: &str,
+    expected: &serde_json::Value,
+    deadline: Duration,
+) {
+    let deadline_at = Instant::now() + deadline;
+    let mut last_received = serde_json::Value::Null;
+    while Instant::now() < deadline_at {
+        let response = call(
+            client,
+            base,
+            "GetDocument",
+            serde_json::json!({
+                "collection": collection,
+                "docId": doc_id,
+            }),
+        )
+        .await;
+        last_received = response
+            .get("jsonData")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or(serde_json::Value::Null);
+        if last_received == *expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        last_received, *expected,
+        "ordinary document written after attachment fanout must converge"
+    );
+}
+
 /// Poll the inbox tree until a file with `expected` bytes appears anywhere under
 /// `inbox`. The inbox mirrors the sender's outbox layout (`inbox/<relative_path>`,
 /// e.g. `inbox/delivery.bin` or `inbox/sub/x.bin`) — no distribution_id wrapper
@@ -217,10 +254,10 @@ fn find_matching_file(root: &std::path::Path, expected: &[u8]) -> Option<PathBuf
 }
 
 /// Boot A + B, peer them, send a real file from A, assert the *same
-/// bytes* land on B's filesystem inbox under the distribution_id
-/// subdirectory. This is the missing acceptance: prior to this test,
-/// no automated check verified that any peer ever received an
-/// attachment.
+/// bytes* land on B's mirrored filesystem inbox, then prove an ordinary
+/// document written after the attachment still converges. This is the missing
+/// acceptance: prior to this test, no automated check verified that any peer
+/// ever received an attachment.
 fn init_test_tracing() {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -348,9 +385,215 @@ async fn end_to_end_attachment_delivery_two_nodes() {
     let on_sender = std::fs::read(&file_path).unwrap();
     assert_eq!(on_sender, payload);
 
+    // Regression for peat-node#189: attachment distribution and later writes
+    // must both make progress through the ordered relay queue. Sustained
+    // higher-QoS sync feedback previously starved the Bulk distribution entry
+    // and prevented the attachment workflow from completing.
+    let expected_post_attachment = serde_json::json!({
+        "phase": "post-attachment",
+        "sequence": 1,
+    });
+    call(
+        &http,
+        &a.base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "models",
+            "docId": "post-attachment",
+            "jsonData": expected_post_attachment.to_string(),
+        }),
+    )
+    .await;
+
+    assert_document_json(
+        &http,
+        &b.base,
+        "models",
+        "post-attachment",
+        &expected_post_attachment,
+        Duration::from_secs(15),
+    )
+    .await;
+
     // Keep `_data_dir` etc. guards alive across the assertion phase by
     // touching them; tempfile cleans up on drop after the test exits.
     drop((a, b));
+}
+
+/// Regression for peat-node#189 at the fanout width that exposed it in the
+/// seven-node experiment: one sender, six directly connected receivers.
+/// Sustained higher-QoS sync feedback must not starve the Bulk distribution
+/// document or the ordinary writes that follow the attachment workflow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[serial_test::serial(iroh_two_node)]
+async fn attachment_fanout_preserves_following_document_sync_seven_nodes() {
+    init_test_tracing();
+    const A_GRPC: u16 = 50231;
+    const A_IROH: u16 = 51331;
+
+    let sender = boot(A_GRPC, A_IROH, "fanout-sender", false).await;
+    let mut receivers = Vec::new();
+    for index in 0..6u16 {
+        receivers.push(
+            boot(
+                A_GRPC + index + 1,
+                A_IROH + index + 1,
+                &format!("fanout-receiver-{index}"),
+                true,
+            )
+            .await,
+        );
+    }
+    let http = http_client();
+
+    let sender_endpoint = call(&http, &sender.base, "GetStatus", serde_json::json!({})).await
+        ["endpointAddr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (index, receiver) in receivers.iter().enumerate() {
+        let receiver_endpoint = call(&http, &receiver.base, "GetStatus", serde_json::json!({}))
+            .await["endpointAddr"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        call(
+            &http,
+            &receiver.base,
+            "ConnectPeer",
+            serde_json::json!({
+                "endpointId": &sender_endpoint,
+                "addresses": [format!("127.0.0.1:{}", A_IROH)],
+            }),
+        )
+        .await;
+        call(
+            &http,
+            &sender.base,
+            "ConnectPeer",
+            serde_json::json!({
+                "endpointId": receiver_endpoint,
+                "addresses": [format!("127.0.0.1:{}", A_IROH + index as u16 + 1)],
+            }),
+        )
+        .await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    call(&http, &sender.base, "StartSync", serde_json::json!({})).await;
+    for receiver in &receivers {
+        call(&http, &receiver.base, "StartSync", serde_json::json!({})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Prove every channel is ready before introducing attachment traffic. This
+    // matches the controlled reproduction and keeps peer-startup timing from
+    // being mistaken for an attachment regression.
+    let expected_pre_attachment = serde_json::json!({
+        "phase": "pre-seven-node-attachment",
+        "sequence": 0,
+    });
+    call(
+        &http,
+        &sender.base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "models",
+            "docId": "pre-seven-node-attachment",
+            "jsonData": expected_pre_attachment.to_string(),
+        }),
+    )
+    .await;
+    futures::future::join_all(receivers.iter().map(|receiver| {
+        assert_document_json(
+            &http,
+            &receiver.base,
+            "models",
+            "pre-seven-node-attachment",
+            &expected_pre_attachment,
+            Duration::from_secs(15),
+        )
+    }))
+    .await;
+
+    // Three consecutive mixed trials are the issue's functional acceptance
+    // threshold and exercise bounded queue fairness without relying on an
+    // artificial retry or StartSync call.
+    for trial in 1..=3u8 {
+        let filename = format!("fanout-{trial}.bin");
+        let payload = vec![0x59 + trial; 10 * 1024];
+        let hash = sha256_of(&payload);
+        std::fs::write(sender.root_path.join(&filename), &payload).unwrap();
+        let response = call(
+            &http,
+            &sender.base,
+            "SendAttachments",
+            serde_json::json!({
+                "files": [{
+                    "rootName": "outbox",
+                    "relativePath": filename,
+                    "sizeBytes": payload.len(),
+                    "sha256": b64(&hash),
+                }],
+                "scope": { "allNodes": {} }
+            }),
+        )
+        .await;
+        let distribution_id = response["handles"][0]["distributionId"]
+            .as_str()
+            .expect("SendAttachments must return a distribution_id")
+            .to_string();
+
+        futures::future::join_all(receivers.iter().map(|receiver| {
+            await_inbox_file(&receiver.inbox_path, &payload, Duration::from_secs(60))
+        }))
+        .await;
+
+        // Payload receipt implies the distribution document was processed,
+        // but assert its presence directly because it is the document whose
+        // explicit fanout triggered #189.
+        for receiver in &receivers {
+            assert!(
+                read_distribution_document(
+                    receiver.node.document_store().as_ref(),
+                    &distribution_id,
+                )
+                .expect("reading the distribution document must succeed")
+                .is_some(),
+                "distribution document must reach every receiver in trial {trial}"
+            );
+        }
+
+        let expected = serde_json::json!({
+            "phase": "post-seven-node-attachment",
+            "sequence": trial,
+        });
+        let doc_id = format!("post-seven-node-attachment-{trial}");
+        call(
+            &http,
+            &sender.base,
+            "PutDocument",
+            serde_json::json!({
+                "collection": "models",
+                "docId": doc_id,
+                "jsonData": expected.to_string(),
+            }),
+        )
+        .await;
+        futures::future::join_all(receivers.iter().map(|receiver| {
+            assert_document_json(
+                &http,
+                &receiver.base,
+                "models",
+                &doc_id,
+                &expected,
+                Duration::from_secs(15),
+            )
+        }))
+        .await;
+    }
+
+    drop((sender, receivers));
 }
 
 /// `iroh::EndpointId::fmt_short` emits the first 10 hex chars of the
@@ -486,6 +729,42 @@ async fn node_list_scope_only_delivers_to_listed_nodes() {
         "C must NOT receive the file — NodeListScope was [{b_short}] only. \
          C's endpoint short is {} and was not in target_nodes.",
         short_endpoint(&endpoint_c)
+    );
+
+    // Multi-peer regression for peat-node#189: assert both peers still
+    // converge after the attachment path has exercised the relay queue.
+    let expected_post_attachment = serde_json::json!({
+        "phase": "post-multi-peer-attachment",
+        "sequence": 1,
+    });
+    call(
+        &http,
+        &a.base,
+        "PutDocument",
+        serde_json::json!({
+            "collection": "models",
+            "docId": "post-multi-peer-attachment",
+            "jsonData": expected_post_attachment.to_string(),
+        }),
+    )
+    .await;
+    tokio::join!(
+        assert_document_json(
+            &http,
+            &b.base,
+            "models",
+            "post-multi-peer-attachment",
+            &expected_post_attachment,
+            Duration::from_secs(15),
+        ),
+        assert_document_json(
+            &http,
+            &c.base,
+            "models",
+            "post-multi-peer-attachment",
+            &expected_post_attachment,
+            Duration::from_secs(15),
+        ),
     );
 
     drop((a, b, c));

@@ -29,6 +29,9 @@ use peat_protocol::storage::file_distribution::{
     DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
     TransferPriority, TransferState,
 };
+use peat_protocol::storage::{
+    read_distribution_document, write_receiver_node_status, IROH_DISTRIBUTION_COLLECTION,
+};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;
@@ -141,6 +144,20 @@ pub async fn send_attachments(
         priority,
     )
     .await?;
+
+    // `FileDistribution::distribute` persists one internal Automerge document
+    // per file. Enqueue each document explicitly: the generic store-change
+    // listener remains useful for ordinary writes and transitive gossip, but
+    // attachment delivery must not depend on a best-effort broadcast event.
+    // Using the same ordered worker preserves per-peer ordering; its bounded
+    // priority bursts prevent higher-QoS feedback from starving this Bulk doc.
+    for item in &ingested {
+        let key = format!(
+            "{}:{}",
+            IROH_DISTRIBUTION_COLLECTION, item.distribution_handle.distribution_id
+        );
+        node.queue_document_sync_with_all_peers(&key);
+    }
 
     // 6. Insert the record. check_resubmit cleared any prior FAILED /
     //    CANCELLED entry — insert overwrites cleanly.
@@ -348,11 +365,7 @@ pub async fn cancel_attachment_distribution(
             ),
             ..Default::default()
         };
-        runtime.apply_progress(
-            handle_rec.file_index,
-            DistributionState::Cancelled,
-            progress,
-        );
+        runtime.apply_cancellation(handle_rec.file_index, progress);
         maybe_finalize_bundle(node.bundle_registry(), &runtime, &bundle_id);
     } else {
         // No runtime entry (e.g., 7a-era bundle inserted before the

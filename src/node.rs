@@ -139,6 +139,9 @@ impl Default for SidecarConfig {
 pub struct SidecarNode {
     node_id: String,
     backend: Arc<AutomergeBackend>,
+    /// Ordered relay queue shared by store-change fanout and explicit
+    /// protocol-triggered fanout (for example attachment distribution docs).
+    relay_fanout: Arc<crate::fanout::PriorityFanout>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
     // Wired into the NATS runtime in the next phase plan; exercised here via
@@ -955,8 +958,9 @@ impl SidecarNode {
             Arc::clone(backend.coordinator()),
             Arc::clone(backend.transport()),
         ));
+        let change_fanout = Arc::clone(&fanout);
         tokio::spawn(async move {
-            Self::sync_on_change(sync_rx, fanout).await;
+            Self::sync_on_change(sync_rx, change_fanout).await;
         });
 
         // PRD-006: bundle handle table is always present (the cheap empty
@@ -1340,6 +1344,7 @@ impl SidecarNode {
         Ok(Self {
             node_id: config.node_id,
             backend,
+            relay_fanout: fanout,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             bridge_change_tx,
@@ -1985,6 +1990,17 @@ impl SidecarNode {
         self.sync_active.store(true, Ordering::Relaxed);
         info!("sync started");
         Ok(())
+    }
+
+    /// Queue one locally-created document for delivery to every connected peer.
+    ///
+    /// Most writes enter this queue through the best-effort store-change
+    /// listener. Protocols with an explicit delivery contract enqueue here as
+    /// well, so they cannot miss a broadcast event or bypass the queue's
+    /// ordering and bounded-fairness guarantees.
+    pub fn queue_document_sync_with_all_peers(&self, doc_key: &str) {
+        debug!(doc_key, "queueing explicit all-peer document fanout");
+        self.relay_fanout.enqueue(doc_key, FanoutKind::AllPeers);
     }
 
     pub async fn stop_sync(&self) -> anyhow::Result<()> {

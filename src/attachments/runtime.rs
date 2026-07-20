@@ -181,6 +181,45 @@ impl BundleRuntime {
         let _ = self.progress_tx.send(progress);
         became_terminal
     }
+
+    /// Record an accepted API cancellation.
+    ///
+    /// The protocol substrate represents cancellation as a failed per-node
+    /// transfer and may publish that frame before `cancel()` returns.  Unlike
+    /// ordinary progress updates, an accepted cancellation therefore owns a
+    /// concurrent `Failed` terminal state and relabels it as `Cancelled`.
+    /// The terminal counter is only incremented when the prior state was
+    /// non-terminal.
+    pub fn apply_cancellation(&self, file_index: usize, progress: pb::AttachmentProgress) -> bool {
+        let became_terminal = {
+            let mut slots = self
+                .per_distribution
+                .lock()
+                .expect("per_distribution Mutex poisoned");
+            let slot = match slots.get_mut(file_index) {
+                Some(s) => s,
+                None => return false,
+            };
+            if matches!(
+                slot.state,
+                DistributionState::Completed | DistributionState::Cancelled
+            ) {
+                return false;
+            }
+            let became_terminal = !slot.state.is_terminal();
+            slot.state = DistributionState::Cancelled;
+            slot.bytes_transferred = progress.bytes_transferred;
+            slot.bytes_total = progress.bytes_total;
+            slot.error = progress.error.clone();
+            slot.last_progress = progress.clone();
+            became_terminal
+        };
+        if became_terminal {
+            self.terminal_count.fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = self.progress_tx.send(progress);
+        became_terminal
+    }
 }
 
 /// Process-wide store of per-bundle runtime state. Keyed by `bundle_id`.
@@ -314,6 +353,27 @@ mod tests {
         let again = rt.apply_progress(0, DistributionState::Completed, frame("d-a", 100));
         assert!(!again);
         assert_eq!(rt.terminal_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_cancellation_relabels_substrate_failure_without_double_counting() {
+        let store = BundleRuntimeStore::new();
+        let rt = store.register("B", vec![slot("d-a")]);
+        rt.apply_progress(0, DistributionState::Failed, frame("d-a", 20));
+
+        let mut cancelled = frame("d-a", 20);
+        cancelled.status =
+            buffa::EnumValue::from(pb::DistributionStatus::DISTRIBUTION_STATUS_CANCELLED as i32);
+        let became_terminal = rt.apply_cancellation(0, cancelled);
+
+        assert!(!became_terminal);
+        assert_eq!(rt.terminal_count(), 1);
+        let snapshot = rt.per_distribution_snapshot();
+        assert!(matches!(snapshot[0].state, DistributionState::Cancelled));
+        assert_eq!(
+            snapshot[0].last_progress.status.as_known(),
+            Some(pb::DistributionStatus::DISTRIBUTION_STATUS_CANCELLED)
+        );
     }
 
     #[tokio::test]

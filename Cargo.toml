@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.9"
+version = "0.4.10"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -129,12 +129,20 @@ path = "src/main.rs"
 #
 # rc.46 (peat-mesh#276): iroh 1.0 stable — iroh 1.0.2, iroh-blobs 0.103,
 #   iroh-mdns-address-lookup 0.4. Zero API breakage.
-peat-mesh = { version = "=0.9.0-rc.46", features = ["automerge-backend", "kubernetes"] }
-# Directly match peat-mesh's locked Automerge API so peat-node can perform a
-# non-recursive structural preflight before peat-mesh's recursive JSON helper.
-# This adds no package or version to Cargo.lock; it makes the existing pin an
-# explicit safety-boundary dependency.
-automerge = "=0.9.0"
+#
+# rc.47 (peat-mesh#289): receive-path sync writes now pass through the
+#   byte-bounded cache and dirty-buffer pipeline. This prevents unbounded RSS
+#   growth while ingesting large remote document corpora and weights remote
+#   receives more heavily for compaction.
+#
+# rc.48 (peat-mesh#304): IPv6 reachability is probed per candidate address and
+#   ULAs skip the internet reachability probe. This prevents broken global IPv6
+#   routes from being advertised while preserving offline tactical IPv6 links.
+#
+# rc.49 (peat-mesh#306/#307): retry distribution documents whose Automerge key
+#   arrives before metadata materializes, so multi-receiver attachment delivery
+#   cannot permanently skip a partially synchronized document.
+peat-mesh = { version = "=0.9.0-rc.49", features = ["automerge-backend", "kubernetes"] }
 
 # File distribution substrate (PRD-006). FileDistribution trait + IrohFileDistribution.
 # rc.17 picks up peat-mesh rc.25 (persistent multiplexed sync streams,
@@ -143,7 +151,9 @@ automerge = "=0.9.0"
 # consumer-side IrohMeshTransport deletion + direct-iroh-dep drop (peat#926).
 # rc.29 (peat#1016/#1019): peat-mesh floor → rc.44, peat-ffi blob surface,
 # proto schema version unification, formation_handshake test race fix.
-peat-protocol = { version = ">=0.9.0-rc.29, <0.9.1", features = ["automerge-backend"] }
+# rc.31 (peat#1027): restores three-node convergence coverage and advances the
+# matching peat-schema release; no peat-node API or wire-contract change.
+peat-protocol = { version = ">=0.9.0-rc.31, <0.9.1", features = ["automerge-backend"] }
 
 # P2P networking — pinned to match peat-mesh's iroh version
 # (peat#923 / peat#924). peat-mesh and peat-node MUST share an iroh
