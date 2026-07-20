@@ -29,9 +29,7 @@ use peat_protocol::storage::file_distribution::{
     DistributionHandle, FileDistribution, IrohFileDistribution, NodeTransferStatus,
     TransferPriority, TransferState,
 };
-use peat_protocol::storage::{
-    read_distribution_document, write_receiver_node_status, IROH_DISTRIBUTION_COLLECTION,
-};
+use peat_protocol::storage::IROH_DISTRIBUTION_COLLECTION;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::warn;

@@ -554,12 +554,11 @@ async fn attachment_fanout_preserves_following_document_sync_seven_nodes() {
         // explicit fanout triggered #189.
         for receiver in &receivers {
             assert!(
-                read_distribution_document(
-                    receiver.node.document_store().as_ref(),
-                    &distribution_id,
-                )
-                .expect("reading the distribution document must succeed")
-                .is_some(),
+                receiver
+                    .node
+                    .read_attachment_distribution(&distribution_id)
+                    .expect("reading the distribution document must succeed")
+                    .is_some(),
                 "distribution document must reach every receiver in trial {trial}"
             );
         }
