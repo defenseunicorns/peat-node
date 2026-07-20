@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worker and bound strict-priority bursts so sync feedback cannot indefinitely
   starve attachment or subsequent document fanout.
 
+### Changed
+
+- Bump both peat-node and peat-cli to peat-mesh 0.9.0-rc.49, which retries
+  file-distribution documents whose Automerge key arrives before their metadata
+  materializes instead of permanently skipping the partial document.
+
 ## [0.4.10] - 2026-07-19
 
 ### Fixed
