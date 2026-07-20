@@ -18,7 +18,8 @@ PROJECT="peat-nats-e2e-$$"
 WORK="$(mktemp -d)"
 KEEP="${1:-}"
 
-STARTUP_DEADLINE_SECS="${STARTUP_DEADLINE_SECS:-240}"
+BUILD_DEADLINE_SECS="${BUILD_DEADLINE_SECS:-600}"
+STARTUP_DEADLINE_SECS="${STARTUP_DEADLINE_SECS:-120}"
 BROKER_DEADLINE_SECS="${BROKER_DEADLINE_SECS:-60}"
 PEER_DEADLINE_SECS="${PEER_DEADLINE_SECS:-90}"
 BRIDGE_DEADLINE_SECS="${BRIDGE_DEADLINE_SECS:-60}"
@@ -253,7 +254,7 @@ unchanged_documents() {
 if [ -n "$KEEP" ] && [ "$KEEP" != keep ]; then
     fail "usage: $0 [keep]"
 fi
-for timeout_name in STARTUP_DEADLINE_SECS BROKER_DEADLINE_SECS PEER_DEADLINE_SECS \
+for timeout_name in BUILD_DEADLINE_SECS STARTUP_DEADLINE_SECS BROKER_DEADLINE_SECS PEER_DEADLINE_SECS \
     BRIDGE_DEADLINE_SECS RECEIVER_DEADLINE_SECS DOCUMENT_DEADLINE_SECS \
     RECEIPT_DEADLINE_SECS QUIESCENCE_SECS QUERY_TIMEOUT_SECS; do
     validate_positive_integer "$timeout_name" "${!timeout_name}"
@@ -281,10 +282,15 @@ jq -e '
 ' "${WORK}/compose.json" >/dev/null || fail "rendered topology permits a direct broker path"
 pass "rendered topology isolates brokers and has no federation mode"
 
+CURRENT_GATE="build"
+log "Building the current checkout Peat image"
+run_bounded "$BUILD_DEADLINE_SECS" compose build peat-a peat-b \
+    || fail "current-checkout image did not build within ${BUILD_DEADLINE_SECS}s"
+
 CURRENT_GATE="startup"
-log "Building the current checkout and starting brokers plus Peat nodes"
-run_bounded "$STARTUP_DEADLINE_SECS" compose up -d --build nats-a nats-b peat-a peat-b \
-    >/dev/null || fail "current-checkout stack did not start within ${STARTUP_DEADLINE_SECS}s"
+log "Starting independent brokers and Peat nodes"
+run_bounded "$STARTUP_DEADLINE_SECS" compose up -d nats-a nats-b peat-a peat-b \
+    || fail "current-checkout stack did not start within ${STARTUP_DEADLINE_SECS}s"
 
 wait_for "nats-a private health" "$BROKER_DEADLINE_SECS" broker_healthy nats-a
 wait_for "nats-b private health" "$BROKER_DEADLINE_SECS" broker_healthy nats-b
