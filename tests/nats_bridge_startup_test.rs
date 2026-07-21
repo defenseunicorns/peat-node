@@ -17,7 +17,7 @@ fn strip_ansi_escape_codes(input: &str) -> String {
     let mut in_escape = false;
     for character in input.chars() {
         if in_escape {
-            if ('@'..='~').contains(&character) {
+            if ('@'..='~').contains(&character) && character != '[' {
                 in_escape = false;
             }
         } else if character == '\u{1b}' {
@@ -223,9 +223,7 @@ async fn shutdown_sigterm_uds_stops_owned_connections_and_cleans_node() {
     })
     .await
     .expect("UDS listener startup must be bounded");
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
     unsafe {
         libc::kill(child.0.id().expect("child id") as i32, libc::SIGTERM);
     }
