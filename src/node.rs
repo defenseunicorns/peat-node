@@ -36,8 +36,7 @@ use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
 use peat_protocol::storage::file_distribution::{
     DistributionDocument, IrohFileDistribution, NodeTransferStatus,
 };
-use sha2::{Digest, Sha256};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::attachments::config::AttachmentConfig;
@@ -148,10 +147,6 @@ pub struct SidecarNode {
     // the crate-private seam before that consumer exists.
     #[allow(dead_code)]
     bridge_change_tx: broadcast::Sender<BridgeChangeEvent>,
-    local_revisions: Arc<Mutex<LocalRevisionGuard>>,
-    /// Async stripes order local write-ahead exclusion against remote capture
-    /// without ever retaining a synchronous store guard across an await.
-    bridge_mutation_guards: Arc<[AsyncMutex<()>]>,
     bridge_ledger: RwLock<Option<InstalledBridgeLedger>>,
     bridge_ledger_data_dir: PathBuf,
     #[cfg(test)]
@@ -196,14 +191,6 @@ pub struct SidecarNode {
     /// lifetime. `None` when `--enable-kubernetes-discovery` is false or
     /// discovery failed to start.
     _k8s_discovery: Option<KubernetesDiscovery>,
-}
-
-const BRIDGE_MUTATION_GUARD_STRIPES: usize = 256;
-
-fn mutation_guard_stripe(collection: &str, doc_id: &str) -> usize {
-    let digest = document_digest(collection, doc_id);
-    let prefix = u64::from_be_bytes(digest.0[..8].try_into().expect("digest prefix is fixed"));
-    prefix as usize % BRIDGE_MUTATION_GUARD_STRIPES
 }
 
 struct InstalledBridgeLedger {
@@ -334,9 +321,6 @@ const MAX_EVENT_TOTAL_ENTRIES: usize = 65_536;
 const MAX_EVENT_SCALAR_BYTES: usize = 2 * 1_048_576;
 const MAX_EVENT_OUTPUT_PROXY_BYTES: usize = 6 * MAX_BRIDGE_EVENT_JSON_BYTES;
 const NODE_CHANGE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
-const LOCAL_REVISION_CAPACITY: usize = 4096;
-const MAX_REVISION_HEADS: usize = 64;
-const REVISION_DIGEST_DOMAIN: &[u8] = b"peat-node:local-revision:v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NodeChangePath {
@@ -594,77 +578,6 @@ fn enforce_preflight_counts(
     Ok(())
 }
 
-/// Fixed-width, non-evicting journal of locally authored revisions.
-///
-/// The retained digest payload is exactly 4096 * 32 = 131,072 bytes plus
-/// fixed metadata. It retains neither document keys nor Automerge head
-/// vectors. Exhaustion is sticky and fail-closed until process restart.
-struct LocalRevisionGuard {
-    slots: Box<[[u8; 32]]>,
-    len: usize,
-    exhausted: bool,
-}
-
-impl LocalRevisionGuard {
-    fn new() -> Self {
-        Self {
-            slots: vec![[0; 32]; LOCAL_REVISION_CAPACITY].into_boxed_slice(),
-            len: 0,
-            exhausted: false,
-        }
-    }
-
-    fn digest_revision<'a>(
-        &mut self,
-        key: &str,
-        heads: impl ExactSizeIterator<Item = &'a [u8]>,
-    ) -> Option<[u8; 32]> {
-        // Automerge 0.9.0 get_heads() has already collected and sorted every
-        // current head before this check. This limit bounds only our digest
-        // iteration and retained state, not that inherited temporary Vec.
-        let head_count = heads.len();
-        if self.exhausted || head_count > MAX_REVISION_HEADS {
-            self.exhausted = true;
-            return None;
-        }
-
-        let mut digest = Sha256::new();
-        digest.update((REVISION_DIGEST_DOMAIN.len() as u64).to_be_bytes());
-        digest.update(REVISION_DIGEST_DOMAIN);
-        digest.update((key.len() as u64).to_be_bytes());
-        digest.update(key.as_bytes());
-        digest.update((head_count as u64).to_be_bytes());
-        for head in heads {
-            digest.update((head.len() as u64).to_be_bytes());
-            digest.update(head);
-        }
-        Some(digest.finalize().into())
-    }
-
-    fn record<'a>(&mut self, key: &str, heads: impl ExactSizeIterator<Item = &'a [u8]>) -> bool {
-        let Some(digest) = self.digest_revision(key, heads) else {
-            return false;
-        };
-        if self.slots[..self.len].contains(&digest) {
-            return true;
-        }
-        if self.len == self.slots.len() {
-            self.exhausted = true;
-            return false;
-        }
-        self.slots[self.len] = digest;
-        self.len += 1;
-        true
-    }
-
-    fn is_local<'a>(&mut self, key: &str, heads: impl ExactSizeIterator<Item = &'a [u8]>) -> bool {
-        let Some(digest) = self.digest_revision(key, heads) else {
-            return true;
-        };
-        self.slots[..self.len].contains(&digest)
-    }
-}
-
 /// Read-only facade over the node's document store.
 ///
 /// The backing `Arc<AutomergeStore>` is intentionally private and this type
@@ -888,11 +801,6 @@ impl SidecarNode {
 
         let (change_tx, _) = broadcast::channel(256);
         let (bridge_change_tx, _) = broadcast::channel(BRIDGE_CHANGE_CAPACITY);
-        let local_revisions = Arc::new(Mutex::new(LocalRevisionGuard::new()));
-        let bridge_mutation_guards: Arc<[AsyncMutex<()>]> = (0..BRIDGE_MUTATION_GUARD_STRIPES)
-            .map(|_| AsyncMutex::new(()))
-            .collect::<Vec<_>>()
-            .into();
         let node_change_diagnostics = NodeChangeDiagnostics::default();
 
         // Forward AutomergeStore observer events into our ChangeEvent shape
@@ -938,8 +846,6 @@ impl SidecarNode {
         let bridge_store = Arc::clone(backend.store());
         let bridge_tx = bridge_change_tx.clone();
         let bridge_cipher = cipher.clone();
-        let bridge_local_revisions = Arc::clone(&local_revisions);
-        let bridge_forward_guards = Arc::clone(&bridge_mutation_guards);
         let bridge_diagnostics = node_change_diagnostics.clone();
         tokio::spawn(async move {
             Self::forward_bridge_changes(
@@ -947,8 +853,6 @@ impl SidecarNode {
                 bridge_tx,
                 bridge_store,
                 bridge_cipher,
-                bridge_local_revisions,
-                bridge_forward_guards,
                 bridge_diagnostics,
             )
             .await;
@@ -1348,8 +1252,6 @@ impl SidecarNode {
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
             bridge_change_tx,
-            local_revisions,
-            bridge_mutation_guards,
             bridge_ledger: RwLock::new(None),
             bridge_ledger_data_dir: config.data_dir.clone(),
             #[cfg(test)]
@@ -1749,21 +1651,16 @@ impl SidecarNode {
         }
     }
 
-    /// Forward only proven remote, present, non-local revisions to the bridge.
+    /// Forward present remote-origin bridge documents to the egress path.
     ///
-    /// Pinned peat-mesh exposes `DocChange { key, origin }`, not an atomic
-    /// origin+snapshot event. The shared per-key lock therefore closes the
-    /// notification/reread race: local writes record their completed exact
-    /// heads before unlock, while this path captures and classifies the current
-    /// snapshot under the same lock. Superseded remote events may be dropped;
-    /// a later local snapshot can never be attributed as remote.
+    /// Bridge ingress creates immutable documents with unique IDs. A remote
+    /// notification therefore identifies the document to publish; it does not
+    /// need local revision mediation or a same-key write race workaround.
     async fn forward_bridge_changes(
         mut rx: broadcast::Receiver<DocChange>,
         tx: broadcast::Sender<BridgeChangeEvent>,
         store: Arc<AutomergeStore>,
         cipher: Option<StoreCipher>,
-        local_revisions: Arc<Mutex<LocalRevisionGuard>>,
-        mutation_guards: Arc<[AsyncMutex<()>]>,
         diagnostics: NodeChangeDiagnostics,
     ) {
         loop {
@@ -1796,32 +1693,16 @@ impl SidecarNode {
                     let collection = collection.to_owned();
                     let doc_id = doc_id.to_owned();
 
-                    let stripe = mutation_guard_stripe(&collection, &doc_id);
-                    let _mutation_guard = mutation_guards[stripe].lock().await;
-
-                    let doc = {
-                        let _key_guard = store.lock_doc(&key);
-                        let doc = match store.get(&key) {
-                            Ok(Some(doc)) => doc,
-                            Ok(None) => continue,
-                            Err(_) => {
-                                diagnostics.record(
-                                    NodeChangePath::BridgeRemote,
-                                    NodeChangeRejectKind::StoreRead,
-                                );
-                                continue;
-                            }
-                        };
-                        let heads = doc.get_heads();
-                        let locally_authored = local_revisions
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .is_local(&key, heads.iter().map(AsRef::as_ref));
-                        drop(heads);
-                        if locally_authored {
+                    let doc = match store.get(&key) {
+                        Ok(Some(doc)) => doc,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            diagnostics.record(
+                                NodeChangePath::BridgeRemote,
+                                NodeChangeRejectKind::StoreRead,
+                            );
                             continue;
                         }
-                        doc
                     };
 
                     // `save_nocompress` is the earliest size signal available
@@ -2291,8 +2172,6 @@ impl SidecarNode {
             serde_json::from_str(json_data).map_err(DocumentWriteError::InvalidInput)?;
 
         let key = format!("{collection}:{doc_id}");
-        let stripe = mutation_guard_stripe(collection, doc_id);
-        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
         self.record_local_exclusion(collection, doc_id)
             .await
             .map_err(|_| DocumentWriteError::Ledger)?;
@@ -2329,11 +2208,6 @@ impl SidecarNode {
         store
             .put(&key, &doc)
             .map_err(DocumentWriteError::StoreWrite)?;
-        let heads = doc.get_heads();
-        self.local_revisions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(&key, heads.iter().map(AsRef::as_ref));
         Ok(())
     }
 
@@ -2405,11 +2279,8 @@ impl SidecarNode {
         Ok((value.len() <= MAX_BRIDGE_EVENT_JSON_BYTES).then_some(value))
     }
 
-    /// Atomically hydrate and offer one reconciliation candidate relative to
-    /// mediated local mutation. The striped guard stays held through the
-    /// post-hydration exclusion check and durable delivery reservation, so a
-    /// local write cannot appear in the gap between provenance validation and
-    /// egress admission.
+    /// Hydrate and offer one reconciliation candidate after local-exclusion
+    /// filtering.
     pub(crate) async fn deliver_bridge_reconciliation_candidate(
         &self,
         collection: &str,
@@ -2417,8 +2288,6 @@ impl SidecarNode {
         exclusion: &LocalExclusionLedger,
         coordinator: &DeliveryCoordinator,
     ) -> Result<CandidateOutcome, CandidateError> {
-        let stripe = mutation_guard_stripe(collection, doc_id);
-        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
         let Some(json_data) = self
             .get_bridge_document(collection, doc_id)
             .map_err(|_| CandidateError::Read)?
@@ -2445,8 +2314,6 @@ impl SidecarNode {
 
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
-        let stripe = mutation_guard_stripe(collection, doc_id);
-        let _mutation_guard = self.bridge_mutation_guards[stripe].lock().await;
         self.record_local_exclusion(collection, doc_id)
             .await
             .map_err(|_| anyhow::anyhow!("bridge local-exclusion persistence failed"))?;
@@ -2991,120 +2858,6 @@ mod tests {
             node.install_bridge_ledger(["other".to_owned()]).await,
             Err(LedgerError::Corrupt)
         );
-    }
-
-    #[tokio::test]
-    async fn bridge_change_queued_remote_then_local_overwrite_never_emits_local_snapshot() {
-        let (_dir, node) = test_node(false).await;
-        let mut rx = node.subscribe_bridge_changes();
-        let key = "frames:raced";
-        {
-            // The store lock is the deterministic pause gate: the Remote
-            // notification is queued, but the forwarder cannot capture until
-            // the mediated local revision has been recorded before unlock.
-            let store = node.backend.store();
-            let _pause = store.lock_doc(key);
-            store
-                .put_with_origin(
-                    key,
-                    &json_to_automerge(&serde_json::json!({"remote": true}), None).unwrap(),
-                    ChangeOrigin::Remote("peer-a".to_owned()),
-                )
-                .unwrap();
-            let local = json_to_automerge(&serde_json::json!({"local": true}), None).unwrap();
-            store.put(key, &local).unwrap();
-            let heads = local.get_heads();
-            node.local_revisions
-                .lock()
-                .unwrap()
-                .record(key, heads.iter().map(AsRef::as_ref));
-        }
-        expect_no_bridge_event(&mut rx).await;
-    }
-
-    #[tokio::test]
-    async fn bridge_change_queued_remote_tombstone_then_local_put_is_suppressed() {
-        let (_dir, node) = test_node(false).await;
-        let mut rx = node.subscribe_bridge_changes();
-        let key = "frames:tombstone-race";
-        {
-            let store = node.backend.store();
-            let _pause = store.lock_doc(key);
-            store
-                .delete_with_origin(key, ChangeOrigin::Remote("peer-a".to_owned()))
-                .unwrap();
-            let local = json_to_automerge(&serde_json::json!({"local": true}), None).unwrap();
-            store.put(key, &local).unwrap();
-            let heads = local.get_heads();
-            node.local_revisions
-                .lock()
-                .unwrap()
-                .record(key, heads.iter().map(AsRef::as_ref));
-        }
-        expect_no_bridge_event(&mut rx).await;
-    }
-
-    #[tokio::test]
-    async fn bridge_change_remote_capture_first_preserves_clone_before_local_last() {
-        let (_dir, node) = test_node(false).await;
-        let mut rx = node.subscribe_bridge_changes();
-        put_remote(&node, "frames:ordered", r#"{"remote":true}"#, "peer-a");
-        let remote = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        node.put_document("frames", "ordered", r#"{"local":true}"#)
-            .await
-            .unwrap();
-        assert_eq!(remote.json_data, r#"{"remote":true}"#);
-        expect_no_bridge_event(&mut rx).await;
-    }
-
-    #[tokio::test]
-    async fn bridge_change_local_first_remote_last_emits_exact_remote_state() {
-        let (_dir, node) = test_node(false).await;
-        let mut rx = node.subscribe_bridge_changes();
-        node.put_document("frames", "ordered", r#"{"local":true}"#)
-            .await
-            .unwrap();
-        put_remote(&node, "frames:ordered", r#"{"remote":true}"#, "peer-a");
-        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(event.json_data, r#"{"remote":true}"#);
-    }
-
-    #[test]
-    fn bridge_change_revision_guard_is_fixed_non_evicting_and_fail_closed() {
-        let mut guard = LocalRevisionGuard::new();
-        assert_eq!(guard.slots.len(), LOCAL_REVISION_CAPACITY);
-        assert_eq!(std::mem::size_of_val(&*guard.slots), 131_072);
-        let head = [7u8; 32];
-        for index in 0..LOCAL_REVISION_CAPACITY {
-            assert!(guard.record(&format!("frames:{index}"), std::iter::once(head.as_slice())));
-        }
-        assert_eq!(guard.len, LOCAL_REVISION_CAPACITY);
-        assert!(!guard.record("frames:overflow", std::iter::once(head.as_slice())));
-        assert!(guard.exhausted);
-        assert!(guard.is_local("never-seen", std::iter::once(head.as_slice())));
-    }
-
-    #[test]
-    fn bridge_change_revision_digest_frames_inputs_and_caps_post_get_heads_work() {
-        let mut guard = LocalRevisionGuard::new();
-        let heads_64 = [[1u8; 32]; MAX_REVISION_HEADS];
-        assert!(guard.record("ab", heads_64.iter().map(|head| head.as_slice())));
-        assert!(guard.is_local("ab", heads_64.iter().map(|head| head.as_slice())));
-        assert!(!guard.is_local("a", heads_64.iter().map(|head| head.as_slice())));
-
-        let heads_65 = [[2u8; 32]; MAX_REVISION_HEADS + 1];
-        assert!(!guard.record("over", heads_65.iter().map(|head| head.as_slice())));
-        assert!(guard.exhausted);
-        // Pinned Automerge 0.9.0 get_heads() has already allocated and sorted
-        // its complete Vec before this 65-head fail-closed check. This asserts
-        // retained guard state only; it makes no transient allocation claim.
-        assert_eq!(guard.len, 1);
     }
 
     #[tokio::test]

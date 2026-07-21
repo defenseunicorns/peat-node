@@ -349,24 +349,6 @@ payload.
 Remote duplicate suppression is persistent and node-local. It is described in
 [Delivery ledger and reconciliation](#delivery-ledger-and-reconciliation).
 
-Origin attribution has a separate local-revision guard with exactly 4,096
-SHA-256 slots (also 4,096 × 32 = 131,072 retained digest bytes). Its
-domain-separated, length-framed digest covers the document key and exact
-canonical Automerge heads. It retains neither document keys nor head vectors.
-Local writes record their completed heads while holding the same per-key store
-lock used by the remote event snapshot. The remote forwarder rereads and
-classifies the current exact heads under that lock, so a later local snapshot
-cannot be mislabeled remote. If a remote revision is superseded before capture,
-it may be lost; there is no historical snapshot recovery.
-
-`MAX_REVISION_HEADS=64` bounds only digest iteration and retained/admitted
-journal work after `get_heads()` returns. Under the locked Automerge pin,
-`get_heads()` first allocates and sorts all current heads. That inherited
-transient exposure has no bounded iterator and is explicitly not a 2,048-byte
-temporary cap, peak-memory limit, RSS guarantee, or whole-process bound. Both
-fixed digest tables add small fixed metadata beyond their 131,072-byte slot
-arrays; neither statement is a whole-runtime memory ceiling.
-
 Before 1.0, `SidecarNode::document_store()` changed from a mutable raw-store
 handle to `DocumentStoreReader`. Existing reads (`get`, `scan_prefix`,
 `keys_with_prefix`, and observer subscription) remain available, but callers
