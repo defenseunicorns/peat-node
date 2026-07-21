@@ -1682,19 +1682,6 @@ impl SidecarNode {
                         //   - structured: direct Automerge map — serialize as JSON
                         let raw = match store.get(&key) {
                             Ok(Some(doc)) => {
-                                let encoded = doc.save_nocompress();
-                                if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
-                                    diagnostics.record(
-                                        NodeChangePath::PublicObserver,
-                                        NodeChangeRejectKind::EncodedTooLarge,
-                                    );
-                                    continue;
-                                }
-                                drop(encoded);
-                                if let Err(kind) = preflight_event_document(&doc) {
-                                    diagnostics.record(NodeChangePath::PublicObserver, kind);
-                                    continue;
-                                }
                                 let j = automerge_to_json(&doc);
                                 if let Some(s) = j
                                     .get("value")
@@ -1741,16 +1728,6 @@ impl SidecarNode {
                             },
                             other => other,
                         };
-                        if json_data
-                            .as_ref()
-                            .is_some_and(|json| json.len() > MAX_BRIDGE_EVENT_JSON_BYTES)
-                        {
-                            diagnostics.record(
-                                NodeChangePath::PublicObserver,
-                                NodeChangeRejectKind::EventTooLarge,
-                            );
-                            continue;
-                        }
                         let _ = tx.send(ChangeEvent {
                             collection: collection.to_string(),
                             doc_id: doc_id.to_string(),
@@ -3262,13 +3239,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(bridge.doc_id, "shape-valid");
-        assert_eq!(public.doc_id, "shape-valid");
+        let mut public_doc_ids = vec![public.doc_id];
+        for _ in 0..2 {
+            public_doc_ids.push(
+                tokio::time::timeout(Duration::from_secs(10), public_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .doc_id,
+            );
+        }
+        public_doc_ids.sort();
+        assert_eq!(public_doc_ids, vec!["shape-valid", "too-deep", "too-wide"]);
         expect_no_bridge_event(&mut bridge_rx).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(75), public_rx.recv())
-                .await
-                .is_err()
-        );
         assert_eq!(
             node.node_change_diagnostics.count(
                 NodeChangePath::BridgeRemote,
@@ -3281,7 +3264,7 @@ mod tests {
                 NodeChangePath::PublicObserver,
                 NodeChangeRejectKind::StructuralLimit
             ),
-            2
+            0
         );
     }
 

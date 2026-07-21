@@ -278,11 +278,14 @@ bridge also rejects a `save_nocompress()` representation larger than 8 MiB.
 It then performs a non-recursive Automerge traversal with these exact ceilings:
 depth 64, 4,096 objects, 4,096 entries in any one map/list, 65,536 entries
 across the document, 2 MiB of string/byte scalar data, and a conservative
-12,607,488-byte JSON-output proxy. The same gates protect the public observer
-and the private remote bridge forwarder. A rejected deep, wide, or otherwise
-over-limit document emits no event, and both forwarders continue with later
-valid changes. This prevents an admitted current document from reaching the
-recursive JSON converter with attacker-controlled structure.
+12,607,488-byte JSON-output proxy. These gates protect the private remote
+bridge forwarder only. The existing public `Subscribe` observer retains its
+prior document-shape and size behavior; bridge admission limits do not
+silently change delivery to existing Subscribe clients. A rejected deep, wide,
+or otherwise over-limit remote document emits no bridge event, and the bridge
+forwarder continues with later valid changes. This prevents an admitted remote
+document from reaching the recursive JSON converter with attacker-controlled
+structure.
 
 The pinned peat-mesh/Automerge API has an explicit residual limitation:
 `DocChange` carries only a key and origin, `AutomergeStore::get()` deep-clones

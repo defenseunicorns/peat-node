@@ -158,6 +158,13 @@ async fn shutdown_unavailable_authenticated_nats_cleans_node_and_logs_safely() {
     assert!(normalized.contains("NATS bridge shutdown failed"));
     assert!(normalized.contains("peat-node cleanup complete"));
     assert!(normalized.contains("NATS bridge operations"));
+    #[cfg(unix)]
+    assert!(
+        normalized.lines().any(|line| {
+            line.contains("reason=\"final\"") && line.contains("shutdown_failure=1")
+        }),
+        "missing final shutdown operations snapshot: {normalized}"
+    );
     assert!(
         saw_not_ready,
         "missing bridge_ready=false event: {normalized}"
