@@ -12,6 +12,23 @@ use tokio::sync::Mutex;
 
 struct ChildGuard(Child);
 
+fn strip_ansi_escape_codes(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut in_escape = false;
+    for character in input.chars() {
+        if in_escape {
+            if ('@'..='~').contains(&character) {
+                in_escape = false;
+            }
+        } else if character == '\u{1b}' {
+            in_escape = true;
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.start_kill();
@@ -102,9 +119,10 @@ async fn shutdown_unavailable_authenticated_nats_cleans_node_and_logs_safely() {
         }
 
         let captured = output.lock().await.clone();
-        saw_not_ready |= captured.contains("bridge_ready=false");
-        saw_unavailable |= captured.contains("broker_unavailable");
-        saw_retry |= captured.contains("retry_scheduled");
+        let normalized = strip_ansi_escape_codes(&captured);
+        saw_not_ready |= normalized.contains("bridge_ready=false");
+        saw_unavailable |= normalized.contains("broker_unavailable");
+        saw_retry |= normalized.contains("retry_scheduled");
         if status.is_some() && saw_not_ready && saw_unavailable && saw_retry {
             break;
         }
@@ -132,24 +150,25 @@ async fn shutdown_unavailable_authenticated_nats_cleans_node_and_logs_safely() {
     assert!(status.get("bridgeReady").is_none());
 
     let captured = output.lock().await.clone();
+    let normalized = strip_ansi_escape_codes(&captured);
     assert!(
         !exit_status.success(),
         "blocked NATS flush must return an error"
     );
-    assert!(captured.contains("NATS bridge shutdown failed"));
-    assert!(captured.contains("peat-node cleanup complete"));
-    assert!(captured.contains("NATS bridge operations"));
+    assert!(normalized.contains("NATS bridge shutdown failed"));
+    assert!(normalized.contains("peat-node cleanup complete"));
+    assert!(normalized.contains("NATS bridge operations"));
     assert!(
         saw_not_ready,
-        "missing bridge_ready=false event: {captured}"
+        "missing bridge_ready=false event: {normalized}"
     );
     assert!(
         saw_unavailable,
-        "missing safe unavailable reason: {captured}"
+        "missing safe unavailable reason: {normalized}"
     );
-    assert!(saw_retry, "missing retry evidence: {captured}");
+    assert!(saw_retry, "missing retry evidence: {normalized}");
     for secret in ["test-user", "p%61ssword", "password"] {
-        assert!(!captured.contains(secret));
+        assert!(!normalized.contains(secret));
     }
 }
 
