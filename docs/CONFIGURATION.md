@@ -29,6 +29,16 @@ controls apply only to the built-in TCP listener. Streaming response bodies
 remain unbounded after handler setup so long-lived `Subscribe` and attachment
 progress streams are not terminated by the unary request deadline.
 
+### Integration guidance
+
+Co-located applications **should reuse one persistent Connect/gRPC/HTTP
+client** instead of opening a new TCP connection for every unary RPC. The
+server bounds above make abandoned and idle connections safe, but pooling
+still avoids repeated transport allocations and the kernel `TIME_WAIT` churn
+created by per-request connections. Recreate a client only after the existing
+connection fails or the server retires it; normal client pools handle that
+reconnect transparently.
+
 ## Identity & formation
 
 | Env var | Flag | Type | Default | Description |
