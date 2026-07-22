@@ -11,6 +11,34 @@ if you add or rename a flag, update this file in the same PR.
 | `PEAT_NODE_LISTEN` | `--listen` | string | `tcp://0.0.0.0:50051` | Listen address. Use `unix:///path/to/sock` for a Unix socket or `tcp://HOST:PORT` for TCP. The single port serves Connect RPC, gRPC, and gRPC-Web. |
 | `PEAT_NODE_DATA_DIR` | `--data-dir` | path | `/data/peat-node` | Persistent data directory. Contains the Automerge CRDT store under `automerge/` and the Iroh blob store under `iroh/`. Note: the iroh **endpoint ID is not derived from this directory** — it is seeded deterministically from `(PEAT_NODE_SHARED_KEY, PEAT_NODE_NODE_ID)` (see [Deterministic identity](#deterministic-identity--offline-peer-id-derivation)), so it is stable across restarts and even across data-dir wipes, as long as those two inputs are unchanged. |
 
+## RPC deadlines & TCP connection bounds
+
+| Env var | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `PEAT_NODE_RPC_DEFAULT_TIMEOUT_SECS` | `--rpc-default-timeout-secs` | u64 | `120` | Server deadline used when a Connect/gRPC client supplies no timeout. Covers request-body receipt and unary or streaming-handler setup, but not the lifetime of a streaming response after setup. |
+| `PEAT_NODE_RPC_MAX_TIMEOUT_SECS` | `--rpc-max-timeout-secs` | u64 | `300` | Upper bound applied to a client-asserted Connect/gRPC timeout. Must be at least the default timeout. |
+| `PEAT_NODE_HTTP_HEADER_READ_TIMEOUT_SECS` | `--http-header-read-timeout-secs` | u64 | `30` | TCP HTTP/1.1 deadline for receiving complete headers, including the wait for a next request on a keep-alive connection. Reclaims clients that connect or finish a request and then stop sending headers. |
+| `PEAT_NODE_HTTP_MAX_CONNECTION_IDLE_SECS` | `--http-max-connection-idle-secs` | u64 | `300` | Retires a TCP HTTP/1.1 or HTTP/2 connection after it has no in-flight requests for this duration. Idle retirement is evaluated lazily and normally occurs within one to two times this value. |
+| `PEAT_NODE_HTTP2_KEEPALIVE_INTERVAL_SECS` | `--http2-keepalive-interval-secs` | u64 | `30` | Interval between server HTTP/2 PING frames. |
+| `PEAT_NODE_HTTP2_KEEPALIVE_TIMEOUT_SECS` | `--http2-keepalive-timeout-secs` | u64 | `20` | Closes an HTTP/2 connection whose keepalive PING is not acknowledged within this time. |
+| `PEAT_NODE_HTTP2_MAX_CONCURRENT_STREAMS` | `--http2-max-concurrent-streams` | u32 | `128` | Maximum in-flight HTTP/2 streams accepted on one TCP connection. |
+| `PEAT_NODE_ALLOCATOR_STATS_INTERVAL_SECS` | `--allocator-stats-interval-secs` | u64 | `0` (disabled) | Linux/glibc diagnostic hook. Emits arena, mmap, in-use, free, and releasable byte counters from `mallinfo2`; unsupported targets log a warning. This is allocator evidence, not an RSS ceiling. |
+
+RPC deadlines apply to TCP and Unix-socket listeners. The HTTP transport
+controls apply only to the built-in TCP listener. Streaming response bodies
+remain unbounded after handler setup so long-lived `Subscribe` and attachment
+progress streams are not terminated by the unary request deadline.
+
+### Integration guidance
+
+Co-located applications **should reuse one persistent Connect/gRPC/HTTP
+client** instead of opening a new TCP connection for every unary RPC. The
+server bounds above make abandoned and idle connections safe, but pooling
+still avoids repeated transport allocations and the kernel `TIME_WAIT` churn
+created by per-request connections. Recreate a client only after the existing
+connection fails or the server retires it; normal client pools handle that
+reconnect transparently.
+
 ## Identity & formation
 
 | Env var | Flag | Type | Default | Description |

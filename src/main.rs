@@ -43,6 +43,81 @@ struct Args {
     #[arg(long, env = "PEAT_NODE_LISTEN", default_value = "tcp://0.0.0.0:50051")]
     listen: String,
 
+    /// Default server deadline for RPC request receipt and handler setup.
+    /// Streaming response bodies remain unbounded after setup.
+    #[arg(
+        long,
+        env = "PEAT_NODE_RPC_DEFAULT_TIMEOUT_SECS",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    rpc_default_timeout_secs: u64,
+
+    /// Maximum client-asserted RPC deadline. Larger Connect/gRPC timeout
+    /// headers are clamped to this server-controlled cap.
+    #[arg(
+        long,
+        env = "PEAT_NODE_RPC_MAX_TIMEOUT_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    rpc_max_timeout_secs: u64,
+
+    /// Maximum time to receive complete HTTP/1.1 request headers.
+    #[arg(
+        long,
+        env = "PEAT_NODE_HTTP_HEADER_READ_TIMEOUT_SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=3_600)
+    )]
+    http_header_read_timeout_secs: u64,
+
+    /// Retire a TCP connection after this long with no in-flight request.
+    #[arg(
+        long,
+        env = "PEAT_NODE_HTTP_MAX_CONNECTION_IDLE_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..=86_400)
+    )]
+    http_max_connection_idle_secs: u64,
+
+    /// Interval between server HTTP/2 keepalive PING frames.
+    #[arg(
+        long,
+        env = "PEAT_NODE_HTTP2_KEEPALIVE_INTERVAL_SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=3_600)
+    )]
+    http2_keepalive_interval_secs: u64,
+
+    /// Time allowed for an HTTP/2 keepalive acknowledgement.
+    #[arg(
+        long,
+        env = "PEAT_NODE_HTTP2_KEEPALIVE_TIMEOUT_SECS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u64).range(1..=3_600)
+    )]
+    http2_keepalive_timeout_secs: u64,
+
+    /// Maximum concurrent HTTP/2 streams accepted per TCP connection.
+    #[arg(
+        long,
+        env = "PEAT_NODE_HTTP2_MAX_CONCURRENT_STREAMS",
+        default_value_t = 128,
+        value_parser = clap::value_parser!(u32).range(1..=65_535)
+    )]
+    http2_max_concurrent_streams: u32,
+
+    /// Emit glibc allocator counters at this interval. Zero disables the
+    /// diagnostic hook. Available on Linux GNU targets.
+    #[arg(
+        long,
+        env = "PEAT_NODE_ALLOCATOR_STATS_INTERVAL_SECS",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u64).range(0..=86_400)
+    )]
+    allocator_stats_interval_secs: u64,
+
     /// Persistent data directory.
     #[arg(long, env = "PEAT_NODE_DATA_DIR", default_value = "/data/peat-node")]
     data_dir: PathBuf,
@@ -409,6 +484,58 @@ fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
     redacted
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MallInfo2 {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn mallinfo2() -> MallInfo2;
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn start_allocator_stats(interval_secs: u64) {
+    if interval_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+            // SAFETY: glibc's mallinfo2 takes no pointers, returns its counters
+            // by value, and is documented as MT-safe.
+            let stats = unsafe { mallinfo2() };
+            info!(
+                allocator_arena_bytes = stats.arena,
+                allocator_mmap_bytes = stats.hblkhd,
+                allocator_in_use_bytes = stats.uordblks,
+                allocator_free_bytes = stats.fordblks,
+                allocator_releasable_bytes = stats.keepcost,
+                "glibc allocator stats"
+            );
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn start_allocator_stats(interval_secs: u64) {
+    if interval_secs != 0 {
+        warn!("allocator stats requested but mallinfo2 is unavailable on this platform");
+    }
+}
+
 async fn start_bridge_runtime_with<N, T, F, Fut>(
     bridge_config: BridgeConfig,
     node_id: String,
@@ -565,6 +692,11 @@ async fn main() -> anyhow::Result<()> {
         println!("{endpoint_id}");
         return Ok(());
     }
+
+    if args.rpc_default_timeout_secs > args.rpc_max_timeout_secs {
+        anyhow::bail!("--rpc-default-timeout-secs must not exceed --rpc-max-timeout-secs");
+    }
+    start_allocator_stats(args.allocator_stats_interval_secs);
 
     // Reject the complete bridge configuration before any data-directory or
     // mesh construction. The parsed value is retained for Plan 03's strictly
@@ -758,99 +890,110 @@ async fn main() -> anyhow::Result<()> {
     let service = Arc::new(PeatSidecarService::new(Arc::clone(&node)));
     let router = service.register(Router::new());
 
+    let deadline_policy = connectrpc::DeadlinePolicy::new()
+        .with_max(Duration::from_secs(args.rpc_max_timeout_secs))
+        .with_default_timeout(Duration::from_secs(args.rpc_default_timeout_secs));
     // Parse listen address and start server
-    let (serve_result, bridge_result, node_result) =
-        if let Some(path) = args.listen.strip_prefix("unix://") {
-            let uds_path = PathBuf::from(path);
-            if uds_path.exists() {
-                tokio::fs::remove_file(&uds_path).await?;
-            }
-            if let Some(parent) = uds_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+    let (serve_result, bridge_result, node_result) = if let Some(path) =
+        args.listen.strip_prefix("unix://")
+    {
+        let uds_path = PathBuf::from(path);
+        if uds_path.exists() {
+            tokio::fs::remove_file(&uds_path).await?;
+        }
+        if let Some(parent) = uds_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
-            info!(path = %uds_path.display(), "listening on Unix socket");
+        info!(path = %uds_path.display(), "listening on Unix socket");
 
-            let listener = tokio::net::UnixListener::bind(&uds_path)?;
-            let connect_service = connectrpc::ConnectRpcService::new(router);
-
-            let mut connections = tokio::task::JoinSet::new();
-            let serve_result = loop {
-                tokio::select! {
-                    () = shutdown_signal() => break Ok(()),
-                    accepted = listener.accept() => {
-                        let (stream, _) = match accepted {
-                            Ok(accepted) => accepted,
-                            Err(_) => break Err(anyhow::anyhow!("Unix listener failed")),
-                        };
-                        let svc = connect_service.clone();
-                        connections.spawn(async move {
-                            let io = hyper_util::rt::TokioIo::new(stream);
-                            let _ = hyper_util::server::conn::auto::Builder::new(
-                                hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection(
-                                io,
-                                hyper::service::service_fn(move |req| {
-                                    let mut s = svc.clone();
-                                    async move { tower::Service::call(&mut s, req).await }
-                                }),
-                            )
-                            .await;
-                        });
-                    }
+        let listener = tokio::net::UnixListener::bind(&uds_path)?;
+        let connect_service =
+            connectrpc::ConnectRpcService::new(router).with_deadline_policy(deadline_policy);
+        let mut connections = tokio::task::JoinSet::new();
+        let serve_result = loop {
+            tokio::select! {
+                () = shutdown_signal() => break Ok(()),
+                accepted = listener.accept() => {
+                    let (stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(_) => break Err(anyhow::anyhow!("Unix listener failed")),
+                    };
+                    let svc = connect_service.clone();
+                    connections.spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(move |req| {
+                                let mut s = svc.clone();
+                                async move { tower::Service::call(&mut s, req).await }
+                            }),
+                        )
+                        .await;
+                    });
                 }
-            };
-            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
-            connections.abort_all();
-            let connection_result = tokio::time::timeout(
-                Duration::from_secs(args.nats_shutdown_timeout_secs),
-                async { while connections.join_next().await.is_some() {} },
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("Unix connection shutdown timed out"));
-            let node_result = shutdown_node(&node).await;
-            (
-                serve_result.and(connection_result),
-                bridge_result,
-                node_result,
-            )
-        } else {
-            // TCP
-            let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
-            let addr: std::net::SocketAddr = addr_str.parse()?;
-
-            info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
-
-            let bound = connectrpc::Server::bind(addr)
-                .await
-                .map_err(|_| anyhow::anyhow!("Connect server bind failed"))?;
-            let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel();
-            let mut server_task = tokio::spawn(async move {
-                bound
-                    .serve_with_graceful_shutdown(router, async {
-                        let _ = server_stop_rx.await;
-                    })
-                    .await
-            });
-            shutdown_signal().await;
-            let _ = server_stop_tx.send(());
-
-            // Quiesce the bridge immediately after the listener stop signal. The
-            // Connect server drains independently and is bounded below.
-            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
-            let server_deadline = Duration::from_secs(args.nats_shutdown_timeout_secs);
-            let serve_result = match tokio::time::timeout(server_deadline, &mut server_task).await {
-                Ok(Ok(Ok(()))) => Ok(()),
-                Ok(Ok(Err(_))) | Ok(Err(_)) => Err(anyhow::anyhow!("Connect server failed")),
-                Err(_) => {
-                    server_task.abort();
-                    Err(anyhow::anyhow!("Connect server shutdown timed out"))
-                }
-            };
-            let node_result = shutdown_node(&node).await;
-            (serve_result, bridge_result, node_result)
+            }
         };
+        let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+        connections.abort_all();
+        let connection_result = tokio::time::timeout(
+            Duration::from_secs(args.nats_shutdown_timeout_secs),
+            async { while connections.join_next().await.is_some() {} },
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Unix connection shutdown timed out"));
+        let node_result = shutdown_node(&node).await;
+        (
+            serve_result.and(connection_result),
+            bridge_result,
+            node_result,
+        )
+    } else {
+        // TCP
+        let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
+        let addr: std::net::SocketAddr = addr_str.parse()?;
+
+        info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
+
+        let bound = connectrpc::Server::bind(addr)
+            .await
+            .map_err(|_| anyhow::anyhow!("Connect server bind failed"))?
+            .with_header_read_timeout(Duration::from_secs(args.http_header_read_timeout_secs))
+            .with_max_connection_idle(Duration::from_secs(args.http_max_connection_idle_secs))
+            .with_max_concurrent_streams(args.http2_max_concurrent_streams)
+            .with_http2_keepalive_interval(Duration::from_secs(args.http2_keepalive_interval_secs))
+            .with_http2_keepalive_timeout(Duration::from_secs(args.http2_keepalive_timeout_secs));
+        let connect_service =
+            connectrpc::ConnectRpcService::new(router).with_deadline_policy(deadline_policy);
+        let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel();
+        let mut server_task = tokio::spawn(async move {
+            bound
+                .serve_with_service_and_shutdown(connect_service, async {
+                    let _ = server_stop_rx.await;
+                })
+                .await
+        });
+        shutdown_signal().await;
+        let _ = server_stop_tx.send(());
+
+        // Quiesce the bridge immediately after the listener stop signal. The
+        // Connect server drains independently and is bounded below.
+        let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+        let server_deadline = Duration::from_secs(args.nats_shutdown_timeout_secs);
+        let serve_result = match tokio::time::timeout(server_deadline, &mut server_task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(_))) | Ok(Err(_)) => Err(anyhow::anyhow!("Connect server failed")),
+            Err(_) => {
+                server_task.abort();
+                Err(anyhow::anyhow!("Connect server shutdown timed out"))
+            }
+        };
+        let node_result = shutdown_node(&node).await;
+        (serve_result, bridge_result, node_result)
+    };
     match (serve_result, bridge_result, node_result) {
         (Ok(()), Ok(()), Ok(())) => {}
         (Err(_), Ok(()), Ok(())) => return Err(anyhow::anyhow!("server shutdown failed")),
@@ -944,6 +1087,20 @@ mod tests {
         ])
         .expect("repeated CLI mappings should parse");
         assert_eq!(repeated.nats_mapping, ["a=one", "b=two"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn server_resource_bounds_have_safe_defaults() {
+        let args = Args::try_parse_from(["peat-node"]).expect("default arguments parse");
+        assert_eq!(args.rpc_default_timeout_secs, 120);
+        assert_eq!(args.rpc_max_timeout_secs, 300);
+        assert_eq!(args.http_header_read_timeout_secs, 30);
+        assert_eq!(args.http_max_connection_idle_secs, 300);
+        assert_eq!(args.http2_keepalive_interval_secs, 30);
+        assert_eq!(args.http2_keepalive_timeout_secs, 20);
+        assert_eq!(args.http2_max_concurrent_streams, 128);
+        assert_eq!(args.allocator_stats_interval_secs, 0);
     }
 
     #[test]

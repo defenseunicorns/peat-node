@@ -174,8 +174,8 @@ peat-protocol = { version = ">=0.9.0-rc.31, <0.9.1", features = ["automerge-back
 iroh = "1.0.2"
 
 # Connect RPC (Connect + gRPC + gRPC-Web on single port)
-connectrpc = { version = "0.2", features = ["server"] }
-buffa = "0.2"
+connectrpc = { version = "0.8.1", features = ["server"] }
+buffa = "0.8.1"
 tokio-stream = "0.1"
 
 # HTTP framework
@@ -237,7 +237,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "htt
 clap = { version = "4", features = ["derive", "env"] }
 
 [build-dependencies]
-connectrpc-build = "0.2"
+connectrpc-build = "0.8.0"
 
 [dev-dependencies]
 tempfile = "3.10"

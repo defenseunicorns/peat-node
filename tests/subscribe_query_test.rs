@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use buffa::OwnedView;
-use connectrpc::{Context, ErrorCode};
+use connectrpc::{ErrorCode, RequestContext, ServiceRequest, ServiceResult, ServiceStream};
 use futures::StreamExt;
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::{
@@ -98,6 +98,18 @@ fn subscribe_view(req: SubscribeRequest) -> OwnedView<pb::SubscribeRequestView<'
     OwnedView::from_owned(&req).expect("encode/decode subscribe request")
 }
 
+async fn subscribe_service(
+    service: &PeatSidecarService,
+    request: OwnedView<pb::SubscribeRequestView<'static>>,
+) -> ServiceResult<ServiceStream<pb::DocumentChange>> {
+    service
+        .subscribe(
+            RequestContext::default(),
+            ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+        )
+        .await
+}
+
 /// Collect change events for up to `total_budget`. Bails as soon as
 /// `expected` events arrive; otherwise returns whatever it has when
 /// the budget expires. Per-recv timeout is short so a quiet stream
@@ -146,10 +158,10 @@ async fn no_query_streams_every_collection_event() {
     let (node, service) = fresh_service().await;
 
     let view = subscribe_view(SubscribeRequest::default());
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     put(&node, "alpha", "a1", r#"{"x":1}"#).await;
     put(&node, "bravo", "b1", r#"{"x":2}"#).await;
@@ -175,10 +187,10 @@ async fn eq_query_filters_to_matching_documents() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     // Three docs: 2 match, 1 doesn't.
     put(
@@ -230,10 +242,10 @@ async fn collection_filter_and_query_compose() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     // Matches collection + predicate.
     put(&node, "nodes", "p1", r#"{"status":"ready"}"#).await;
@@ -265,10 +277,10 @@ async fn delete_events_pass_through_query_filter() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     put(&node, "nodes", "p1", r#"{"node_type":"vehicle"}"#).await;
     node.delete_document("nodes", "p1")
@@ -303,10 +315,10 @@ async fn and_combinator_filters_correctly() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     // Matches both clauses.
     put(
@@ -356,10 +368,10 @@ async fn or_combinator_filters_correctly() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     put(&node, "tags", "t1", r#"{"category":"a"}"#).await;
     put(&node, "tags", "t2", r#"{"category":"b"}"#).await;
@@ -386,10 +398,10 @@ async fn query_all_passes_every_upsert() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), view)
+    let mut stream = subscribe_service(&service, view)
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     put(&node, "alpha", "a1", r#"{"x":1}"#).await;
     put(&node, "bravo", "b1", r#"{"x":2}"#).await;
@@ -418,7 +430,7 @@ async fn empty_query_oneof_is_invalid_argument() {
         ..Default::default()
     };
     let view = subscribe_view(req);
-    match service.subscribe(Context::default(), view).await {
+    match subscribe_service(&service, view).await {
         Ok(_) => panic!("expected InvalidArgument; got Ok"),
         Err(err) => assert_eq!(
             err.code,
@@ -445,10 +457,10 @@ async fn subscribe_initial_snapshot_includes_existing_docs() {
         collections: vec!["nodes".to_string()],
         ..Default::default()
     };
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), subscribe_view(req))
+    let mut stream = subscribe_service(&service, subscribe_view(req))
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     // Expect the 3 snapshot events; they should arrive without any writes.
     let events = collect(&mut stream, 3, Duration::from_secs(2)).await;
@@ -478,10 +490,10 @@ async fn subscribe_initial_snapshot_filtered_by_query() {
         query: buffa::MessageField::some(pq_eq("node_type", "\"vehicle\"")),
         ..Default::default()
     };
-    let (mut stream, _ctx) = service
-        .subscribe(Context::default(), subscribe_view(req))
+    let mut stream = subscribe_service(&service, subscribe_view(req))
         .await
-        .expect("subscribe");
+        .expect("subscribe")
+        .body;
 
     let events = collect(&mut stream, 2, Duration::from_secs(2)).await;
     assert_eq!(

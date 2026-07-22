@@ -627,31 +627,47 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.2.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fb26cf6d5fa531c242d47df5d6bad0e379c26dcfa0270680a028d09030f7f1a"
+checksum = "33f29a40702df4b86ccd84211bfde8cee0bce6d0811450ade4a86a7d0958a23a"
 dependencies = [
  "base64",
  "bytes",
+ "foldhash 0.1.5",
  "hashbrown 0.15.5",
  "once_cell",
+ "rustversion",
  "serde",
  "serde_json",
+ "smoothutf8",
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "buffa-codegen"
-version = "0.2.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b8f1742cc45062edd1df41e7cbf56dd87388638472ddcff39ab5828214e67dc"
+checksum = "c6681b562b18ea719622d0d12684e88ecbdca600d517557dc7bcef7704631e28"
 dependencies = [
  "buffa",
+ "buffa-descriptor",
  "prettyplease",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "buffa-descriptor"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57ed423c4ecec86d1500879ce42e7e5f6def01bc632985ac756c1fd723fa21fc"
+dependencies = [
+ "buffa",
+ "rustversion",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -850,11 +866,12 @@ dependencies = [
 
 [[package]]
 name = "connectrpc"
-version = "0.2.1"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "348832a19a9d7e3854438c0f5693996c660d696bdf9ba49954b7c0a7bd28822b"
+checksum = "e4d1bbfc95ed1f4f31a027f5b97ff981be2617bc8a5c800fd6fcc701867bb97f"
 dependencies = [
  "async-compression",
+ "async-trait",
  "base64",
  "buffa",
  "bytes",
@@ -876,14 +893,15 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "wasm-bindgen-futures",
  "zstd",
 ]
 
 [[package]]
 name = "connectrpc-build"
-version = "0.2.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f62358d843d4d9f945eece93673bec2fef96a2d6e33ecfd585c21bee4592386"
+checksum = "f8cdec2dacacd00437898dad38f98105c82d51086a78baa62cee6dc66c031070"
 dependencies = [
  "anyhow",
  "buffa",
@@ -894,9 +912,9 @@ dependencies = [
 
 [[package]]
 name = "connectrpc-codegen"
-version = "0.2.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f604d1f5a75de6fbf25795d50c62748204c3f9f53474f97287916380f6e1afc7"
+checksum = "36c6e3bb62a4a77f41d5cd3d290a488bf529dc7e26b444cda67a3e5544c97542"
 dependencies = [
  "anyhow",
  "buffa",
@@ -1633,6 +1651,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -5476,6 +5495,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "smoothutf8"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36358427d32ecdb1624616deed99eccfef0a167fe5bf40ddb51efe6980bc1ec8"
+dependencies = [
+ "simdutf8",
+]
+
+[[package]]
 name = "socket-pktinfo"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7096,6 +7124,12 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

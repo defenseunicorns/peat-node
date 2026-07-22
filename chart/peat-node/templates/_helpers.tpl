@@ -38,6 +38,24 @@ Usage in a parent chart:
   env:
     - name: PEAT_NODE_LISTEN
       value: {{ .Values.listen | quote }}
+    - name: PEAT_NODE_RPC_DEFAULT_TIMEOUT_SECS
+      value: {{ .Values.server.rpcDefaultTimeoutSeconds | quote }}
+    - name: PEAT_NODE_RPC_MAX_TIMEOUT_SECS
+      value: {{ .Values.server.rpcMaxTimeoutSeconds | quote }}
+    - name: PEAT_NODE_HTTP_HEADER_READ_TIMEOUT_SECS
+      value: {{ .Values.server.httpHeaderReadTimeoutSeconds | quote }}
+    - name: PEAT_NODE_HTTP_MAX_CONNECTION_IDLE_SECS
+      value: {{ .Values.server.httpMaxConnectionIdleSeconds | quote }}
+    - name: PEAT_NODE_HTTP2_KEEPALIVE_INTERVAL_SECS
+      value: {{ .Values.server.http2KeepaliveIntervalSeconds | quote }}
+    - name: PEAT_NODE_HTTP2_KEEPALIVE_TIMEOUT_SECS
+      value: {{ .Values.server.http2KeepaliveTimeoutSeconds | quote }}
+    - name: PEAT_NODE_HTTP2_MAX_CONCURRENT_STREAMS
+      value: {{ .Values.server.http2MaxConcurrentStreams | quote }}
+    {{- if gt (int .Values.server.allocatorStatsIntervalSeconds) 0 }}
+    - name: PEAT_NODE_ALLOCATOR_STATS_INTERVAL_SECS
+      value: {{ .Values.server.allocatorStatsIntervalSeconds | quote }}
+    {{- end }}
     - name: PEAT_NODE_DATA_DIR
       value: /data/peat-node
     {{- if .Values.nodeId }}
