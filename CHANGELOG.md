@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound Connect/gRPC request receipt and client connection lifetimes with
+  configurable RPC deadlines, HTTP/1.1 header timeouts, idle retirement,
+  HTTP/2 keepalives, and per-connection stream limits. Add an opt-in glibc
+  allocator-statistics hook and regression coverage proving stalled plain-TCP
+  clients are reclaimed without disrupting sustained healthy writes.
+
 ## [0.4.11] - 2026-07-22
 
 ### Fixed

@@ -11,6 +11,18 @@ image:
 # Unix socket is preferred for sidecar-to-app communication (no port conflicts).
 listen: "tcp://127.0.0.1:50051"
 
+# -- ConnectRPC request and TCP connection resource bounds.
+server:
+  rpcDefaultTimeoutSeconds: 120
+  rpcMaxTimeoutSeconds: 300
+  httpHeaderReadTimeoutSeconds: 30
+  httpMaxConnectionIdleSeconds: 300
+  http2KeepaliveIntervalSeconds: 30
+  http2KeepaliveTimeoutSeconds: 20
+  http2MaxConcurrentStreams: 128
+  # Linux/glibc mallinfo2 log interval. 0 disables allocator diagnostics.
+  allocatorStatsIntervalSeconds: 0
+
 # -- Node identifier. If empty, a random UUID is generated on startup.
 nodeId: ""
 

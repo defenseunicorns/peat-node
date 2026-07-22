@@ -3,12 +3,12 @@
 //! Implements the generated `PeatSidecar` trait from connectrpc-build.
 //! Supports Connect, gRPC, and gRPC-Web protocols on a single port.
 
-use std::pin::Pin;
 use std::sync::Arc;
 
-use buffa::{MessageView, OwnedView};
-use connectrpc::{ConnectError, Context};
-use futures::stream::Stream;
+use buffa::MessageView;
+use connectrpc::{
+    ConnectError, RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream,
+};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::error;
@@ -35,65 +35,63 @@ fn internal(e: anyhow::Error) -> ConnectError {
     ConnectError::internal(e.to_string())
 }
 
+#[allow(refining_impl_trait)]
 impl pb::PeatSidecar for PeatSidecarService {
     // --- Lifecycle ---
 
     async fn get_status(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetStatusRequestView<'static>>,
-    ) -> Result<(pb::GetStatusResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetStatusRequest>,
+    ) -> ServiceResult<pb::GetStatusResponse> {
         let phase = if self.node.is_sync_active() {
             pb::NodePhase::NODE_PHASE_SYNCING
         } else {
             pb::NodePhase::NODE_PHASE_READY
         };
 
-        Ok((
-            pb::GetStatusResponse {
-                node_id: self.node.node_id().to_string(),
-                endpoint_addr: self.node.endpoint_addr(),
-                sync_active: self.node.is_sync_active(),
-                connected_peers: self.node.connected_peer_count(),
-                phase: phase.into(),
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetStatusResponse {
+            node_id: self.node.node_id().to_string(),
+            endpoint_addr: self.node.endpoint_addr(),
+            sync_active: self.node.is_sync_active(),
+            connected_peers: self.node.connected_peer_count(),
+            phase: phase.into(),
+            ..Default::default()
+        }))
     }
 
     // --- Peer Management ---
 
     async fn connect_peer(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::ConnectPeerRequestView<'static>>,
-    ) -> Result<(pb::ConnectPeerResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ConnectPeerRequest>,
+    ) -> ServiceResult<pb::ConnectPeerResponse> {
         let req = request.to_owned_message();
         self.node
             .connect_peer(&req.endpoint_id, &req.addresses, &req.relay_url)
             .await
             .map_err(internal)?;
-        Ok((pb::ConnectPeerResponse::default(), ctx))
+        Ok(Response::new(pb::ConnectPeerResponse::default()))
     }
 
     async fn disconnect_peer(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::DisconnectPeerRequestView<'static>>,
-    ) -> Result<(pb::DisconnectPeerResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::DisconnectPeerRequest>,
+    ) -> ServiceResult<pb::DisconnectPeerResponse> {
         self.node
             .disconnect_peer(request.endpoint_id)
             .await
             .map_err(internal)?;
-        Ok((pb::DisconnectPeerResponse::default(), ctx))
+        Ok(Response::new(pb::DisconnectPeerResponse::default()))
     }
 
     async fn list_peers(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::ListPeersRequestView<'static>>,
-    ) -> Result<(pb::ListPeersResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListPeersRequest>,
+    ) -> ServiceResult<pb::ListPeersResponse> {
         let peers = self
             .node
             .list_peers()
@@ -105,86 +103,77 @@ impl pb::PeatSidecar for PeatSidecarService {
                 ..Default::default()
             })
             .collect();
-        Ok((
-            pb::ListPeersResponse {
-                peers,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::ListPeersResponse {
+            peers,
+            ..Default::default()
+        }))
     }
 
     // --- Generic Document CRUD ---
 
     async fn put_document(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::PutDocumentRequestView<'static>>,
-    ) -> Result<(pb::PutDocumentResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PutDocumentRequest>,
+    ) -> ServiceResult<pb::PutDocumentResponse> {
         self.node
             .put_document(request.collection, request.doc_id, request.json_data)
             .await
             .map_err(internal)?;
-        Ok((pb::PutDocumentResponse::default(), ctx))
+        Ok(Response::new(pb::PutDocumentResponse::default()))
     }
 
     async fn get_document(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::GetDocumentRequestView<'static>>,
-    ) -> Result<(pb::GetDocumentResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::GetDocumentRequest>,
+    ) -> ServiceResult<pb::GetDocumentResponse> {
         let json_data = self
             .node
             .get_document(request.collection, request.doc_id)
             .await
             .map_err(internal)?;
-        Ok((
-            pb::GetDocumentResponse {
-                json_data,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetDocumentResponse {
+            json_data,
+            ..Default::default()
+        }))
     }
 
     async fn delete_document(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::DeleteDocumentRequestView<'static>>,
-    ) -> Result<(pb::DeleteDocumentResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::DeleteDocumentRequest>,
+    ) -> ServiceResult<pb::DeleteDocumentResponse> {
         self.node
             .delete_document(request.collection, request.doc_id)
             .await
             .map_err(internal)?;
-        Ok((pb::DeleteDocumentResponse::default(), ctx))
+        Ok(Response::new(pb::DeleteDocumentResponse::default()))
     }
 
     async fn list_documents(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::ListDocumentsRequestView<'static>>,
-    ) -> Result<(pb::ListDocumentsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::ListDocumentsRequest>,
+    ) -> ServiceResult<pb::ListDocumentsResponse> {
         let doc_ids = self
             .node
             .list_documents(request.collection)
             .await
             .map_err(internal)?;
-        Ok((
-            pb::ListDocumentsResponse {
-                doc_ids,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::ListDocumentsResponse {
+            doc_ids,
+            ..Default::default()
+        }))
     }
 
     // --- Typed Collections ---
 
     async fn put_node(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::PutNodeRequestView<'static>>,
-    ) -> Result<(pb::PutNodeResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PutNodeRequest>,
+    ) -> ServiceResult<pb::PutNodeResponse> {
         let req = request.to_owned_message();
         let node = req
             .node
@@ -195,14 +184,14 @@ impl pb::PeatSidecar for PeatSidecarService {
             .put_document("nodes", &node.id, &json)
             .await
             .map_err(internal)?;
-        Ok((pb::PutNodeResponse::default(), ctx))
+        Ok(Response::new(pb::PutNodeResponse::default()))
     }
 
     async fn get_nodes(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetNodesRequestView<'static>>,
-    ) -> Result<(pb::GetNodesResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetNodesRequest>,
+    ) -> ServiceResult<pb::GetNodesResponse> {
         let doc_ids = self.node.list_documents("nodes").await.map_err(internal)?;
         let mut nodes = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
@@ -217,20 +206,17 @@ impl pb::PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok((
-            pb::GetNodesResponse {
-                nodes,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetNodesResponse {
+            nodes,
+            ..Default::default()
+        }))
     }
 
     async fn put_cell(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::PutCellRequestView<'static>>,
-    ) -> Result<(pb::PutCellResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PutCellRequest>,
+    ) -> ServiceResult<pb::PutCellResponse> {
         let req = request.to_owned_message();
         let cell = req
             .cell
@@ -241,14 +227,14 @@ impl pb::PeatSidecar for PeatSidecarService {
             .put_document("cells", &cell.id, &json)
             .await
             .map_err(internal)?;
-        Ok((pb::PutCellResponse::default(), ctx))
+        Ok(Response::new(pb::PutCellResponse::default()))
     }
 
     async fn get_cells(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetCellsRequestView<'static>>,
-    ) -> Result<(pb::GetCellsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetCellsRequest>,
+    ) -> ServiceResult<pb::GetCellsResponse> {
         let doc_ids = self.node.list_documents("cells").await.map_err(internal)?;
         let mut cells = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
@@ -263,20 +249,17 @@ impl pb::PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok((
-            pb::GetCellsResponse {
-                cells,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetCellsResponse {
+            cells,
+            ..Default::default()
+        }))
     }
 
     async fn put_track(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::PutTrackRequestView<'static>>,
-    ) -> Result<(pb::PutTrackResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PutTrackRequest>,
+    ) -> ServiceResult<pb::PutTrackResponse> {
         let req = request.to_owned_message();
         let track = req
             .track
@@ -287,14 +270,14 @@ impl pb::PeatSidecar for PeatSidecarService {
             .put_document("tracks", &track.id, &json)
             .await
             .map_err(internal)?;
-        Ok((pb::PutTrackResponse::default(), ctx))
+        Ok(Response::new(pb::PutTrackResponse::default()))
     }
 
     async fn get_tracks(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetTracksRequestView<'static>>,
-    ) -> Result<(pb::GetTracksResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetTracksRequest>,
+    ) -> ServiceResult<pb::GetTracksResponse> {
         let doc_ids = self.node.list_documents("tracks").await.map_err(internal)?;
         let mut tracks = Vec::with_capacity(doc_ids.len());
         for doc_id in doc_ids {
@@ -309,20 +292,17 @@ impl pb::PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok((
-            pb::GetTracksResponse {
-                tracks,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetTracksResponse {
+            tracks,
+            ..Default::default()
+        }))
     }
 
     async fn put_command(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::PutCommandRequestView<'static>>,
-    ) -> Result<(pb::PutCommandResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::PutCommandRequest>,
+    ) -> ServiceResult<pb::PutCommandResponse> {
         let req = request.to_owned_message();
         let command = req
             .command
@@ -333,14 +313,14 @@ impl pb::PeatSidecar for PeatSidecarService {
             .put_document("commands", &command.id, &json)
             .await
             .map_err(internal)?;
-        Ok((pb::PutCommandResponse::default(), ctx))
+        Ok(Response::new(pb::PutCommandResponse::default()))
     }
 
     async fn get_commands(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetCommandsRequestView<'static>>,
-    ) -> Result<(pb::GetCommandsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetCommandsRequest>,
+    ) -> ServiceResult<pb::GetCommandsResponse> {
         let doc_ids = self
             .node
             .list_documents("commands")
@@ -359,34 +339,29 @@ impl pb::PeatSidecar for PeatSidecarService {
                 }
             }
         }
-        Ok((
-            pb::GetCommandsResponse {
-                commands,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetCommandsResponse {
+            commands,
+            ..Default::default()
+        }))
     }
 
     // --- Subscriptions ---
 
     async fn subscribe(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::SubscribeRequestView<'static>>,
-    ) -> Result<
-        (
-            Pin<Box<dyn Stream<Item = Result<pb::DocumentChange, ConnectError>> + Send>>,
-            Context,
-        ),
-        ConnectError,
-    > {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SubscribeRequest>,
+    ) -> ServiceResult<ServiceStream<pb::DocumentChange>> {
         let filter_collections: Vec<String> =
             request.collections.iter().map(|s| s.to_string()).collect();
 
         let matcher: Option<Matcher> = match request.query.as_option() {
             Some(view) => {
-                let owned = view.to_owned_message();
+                let owned = view.to_owned_message().map_err(|e| {
+                    ConnectError::invalid_argument(format!(
+                        "invalid subscription query encoding: {e}"
+                    ))
+                })?;
                 Some(Matcher::from_proto(&owned).map_err(|e| {
                     ConnectError::invalid_argument(format!("invalid subscription query: {e}"))
                 })?)
@@ -454,45 +429,42 @@ impl pb::PeatSidecar for PeatSidecarService {
         });
 
         let combined = futures::stream::iter(snapshot).chain(live_stream);
-        Ok((Box::pin(combined), ctx))
+        Ok(Response::new(Box::pin(combined)))
     }
 
     // --- Sync Control ---
 
     async fn start_sync(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::StartSyncRequestView<'static>>,
-    ) -> Result<(pb::StartSyncResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::StartSyncRequest>,
+    ) -> ServiceResult<pb::StartSyncResponse> {
         self.node.start_sync().await.map_err(internal)?;
-        Ok((pb::StartSyncResponse::default(), ctx))
+        Ok(Response::new(pb::StartSyncResponse::default()))
     }
 
     async fn stop_sync(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::StopSyncRequestView<'static>>,
-    ) -> Result<(pb::StopSyncResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::StopSyncRequest>,
+    ) -> ServiceResult<pb::StopSyncResponse> {
         self.node.stop_sync().await.map_err(internal)?;
-        Ok((pb::StopSyncResponse::default(), ctx))
+        Ok(Response::new(pb::StopSyncResponse::default()))
     }
 
     async fn get_sync_stats(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::GetSyncStatsRequestView<'static>>,
-    ) -> Result<(pb::GetSyncStatsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::GetSyncStatsRequest>,
+    ) -> ServiceResult<pb::GetSyncStatsResponse> {
         let stats = self.node.sync_stats();
-        Ok((
-            pb::GetSyncStatsResponse {
-                sync_active: stats.sync_active,
-                connected_peers: stats.connected_peers,
-                bytes_sent: stats.bytes_sent,
-                bytes_received: stats.bytes_received,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::GetSyncStatsResponse {
+            sync_active: stats.sync_active,
+            connected_peers: stats.connected_peers,
+            bytes_sent: stats.bytes_sent,
+            bytes_received: stats.bytes_received,
+            ..Default::default()
+        }))
     }
 
     // --- Attachments (PRD-006) ---
@@ -505,60 +477,54 @@ impl pb::PeatSidecar for PeatSidecarService {
 
     async fn send_attachments(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::SendAttachmentsRequestView<'static>>,
-    ) -> Result<(pb::SendAttachmentsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SendAttachmentsRequest>,
+    ) -> ServiceResult<pb::SendAttachmentsResponse> {
         let req = request.to_owned_message();
         let resp = crate::attachments::handlers::send_attachments(&self.node, req).await?;
-        Ok((resp, ctx))
+        Ok(Response::new(resp))
     }
 
     async fn get_attachment_distribution(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::GetAttachmentDistributionRequestView<'static>>,
-    ) -> Result<(pb::GetAttachmentDistributionResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::GetAttachmentDistributionRequest>,
+    ) -> ServiceResult<pb::GetAttachmentDistributionResponse> {
         let req = request.to_owned_message();
         let resp =
             crate::attachments::handlers::get_attachment_distribution(&self.node, req).await?;
-        Ok((resp, ctx))
+        Ok(Response::new(resp))
     }
 
     async fn subscribe_attachment_bundle(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::SubscribeAttachmentBundleRequestView<'static>>,
-    ) -> Result<
-        (
-            Pin<Box<dyn Stream<Item = Result<pb::AttachmentProgress, ConnectError>> + Send>>,
-            Context,
-        ),
-        ConnectError,
-    > {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SubscribeAttachmentBundleRequest>,
+    ) -> ServiceResult<ServiceStream<pb::AttachmentProgress>> {
         let req = request.to_owned_message();
         let stream =
             crate::attachments::handlers::subscribe_attachment_bundle(&self.node, req).await?;
-        Ok((stream, ctx))
+        Ok(Response::new(stream))
     }
 
     async fn cancel_attachment_distribution(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::CancelAttachmentDistributionRequestView<'static>>,
-    ) -> Result<(pb::CancelAttachmentDistributionResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::CancelAttachmentDistributionRequest>,
+    ) -> ServiceResult<pb::CancelAttachmentDistributionResponse> {
         let req = request.to_owned_message();
         let resp =
             crate::attachments::handlers::cancel_attachment_distribution(&self.node, req).await?;
-        Ok((resp, ctx))
+        Ok(Response::new(resp))
     }
 
     // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
 
     async fn set_collection_config(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::SetCollectionConfigRequestView<'static>>,
-    ) -> Result<(pb::SetCollectionConfigResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::SetCollectionConfigRequest>,
+    ) -> ServiceResult<pb::SetCollectionConfigResponse> {
         let req = request.to_owned_message();
         let cfg = req
             .config
@@ -571,45 +537,39 @@ impl pb::PeatSidecar for PeatSidecarService {
         let entry = proto_config_to_entry(cfg)
             .map_err(|e| ConnectError::invalid_argument(e.to_string()))?;
         self.node.set_collection_config(entry).map_err(internal)?;
-        Ok((pb::SetCollectionConfigResponse::default(), ctx))
+        Ok(Response::new(pb::SetCollectionConfigResponse::default()))
     }
 
     async fn get_collection_config(
         &self,
-        ctx: Context,
-        request: OwnedView<pb::GetCollectionConfigRequestView<'static>>,
-    ) -> Result<(pb::GetCollectionConfigResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::GetCollectionConfigRequest>,
+    ) -> ServiceResult<pb::GetCollectionConfigResponse> {
         let collection = request.collection;
         match self.node.get_collection_config(collection) {
-            Some(entry) => Ok((
-                pb::GetCollectionConfigResponse {
-                    config: buffa::MessageField::some(entry_to_proto_config(entry)),
-                    ..Default::default()
-                },
-                ctx,
-            )),
-            None => Ok((pb::GetCollectionConfigResponse::default(), ctx)),
+            Some(entry) => Ok(Response::new(pb::GetCollectionConfigResponse {
+                config: buffa::MessageField::some(entry_to_proto_config(entry)),
+                ..Default::default()
+            })),
+            None => Ok(Response::new(pb::GetCollectionConfigResponse::default())),
         }
     }
 
     async fn list_collection_configs(
         &self,
-        ctx: Context,
-        _request: OwnedView<pb::ListCollectionConfigsRequestView<'static>>,
-    ) -> Result<(pb::ListCollectionConfigsResponse, Context), ConnectError> {
+        _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListCollectionConfigsRequest>,
+    ) -> ServiceResult<pb::ListCollectionConfigsResponse> {
         let configs = self
             .node
             .list_collection_configs()
             .into_iter()
             .map(entry_to_proto_config)
             .collect();
-        Ok((
-            pb::ListCollectionConfigsResponse {
-                configs,
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok(Response::new(pb::ListCollectionConfigsResponse {
+            configs,
+            ..Default::default()
+        }))
     }
 }
 

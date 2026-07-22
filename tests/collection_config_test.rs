@@ -6,11 +6,12 @@
 use std::sync::Arc;
 
 use buffa::OwnedView;
-use connectrpc::{Context, ErrorCode};
+use connectrpc::{ErrorCode, RequestContext, ServiceRequest, ServiceResult};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::{
-    CollectionConfig, DeletionPolicy, GetCollectionConfigRequest, ListCollectionConfigsRequest,
-    PeatSidecar, SetCollectionConfigRequest,
+    CollectionConfig, DeletionPolicy, GetCollectionConfigRequest, GetCollectionConfigResponse,
+    ListCollectionConfigsRequest, ListCollectionConfigsResponse, PeatSidecar,
+    SetCollectionConfigRequest, SetCollectionConfigResponse,
 };
 use peat_node::service::PeatSidecarService;
 
@@ -41,29 +42,54 @@ async fn fresh_service() -> (Arc<SidecarNode>, PeatSidecarService) {
     (node, service)
 }
 
-fn set_request(
+async fn set_config(
+    service: &PeatSidecarService,
     cfg: CollectionConfig,
-) -> OwnedView<peat_node::pb::SetCollectionConfigRequestView<'static>> {
-    let req = SetCollectionConfigRequest {
+) -> ServiceResult<SetCollectionConfigResponse> {
+    let message = SetCollectionConfigRequest {
         config: buffa::MessageField::some(cfg),
         ..Default::default()
     };
-    OwnedView::from_owned(&req).expect("encode set_collection_config request")
+    let request: OwnedView<peat_node::pb::SetCollectionConfigRequestView<'static>> =
+        OwnedView::from_owned(&message).expect("encode set_collection_config request");
+    service
+        .set_collection_config(
+            RequestContext::default(),
+            ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+        )
+        .await
 }
 
-fn get_request(
+async fn get_config(
+    service: &PeatSidecarService,
     collection: &str,
-) -> OwnedView<peat_node::pb::GetCollectionConfigRequestView<'static>> {
-    let req = GetCollectionConfigRequest {
+) -> ServiceResult<GetCollectionConfigResponse> {
+    let message = GetCollectionConfigRequest {
         collection: collection.to_string(),
         ..Default::default()
     };
-    OwnedView::from_owned(&req).expect("encode get_collection_config request")
+    let request: OwnedView<peat_node::pb::GetCollectionConfigRequestView<'static>> =
+        OwnedView::from_owned(&message).expect("encode get_collection_config request");
+    service
+        .get_collection_config(
+            RequestContext::default(),
+            ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+        )
+        .await
 }
 
-fn list_request() -> OwnedView<peat_node::pb::ListCollectionConfigsRequestView<'static>> {
-    let req = ListCollectionConfigsRequest::default();
-    OwnedView::from_owned(&req).expect("encode list_collection_configs request")
+async fn list_configs(
+    service: &PeatSidecarService,
+) -> ServiceResult<ListCollectionConfigsResponse> {
+    let message = ListCollectionConfigsRequest::default();
+    let request: OwnedView<peat_node::pb::ListCollectionConfigsRequestView<'static>> =
+        OwnedView::from_owned(&message).expect("encode list_collection_configs request");
+    service
+        .list_collection_configs(
+            RequestContext::default(),
+            ServiceRequest::from_parts(request.reborrow(), request.bytes()),
+        )
+        .await
 }
 
 #[tokio::test]
@@ -77,15 +103,14 @@ async fn set_and_get_collection_config_round_trip() {
         ..Default::default()
     };
 
-    service
-        .set_collection_config(Context::default(), set_request(cfg))
+    set_config(&service, cfg)
         .await
         .expect("set_collection_config");
 
-    let (resp, _) = service
-        .get_collection_config(Context::default(), get_request("tracks"))
+    let resp = get_config(&service, "tracks")
         .await
-        .expect("get_collection_config");
+        .expect("get_collection_config")
+        .body;
 
     let returned = resp.config.into_option().expect("config field present");
     assert_eq!(returned.collection, "tracks");
@@ -103,10 +128,10 @@ async fn get_unconfigured_collection_returns_empty() {
     // An unconfigured collection returns a 200 with no config field (not a NOT_FOUND
     // error). This lets callers check for the presence of a config without treating
     // absence as an error condition.
-    let (resp, _ctx) = service
-        .get_collection_config(Context::default(), get_request("nonexistent"))
+    let resp = get_config(&service, "nonexistent")
         .await
-        .expect("get_collection_config must succeed for unknown collection");
+        .expect("get_collection_config must succeed for unknown collection")
+        .body;
     assert!(
         resp.config.into_option().is_none(),
         "expected no config for unconfigured collection"
@@ -128,19 +153,13 @@ async fn list_collection_configs_returns_all_configured() {
         ..Default::default()
     };
 
-    service
-        .set_collection_config(Context::default(), set_request(cfg_a))
-        .await
-        .expect("set nodes");
-    service
-        .set_collection_config(Context::default(), set_request(cfg_b))
-        .await
-        .expect("set tracks");
+    set_config(&service, cfg_a).await.expect("set nodes");
+    set_config(&service, cfg_b).await.expect("set tracks");
 
-    let (resp, _) = service
-        .list_collection_configs(Context::default(), list_request())
+    let resp = list_configs(&service)
         .await
-        .expect("list_collection_configs");
+        .expect("list_collection_configs")
+        .body;
 
     let mut names: Vec<_> = resp.configs.iter().map(|c| c.collection.as_str()).collect();
     names.sort();
@@ -157,10 +176,7 @@ async fn set_collection_config_requires_collection_name() {
         ..Default::default()
     };
 
-    match service
-        .set_collection_config(Context::default(), set_request(cfg))
-        .await
-    {
+    match set_config(&service, cfg).await {
         Err(e) => assert_eq!(e.code, ErrorCode::InvalidArgument),
         Ok(_) => panic!("expected InvalidArgument"),
     }
@@ -203,10 +219,7 @@ async fn set_collection_config_persists_to_disk() {
         deletion_policy: buffa::EnumValue::from(DeletionPolicy::DELETION_POLICY_IMMUTABLE as i32),
         ..Default::default()
     };
-    service
-        .set_collection_config(Context::default(), set_request(cfg))
-        .await
-        .expect("set");
+    set_config(&service, cfg).await.expect("set");
 
     // Verify the JSON file was written with the correct content.
     let config_path = data_dir.join("collection_configs.json");
