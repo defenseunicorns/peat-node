@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound sustained `LatestOnly` telemetry memory by upgrading peat-node and
+  peat-cli to peat-mesh 0.9.0-rc.51. Stable-key documents now persist and sync
+  as one-change Automerge snapshots instead of retaining their complete
+  revision history. Node writes serialize the same document's
+  read-modify-write sequence, and CLI updates transfer the existing document
+  into conversion without cloning its prior change graph. Recovery-created
+  QUIC connections now also service peer-initiated streams, preserving
+  bidirectional convergence after reconnect.
+
 ## [0.4.10] - 2026-07-20
 
 ### Fixed

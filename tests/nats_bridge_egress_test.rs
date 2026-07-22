@@ -595,14 +595,14 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
         wait_egress_published(&runtime_b, 2).await;
         nats_b.assert_no_buffered_publish();
 
-        // Node B's local bridge creation and local NATS ingress, plus the
-        // receiver-sourced envelope attributed durably to node B, are valid
-        // remote deliveries on node A. Consume them without assuming CRDT
-        // document ordering, then use the exact count to prove node A did not
-        // publish any of its own node-A-attributed mutations.
-        wait_egress_published(&runtime_a, 3).await;
-        let mut initial_a_payloads = Vec::with_capacity(3);
-        for _ in 0..3 {
+        // Node B's local bridge creation and local NATS ingress are valid
+        // remote deliveries on node A. The receiver-sourced envelope was
+        // authored locally on A; bounded sync no longer echoes that unchanged
+        // document back from B. Consume the exact remaining set without
+        // assuming CRDT document ordering.
+        wait_egress_published(&runtime_a, 2).await;
+        let mut initial_a_payloads = Vec::with_capacity(2);
+        for _ in 0..2 {
             let (subject, headers, payload) = nats_a.next_publish().await;
             assert_eq!(subject, "vision.summary");
             assert_eq!(
@@ -615,7 +615,6 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
         let mut expected_initial_a_payloads = vec![
             br#"{"local_bridge":true}"#.to_vec(),
             br#"{"local_ingress":true}"#.to_vec(),
-            br#"{"returned":true}"#.to_vec(),
         ];
         expected_initial_a_payloads.sort();
         assert_eq!(initial_a_payloads, expected_initial_a_payloads);
@@ -640,12 +639,12 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             headers,
             format!("NATS/1.0\r\n{ORIGIN_HEADER}: node-a\r\n\r\n").as_bytes()
         );
-        wait_egress_published(&runtime_a, 4).await;
+        wait_egress_published(&runtime_a, 3).await;
         nats_a.assert_no_buffered_publish();
 
         let operations_a = runtime_a.operations_snapshot();
         let operations_b = runtime_b.operations_snapshot();
-        assert_eq!(operations_a.remote_published, 4);
+        assert_eq!(operations_a.remote_published, 3);
         assert_eq!(operations_b.remote_published, 2);
         assert_eq!(operations_a.publish_failures, 0);
         assert_eq!(operations_b.publish_failures, 0);

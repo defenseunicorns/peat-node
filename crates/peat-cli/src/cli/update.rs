@@ -159,10 +159,10 @@ pub async fn run(args: UpdateArgs, common: CommonArgs) -> Result<(), CliError> {
             // Round-trip-edit (ADR-001 Phase 4b, peat-mesh#187): compute
             // a minimal delta from `current` → `proposed` and apply it,
             // preserving ADR-021's "create once, evolve through deltas"
-            // invariant. `json_to_automerge(.., Some(&current))` evolves
-            // the existing doc's history; `AutomergeStore::diff` then
-            // extracts only the new changes.
-            let proposed = json_to_automerge(&updated, Some(&current))
+            // invariant. `json_to_automerge(.., Some(current.clone()))`
+            // evolves an owned copy of the existing history;
+            // `AutomergeStore::diff` then extracts only the new changes.
+            let proposed = json_to_automerge(&updated, Some(current.clone()))
                 .map_err(|e| CliError::Generic(format!("build automerge doc: {e}")))?;
             let delta = AutomergeStore::diff(&current, &proposed);
             session

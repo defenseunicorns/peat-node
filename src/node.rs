@@ -2182,7 +2182,7 @@ impl SidecarNode {
             return Err(DocumentWriteError::AlreadyExists);
         }
         let conversion_base = match mode {
-            DocumentWriteMode::Upsert => existing.as_ref(),
+            DocumentWriteMode::Upsert => existing,
             DocumentWriteMode::CreateOnly => None,
         };
 
