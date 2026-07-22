@@ -17,6 +17,11 @@ use tracing::{error, info, warn};
 
 use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::identity;
+use peat_node::nats_bridge::config::{
+    BridgeConfig, EnabledBridgeConfig, DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS,
+    MAX_NATS_SHUTDOWN_TIMEOUT_SECS,
+};
+use peat_node::nats_bridge::runtime::{BridgeRuntime, BridgeRuntimeHandle};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
@@ -57,6 +62,29 @@ struct Args {
     /// Base64-encoded 32-byte AES-256-GCM key for encrypting document content at rest.
     #[arg(long, env = "PEAT_NODE_ENCRYPTION_KEY")]
     encryption_key: Option<String>,
+
+    // --- Core NATS bridge ---
+    /// Local Core NATS server URL. Accepted schemes are `nats://` and `tls://`.
+    #[arg(long, env = "PEAT_NODE_NATS_URL")]
+    nats_url: Option<String>,
+
+    /// Literal `subject=collection` bridge mapping. Repeat the flag for more
+    /// mappings; `PEAT_NODE_NATS_MAPPING` uses comma-delimited entries.
+    #[arg(
+        long = "nats-mapping",
+        env = "PEAT_NODE_NATS_MAPPING",
+        value_delimiter = ','
+    )]
+    nats_mapping: Vec<String>,
+
+    /// Total time allowed for all NATS bridge shutdown stages.
+    #[arg(
+        long,
+        env = "PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS",
+        default_value_t = DEFAULT_NATS_SHUTDOWN_TIMEOUT_SECS,
+        value_parser = clap::value_parser!(u64).range(1..=MAX_NATS_SHUTDOWN_TIMEOUT_SECS)
+    )]
+    nats_shutdown_timeout_secs: u64,
 
     /// Peers to connect to on startup, in `endpoint_id@host:port` form.
     /// The `@host:port` suffix is required (the n0 public relay is no longer
@@ -366,6 +394,121 @@ where
         .collect()
 }
 
+/// Clone operator-visible configuration with every secret-bearing field
+/// replaced before the derived `Debug` implementation is invoked.
+fn redacted_resolved_args(args: &Args, bridge_config: &BridgeConfig) -> Args {
+    let mut redacted = args.clone();
+    redacted.shared_key = "<redacted>".to_string();
+    if redacted.encryption_key.is_some() {
+        redacted.encryption_key = Some("<redacted>".to_string());
+    }
+    redacted.nats_url = match bridge_config {
+        BridgeConfig::Enabled(config) => Some(config.endpoint().to_string()),
+        BridgeConfig::Disabled => None,
+    };
+    redacted
+}
+
+async fn start_bridge_runtime_with<N, T, F, Fut>(
+    bridge_config: BridgeConfig,
+    node_id: String,
+    node: Arc<N>,
+    shutdown_timeout: Duration,
+    spawn: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnOnce(EnabledBridgeConfig, String, Arc<N>, Duration) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match bridge_config {
+        BridgeConfig::Disabled => {
+            info!("NATS bridge disabled — no --nats-mapping configured");
+            Ok(None)
+        }
+        BridgeConfig::Enabled(config) => spawn(config, node_id, node, shutdown_timeout)
+            .await
+            .map(Some),
+    }
+}
+
+async fn start_bridge_runtime(
+    bridge_config: BridgeConfig,
+    node_id: String,
+    node: Arc<SidecarNode>,
+    shutdown_timeout: Duration,
+) -> anyhow::Result<Option<BridgeRuntimeHandle>> {
+    start_bridge_runtime_with(
+        bridge_config,
+        node_id,
+        node,
+        shutdown_timeout,
+        BridgeRuntime::try_spawn,
+    )
+    .await
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                signal.recv().await;
+            }
+        };
+        tokio::select! {
+            () = ctrl_c => {}
+            () = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
+async fn shutdown_bridge(bridge: &mut Option<BridgeRuntimeHandle>) -> anyhow::Result<()> {
+    let bridge_result = match bridge {
+        Some(handle) => handle.shutdown().await.map(|report| {
+            info!(
+                joined_tasks = report.joined_tasks,
+                aborted_tasks = report.aborted_tasks,
+                "NATS bridge shutdown complete"
+            );
+        }),
+        None => Ok(()),
+    };
+    if let Err(error) = &bridge_result {
+        error!(
+            stage = ?error.report.stage,
+            failure = ?error.report.failure,
+            joined_tasks = error.report.joined_tasks,
+            aborted_tasks = error.report.aborted_tasks,
+            "NATS bridge shutdown failed"
+        );
+    }
+
+    bridge_result.map_err(|_| anyhow::anyhow!("NATS bridge shutdown failed"))
+}
+
+async fn shutdown_node(node: &SidecarNode) -> anyhow::Result<()> {
+    let node_result = node.shutdown().await;
+    if node_result.is_ok() {
+        info!("peat-node cleanup complete");
+    } else {
+        error!(
+            error_kind = "node_cleanup_failed",
+            "peat-node cleanup failed"
+        );
+    }
+
+    node_result.map_err(|_| anyhow::anyhow!("peat-node cleanup failed"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -423,6 +566,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Reject the complete bridge configuration before any data-directory or
+    // mesh construction. The parsed value is retained for Plan 03's strictly
+    // enabled-only runtime match; no NATS work starts in this plan.
+    let bridge_config = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)?;
+
     // `node_id` is explicit only when the operator set it; otherwise it's a
     // fresh random UUID, which makes deterministic identity impossible (a new
     // id every boot). Track that so we can warn below.
@@ -431,6 +579,7 @@ async fn main() -> anyhow::Result<()> {
         .node_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    bridge_config.validate_node_identity(&node_id)?;
 
     info!(
         node_id = %node_id,
@@ -443,11 +592,7 @@ async fn main() -> anyhow::Result<()> {
     // Full resolved-configuration dump (opt-in via --print-config /
     // PEAT_NODE_PRINT_CONFIG). Secrets are redacted before logging.
     if args.print_config {
-        let mut redacted = args.clone();
-        redacted.shared_key = "<redacted>".to_string();
-        if redacted.encryption_key.is_some() {
-            redacted.encryption_key = Some("<redacted>".to_string());
-        }
+        let redacted = redacted_resolved_args(&args, &bridge_config);
         info!("resolved configuration (PEAT_NODE_PRINT_CONFIG):\n{redacted:#?}");
     }
 
@@ -529,6 +674,17 @@ async fn main() -> anyhow::Result<()> {
 
     let node = Arc::new(SidecarNode::new(config).await?);
 
+    // The disabled branch constructs no NATS state. The enabled constructor
+    // spawns one supervisor and returns before its first broker dial, keeping
+    // Peat/RPC startup independent of local broker availability.
+    let mut bridge_runtime = start_bridge_runtime(
+        bridge_config,
+        node_id.clone(),
+        Arc::clone(&node),
+        Duration::from_secs(args.nats_shutdown_timeout_secs),
+    )
+    .await?;
+
     // Send-side outbox watcher (opt-in): auto-distribute files dropped into the
     // configured roots, the symmetric counterpart to the receive-side inbox
     // watcher. Spawned here (not in SidecarNode::new) because it drives the
@@ -603,49 +759,104 @@ async fn main() -> anyhow::Result<()> {
     let router = service.register(Router::new());
 
     // Parse listen address and start server
-    if let Some(path) = args.listen.strip_prefix("unix://") {
-        let uds_path = PathBuf::from(path);
-        if uds_path.exists() {
-            tokio::fs::remove_file(&uds_path).await?;
-        }
-        if let Some(parent) = uds_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+    let (serve_result, bridge_result, node_result) =
+        if let Some(path) = args.listen.strip_prefix("unix://") {
+            let uds_path = PathBuf::from(path);
+            if uds_path.exists() {
+                tokio::fs::remove_file(&uds_path).await?;
+            }
+            if let Some(parent) = uds_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
 
-        info!(path = %uds_path.display(), "listening on Unix socket");
+            info!(path = %uds_path.display(), "listening on Unix socket");
 
-        let listener = tokio::net::UnixListener::bind(&uds_path)?;
-        let connect_service = connectrpc::ConnectRpcService::new(router);
+            let listener = tokio::net::UnixListener::bind(&uds_path)?;
+            let connect_service = connectrpc::ConnectRpcService::new(router);
 
-        loop {
-            let (stream, _) = listener.accept().await?;
-            let svc = connect_service.clone();
-            tokio::spawn(async move {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let _ = hyper_util::server::conn::auto::Builder::new(
-                    hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection(
-                    io,
-                    hyper::service::service_fn(move |req| {
-                        let mut s = svc.clone();
-                        async move { tower::Service::call(&mut s, req).await }
-                    }),
-                )
-                .await;
-            });
-        }
-    } else {
-        // TCP
-        let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
-        let addr: std::net::SocketAddr = addr_str.parse()?;
-
-        info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
-
-        connectrpc::Server::new(router)
-            .serve(addr)
+            let mut connections = tokio::task::JoinSet::new();
+            let serve_result = loop {
+                tokio::select! {
+                    () = shutdown_signal() => break Ok(()),
+                    accepted = listener.accept() => {
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(_) => break Err(anyhow::anyhow!("Unix listener failed")),
+                        };
+                        let svc = connect_service.clone();
+                        connections.spawn(async move {
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let _ = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(
+                                io,
+                                hyper::service::service_fn(move |req| {
+                                    let mut s = svc.clone();
+                                    async move { tower::Service::call(&mut s, req).await }
+                                }),
+                            )
+                            .await;
+                        });
+                    }
+                }
+            };
+            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+            connections.abort_all();
+            let connection_result = tokio::time::timeout(
+                Duration::from_secs(args.nats_shutdown_timeout_secs),
+                async { while connections.join_next().await.is_some() {} },
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|_| anyhow::anyhow!("Unix connection shutdown timed out"));
+            let node_result = shutdown_node(&node).await;
+            (
+                serve_result.and(connection_result),
+                bridge_result,
+                node_result,
+            )
+        } else {
+            // TCP
+            let addr_str = args.listen.strip_prefix("tcp://").unwrap_or(&args.listen);
+            let addr: std::net::SocketAddr = addr_str.parse()?;
+
+            info!(%addr, "listening on TCP (Connect + gRPC + gRPC-Web)");
+
+            let bound = connectrpc::Server::bind(addr)
+                .await
+                .map_err(|_| anyhow::anyhow!("Connect server bind failed"))?;
+            let (server_stop_tx, server_stop_rx) = tokio::sync::oneshot::channel();
+            let mut server_task = tokio::spawn(async move {
+                bound
+                    .serve_with_graceful_shutdown(router, async {
+                        let _ = server_stop_rx.await;
+                    })
+                    .await
+            });
+            shutdown_signal().await;
+            let _ = server_stop_tx.send(());
+
+            // Quiesce the bridge immediately after the listener stop signal. The
+            // Connect server drains independently and is bounded below.
+            let bridge_result = shutdown_bridge(&mut bridge_runtime).await;
+            let server_deadline = Duration::from_secs(args.nats_shutdown_timeout_secs);
+            let serve_result = match tokio::time::timeout(server_deadline, &mut server_task).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(_))) | Ok(Err(_)) => Err(anyhow::anyhow!("Connect server failed")),
+                Err(_) => {
+                    server_task.abort();
+                    Err(anyhow::anyhow!("Connect server shutdown timed out"))
+                }
+            };
+            let node_result = shutdown_node(&node).await;
+            (serve_result, bridge_result, node_result)
+        };
+    match (serve_result, bridge_result, node_result) {
+        (Ok(()), Ok(()), Ok(())) => {}
+        (Err(_), Ok(()), Ok(())) => return Err(anyhow::anyhow!("server shutdown failed")),
+        (Ok(()), Err(_), Ok(())) => return Err(anyhow::anyhow!("NATS bridge shutdown failed")),
+        (Ok(()), Ok(()), Err(_)) => return Err(anyhow::anyhow!("peat-node cleanup failed")),
+        _ => return Err(anyhow::anyhow!("multiple shutdown stages failed")),
     }
 
     info!("peat-node stopped");
@@ -654,7 +865,38 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::empty_prefixed_env_keys;
+    use std::ffi::OsString;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use clap::Parser;
+
+    use peat_node::nats_bridge::config::BridgeConfig;
+
+    use super::{empty_prefixed_env_keys, redacted_resolved_args, start_bridge_runtime_with, Args};
+
+    struct EnvRestore {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn empty_prefixed_env_keys_selects_only_empty_matching_prefix() {
@@ -662,6 +904,7 @@ mod tests {
             ("PEAT_NODE_ATTACHMENT_INBOX".to_string(), "".to_string()), // empty + prefix -> drop
             ("PEAT_NODE_SHARED_KEY".to_string(), "abc".to_string()),    // non-empty -> keep
             ("PEAT_NODE_AGENT_ADDR".to_string(), "".to_string()),       // empty + prefix -> drop
+            ("PEAT_NODE_NATS_MAPPING".to_string(), "".to_string()),     // wholly empty -> unset
             ("OTHER_VAR".to_string(), "".to_string()), // empty but wrong prefix -> keep
             ("PATH".to_string(), "/usr/bin".to_string()), // unrelated -> keep
         ];
@@ -669,7 +912,11 @@ mod tests {
         got.sort();
         assert_eq!(
             got,
-            vec!["PEAT_NODE_AGENT_ADDR", "PEAT_NODE_ATTACHMENT_INBOX"]
+            vec![
+                "PEAT_NODE_AGENT_ADDR",
+                "PEAT_NODE_ATTACHMENT_INBOX",
+                "PEAT_NODE_NATS_MAPPING"
+            ]
         );
     }
 
@@ -680,5 +927,253 @@ mod tests {
             "tcp://0.0.0.0:50051".to_string(),
         )];
         assert!(empty_prefixed_env_keys(vars, "PEAT_NODE_").is_empty());
+    }
+
+    #[test]
+    fn nats_mapping_accepts_one_and_repeated_cli_values() {
+        let one = Args::try_parse_from(["peat-node", "--nats-mapping", "a=one"])
+            .expect("one CLI mapping should parse");
+        assert_eq!(one.nats_mapping, ["a=one"]);
+
+        let repeated = Args::try_parse_from([
+            "peat-node",
+            "--nats-mapping",
+            "a=one",
+            "--nats-mapping",
+            "b=two",
+        ])
+        .expect("repeated CLI mappings should parse");
+        assert_eq!(repeated.nats_mapping, ["a=one", "b=two"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_shutdown_timeout_defaults_and_accepts_inclusive_bounds() {
+        let default = Args::try_parse_from(["peat-node"]).expect("default arguments parse");
+        assert_eq!(default.nats_shutdown_timeout_secs, 10);
+        for value in ["1", "300"] {
+            let args = Args::try_parse_from(["peat-node", "--nats-shutdown-timeout-secs", value])
+                .expect("inclusive shutdown bound parses");
+            assert_eq!(args.nats_shutdown_timeout_secs.to_string(), value);
+        }
+        for value in ["0", "301"] {
+            assert!(
+                Args::try_parse_from(["peat-node", "--nats-shutdown-timeout-secs", value,])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_shutdown_timeout_accepts_environment_value() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS", "29");
+        let args = Args::try_parse_from(["peat-node"]).expect("environment timeout parses");
+        assert_eq!(args.nats_shutdown_timeout_secs, 29);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_mapping_accepts_comma_delimited_environment_values() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_MAPPING", "a=one,b=two");
+        let args = Args::try_parse_from(["peat-node"]).expect("environment mappings should parse");
+        assert_eq!(args.nats_mapping, ["a=one", "b=two"]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_mapping_cli_values_replace_environment_values() {
+        let _restore = EnvRestore::set("PEAT_NODE_NATS_MAPPING", "env.subject=env_collection");
+        let args = Args::try_parse_from([
+            "peat-node",
+            "--nats-mapping",
+            "cli.one=one",
+            "--nats-mapping",
+            "cli.two=two",
+        ])
+        .expect("CLI mappings should parse");
+        assert_eq!(args.nats_mapping, ["cli.one=one", "cli.two=two"]);
+    }
+
+    fn args_with_authenticated_nats(url: &str) -> Args {
+        Args::try_parse_from([
+            "peat-node",
+            "--shared-key",
+            "shared-secret",
+            "--encryption-key",
+            "encryption-secret",
+            "--nats-url",
+            url,
+            "--nats-mapping",
+            "vision.summary=frames",
+        ])
+        .expect("test arguments should parse")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nats_resolved_config_redacts_all_authenticated_user_info() {
+        let cases = [
+            "nats://alice:password@broker.example",
+            "nats://token-value@broker.example:4333",
+            "tls://encoded:sec%72et@[2001:db8::1]",
+        ];
+        for url in cases {
+            let args = args_with_authenticated_nats(url);
+            let config = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)
+                .expect("bridge configuration should be valid");
+            let rendered = format!("{:#?}", redacted_resolved_args(&args, &config));
+
+            assert!(rendered.contains("<redacted>"));
+            assert!(rendered.contains("nats_shutdown_timeout_secs: 10"));
+            for secret in [
+                "alice",
+                "password",
+                "token-value",
+                "encoded",
+                "sec%72et",
+                "secret",
+                "shared-secret",
+                "encryption-secret",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+    }
+
+    #[test]
+    fn nats_malformed_authenticated_url_has_generic_safe_diagnostics() {
+        let args =
+            args_with_authenticated_nats("nats://raw-user:raw-pass%65ncoded@broker.example:99999");
+        let error = BridgeConfig::from_raw(args.nats_url.as_deref(), &args.nats_mapping)
+            .expect_err("invalid port should be rejected");
+        let rendered = format!("{error} {error:?}");
+        assert!(rendered.contains("NATS URL is malformed"));
+        for secret in ["raw-user", "raw-pass%65ncoded", "raw-passencoded"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn nats_validation_precedes_data_and_mesh_bootstrap() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        let validation = production
+            .find(concat!("BridgeConfig", "::from_raw"))
+            .expect("startup validation call should exist");
+        assert_eq!(
+            production
+                .match_indices(concat!("BridgeConfig", "::from_raw"))
+                .count(),
+            1
+        );
+        let data_dir = production
+            .find("tokio::fs::create_dir_all(&args.data_dir)")
+            .expect("data-directory creation should exist");
+        let mesh = production
+            .find("SidecarNode::new(config)")
+            .expect("mesh construction should exist");
+        let node_identity_validation = production
+            .find("bridge_config.validate_node_identity(&node_id)")
+            .expect("effective bridge node identity must be startup-validated");
+        assert!(validation < data_dir);
+        assert!(validation < mesh);
+        assert!(node_identity_validation < data_dir);
+        assert!(node_identity_validation < mesh);
+    }
+
+    #[tokio::test]
+    async fn start_bridge_runtime_disabled_does_not_invoke_factory() {
+        let config = BridgeConfig::from_raw(None, &[]).expect("empty config should be valid");
+        let calls = std::cell::Cell::new(0usize);
+        let node = Arc::new(());
+        let handle: Option<()> = start_bridge_runtime_with(
+            config,
+            "disabled-node".to_owned(),
+            Arc::clone(&node),
+            Duration::from_secs(10),
+            |_, _, _, _| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(handle.is_none());
+        assert_eq!(calls.get(), 0);
+
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source should precede tests");
+        assert_eq!(
+            production
+                .matches("NATS bridge disabled — no --nats-mapping configured")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn start_bridge_runtime_enabled_passes_inputs_once() {
+        let mappings = vec!["vision.summary=frames".to_owned()];
+        let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
+            .expect("enabled config should be valid");
+        let expected_node_id = "operator-visible-node".to_owned();
+        let node = Arc::new(());
+        let calls = std::cell::Cell::new(0usize);
+        let handle = start_bridge_runtime_with(
+            config,
+            expected_node_id.clone(),
+            Arc::clone(&node),
+            Duration::from_secs(37),
+            |actual_config, actual_node_id, actual_node, actual_timeout| {
+                calls.set(calls.get() + 1);
+                assert_eq!(actual_config.endpoint().to_string(), "nats://127.0.0.1:9");
+                assert_eq!(actual_config.mappings().len(), 1);
+                assert_eq!(
+                    actual_config.mappings()[0].subject().as_str(),
+                    "vision.summary"
+                );
+                assert_eq!(actual_config.mappings()[0].collection(), "frames");
+                assert_eq!(actual_node_id, expected_node_id);
+                assert!(Arc::ptr_eq(&actual_node, &node));
+                assert_eq!(actual_timeout, Duration::from_secs(37));
+                std::future::ready(Ok("spawned"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(handle, Some("spawned"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_bridge_runtime_awaits_enabled_factory_completion() {
+        let mappings = vec!["vision.summary=frames".to_owned()];
+        let config = BridgeConfig::from_raw(Some("nats://127.0.0.1:9"), &mappings)
+            .expect("enabled config should be valid");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let startup = tokio::spawn(start_bridge_runtime_with(
+            config,
+            "awaited-node".to_owned(),
+            Arc::new(()),
+            Duration::from_secs(10),
+            move |_, _, _, _| async move {
+                entered_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok("spawned")
+            },
+        ));
+
+        entered_rx.await.unwrap();
+        assert!(!startup.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(startup.await.unwrap().unwrap(), Some("spawned"));
     }
 }

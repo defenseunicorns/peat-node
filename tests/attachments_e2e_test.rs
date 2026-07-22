@@ -28,7 +28,7 @@ use peat_node::attachments::config::{AttachmentConfig, AttachmentPriorityCli};
 use peat_node::node::{SidecarConfig, SidecarNode};
 use peat_node::pb::PeatSidecarExt;
 use peat_node::service::PeatSidecarService;
-use peat_protocol::storage::{read_distribution_document, TransferState};
+use peat_protocol::storage::TransferState;
 use sha2::{Digest, Sha256};
 
 struct BootedNode {
@@ -554,12 +554,11 @@ async fn attachment_fanout_preserves_following_document_sync_seven_nodes() {
         // explicit fanout triggered #189.
         for receiver in &receivers {
             assert!(
-                read_distribution_document(
-                    receiver.node.document_store().as_ref(),
-                    &distribution_id,
-                )
-                .expect("reading the distribution document must succeed")
-                .is_some(),
+                receiver
+                    .node
+                    .read_attachment_distribution(&distribution_id)
+                    .expect("reading the distribution document must succeed")
+                    .is_some(),
                 "distribution document must reach every receiver in trial {trial}"
             );
         }
@@ -890,7 +889,9 @@ async fn receiver_writes_node_status_into_distribution_doc() {
     // distinguishable from sheer slowness.
     let poll_deadline = Instant::now() + Duration::from_secs(15);
     let entry = loop {
-        let doc = read_distribution_document(b.node.document_store().as_ref(), &distribution_id)
+        let doc = b
+            .node
+            .read_attachment_distribution(&distribution_id)
             .expect("read_distribution_document must succeed")
             .expect("distribution doc must exist on the receiver after delivery");
         if let Some(entry) = doc.node_statuses.get(&b_short) {

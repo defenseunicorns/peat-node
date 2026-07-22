@@ -1,0 +1,10 @@
+# Build both Peat services from the current checkout without changing topology.
+services:
+  peat-a:
+    image: peat-node:nats-bridge-e2e
+    build:
+      context: ../../..
+  peat-b:
+    image: peat-node:nats-bridge-e2e
+    build:
+      context: ../../..

@@ -8,14 +8,22 @@
 //! broadcast channel that `service.rs::subscribe` consumes, the
 //! `connect_peer` retry loop, and the `start_sync`/`stop_sync` flag.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::crypto::derive_iroh_node_key;
 use crate::fanout::FanoutKind;
+use crate::nats_bridge::config::MAX_BRIDGE_IDENTITY_BYTES;
+use crate::nats_bridge::egress::DeliveryCoordinator;
+use crate::nats_bridge::ledger::{
+    document_digest, BridgeLedger, DeliveryLedger, LedgerError, LedgerOpenError,
+    LocalExclusionLedger,
+};
+use crate::nats_bridge::reconcile::{CandidateError, CandidateOutcome};
+use automerge::{ObjId, ObjType, ReadDoc, ScalarValueRef, ValueRef, ROOT};
 use base64::Engine as _;
 use peat_mesh::discovery::{
     DiscoveryEvent, DiscoveryStrategy, KubernetesDiscovery, KubernetesDiscoveryConfig,
@@ -25,7 +33,9 @@ use peat_mesh::qos::GcConfig;
 use peat_mesh::storage::json_convert::{automerge_to_json, json_to_automerge};
 use peat_mesh::storage::{AutomergeStore, ChangeOrigin, DocChange, SyncTransport, TtlConfig};
 use peat_mesh::sync::{AutomergeBackend, AutomergeBackendConfig};
-use peat_protocol::storage::file_distribution::IrohFileDistribution;
+use peat_protocol::storage::file_distribution::{
+    DistributionDocument, IrohFileDistribution, NodeTransferStatus,
+};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -133,6 +143,14 @@ pub struct SidecarNode {
     relay_fanout: Arc<crate::fanout::PriorityFanout>,
     sync_active: Arc<AtomicBool>,
     change_tx: broadcast::Sender<ChangeEvent>,
+    // Wired into the NATS runtime in the next phase plan; exercised here via
+    // the crate-private seam before that consumer exists.
+    #[allow(dead_code)]
+    bridge_change_tx: broadcast::Sender<BridgeChangeEvent>,
+    bridge_ledger: RwLock<Option<InstalledBridgeLedger>>,
+    bridge_ledger_data_dir: PathBuf,
+    #[cfg(test)]
+    node_change_diagnostics: NodeChangeDiagnostics,
     cipher: Option<StoreCipher>,
     /// PRD-006 attachment configuration. Carried through so handlers can
     /// short-circuit to `Unimplemented` when no `--attachment-root` is
@@ -173,6 +191,19 @@ pub struct SidecarNode {
     /// lifetime. `None` when `--enable-kubernetes-discovery` is false or
     /// discovery failed to start.
     _k8s_discovery: Option<KubernetesDiscovery>,
+}
+
+struct InstalledBridgeLedger {
+    collections: BTreeSet<String>,
+    exclusion: Option<LocalExclusionLedger>,
+    delivery: Option<DeliveryLedger>,
+}
+
+/// Independent ledger-health facts returned by the install-once boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BridgeLedgerHealth {
+    pub(crate) exclusion_healthy: bool,
+    pub(crate) delivery_healthy: bool,
 }
 
 /// Address hint captured per [`SidecarNode::connect_peer`] invocation,
@@ -259,10 +290,408 @@ pub struct ChangeEvent {
     pub json_data: Option<String>,
 }
 
+/// Private transport-origin event consumed only by the native NATS bridge.
+///
+/// This deliberately does not extend [`ChangeEvent`]: client subscriptions
+/// retain their existing local/remote/delete behavior and public shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BridgeChangeEvent {
+    pub collection: String,
+    pub doc_id: String,
+    pub remote_peer_id: String,
+    pub json_data: String,
+}
+
+const BRIDGE_CHANGE_CAPACITY: usize = 256;
+// A valid 1 MiB JSON payload can nearly double when it is escaped into the
+// durable envelope. Keep a small fixed allowance for the other envelope
+// fields, but never retain an arbitrarily large remote document in the
+// broadcast ring.
+const MAX_BRIDGE_EVENT_JSON_BYTES: usize = 2 * 1_048_576 + 4_096;
+// Pinned Automerge exposes no borrowed store read or encoded-size metadata:
+// `AutomergeStore::get` deep-clones the cached document. A no-compression save
+// is therefore the earliest available representation-size gate before the
+// bridge recursively hydrates a serde_json::Value. The temporary save itself
+// is an inherited full-document allocation; see the forwarder comment.
+const MAX_BRIDGE_AUTOMERGE_BYTES: usize = 8 * 1_048_576;
+const MAX_EVENT_DOCUMENT_DEPTH: usize = 64;
+const MAX_EVENT_DOCUMENT_OBJECTS: usize = 4_096;
+const MAX_EVENT_CONTAINER_ENTRIES: usize = 4_096;
+const MAX_EVENT_TOTAL_ENTRIES: usize = 65_536;
+const MAX_EVENT_SCALAR_BYTES: usize = 2 * 1_048_576;
+const MAX_EVENT_OUTPUT_PROXY_BYTES: usize = 6 * MAX_BRIDGE_EVENT_JSON_BYTES;
+const NODE_CHANGE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeChangePath {
+    PublicObserver,
+    BridgeRemote,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeChangeRejectKind {
+    InvalidKey,
+    IdentityTooLarge,
+    StoreRead,
+    EncodedTooLarge,
+    StructuralLimit,
+    Decrypt,
+    Conversion,
+    EventTooLarge,
+}
+
+const NODE_CHANGE_REJECT_KINDS: usize = 8;
+const NODE_CHANGE_DIAGNOSTIC_BUCKETS: usize = 2 * NODE_CHANGE_REJECT_KINDS;
+
+impl NodeChangeRejectKind {
+    fn index(self) -> usize {
+        match self {
+            Self::InvalidKey => 0,
+            Self::IdentityTooLarge => 1,
+            Self::StoreRead => 2,
+            Self::EncodedTooLarge => 3,
+            Self::StructuralLimit => 4,
+            Self::Decrypt => 5,
+            Self::Conversion => 6,
+            Self::EventTooLarge => 7,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NodeChangeWarningBucket {
+    next_emit: Option<Instant>,
+    suppressed: u64,
+}
+
+trait NodeChangeEmitter: Send + Sync + 'static {
+    fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64);
+}
+
+#[derive(Clone, Copy)]
+struct TracingNodeChangeEmitter;
+
+impl NodeChangeEmitter for TracingNodeChangeEmitter {
+    fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64) {
+        warn!(?path, ?kind, suppressed, "node change event rejected");
+    }
+}
+
+#[derive(Clone)]
+struct NodeChangeDiagnostics {
+    counters: Arc<[std::sync::atomic::AtomicU64; NODE_CHANGE_DIAGNOSTIC_BUCKETS]>,
+    warnings: Arc<Mutex<[NodeChangeWarningBucket; NODE_CHANGE_DIAGNOSTIC_BUCKETS]>>,
+    emitter: Arc<dyn NodeChangeEmitter>,
+}
+
+impl Default for NodeChangeDiagnostics {
+    fn default() -> Self {
+        Self::with_emitter(TracingNodeChangeEmitter)
+    }
+}
+
+impl NodeChangeDiagnostics {
+    fn with_emitter<E: NodeChangeEmitter>(emitter: E) -> Self {
+        Self {
+            counters: Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicU64::new(0)
+            })),
+            warnings: Arc::new(Mutex::new(
+                [NodeChangeWarningBucket::default(); NODE_CHANGE_DIAGNOSTIC_BUCKETS],
+            )),
+            emitter: Arc::new(emitter),
+        }
+    }
+
+    fn index(path: NodeChangePath, kind: NodeChangeRejectKind) -> usize {
+        let path_offset = match path {
+            NodeChangePath::PublicObserver => 0,
+            NodeChangePath::BridgeRemote => NODE_CHANGE_REJECT_KINDS,
+        };
+        path_offset + kind.index()
+    }
+
+    fn record(&self, path: NodeChangePath, kind: NodeChangeRejectKind) {
+        self.record_at(path, kind, Instant::now());
+    }
+
+    fn record_at(&self, path: NodeChangePath, kind: NodeChangeRejectKind, now: Instant) {
+        let index = Self::index(path, kind);
+        self.counters[index].fetch_add(1, Ordering::Relaxed);
+        let suppressed = {
+            let mut warnings = self
+                .warnings
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let bucket = &mut warnings[index];
+            if bucket.next_emit.is_some_and(|deadline| now < deadline) {
+                bucket.suppressed = bucket.suppressed.saturating_add(1);
+                return;
+            }
+            let suppressed = bucket.suppressed;
+            bucket.suppressed = 0;
+            bucket.next_emit = Some(now + NODE_CHANGE_WARNING_INTERVAL);
+            suppressed
+        };
+        self.emitter.emit(path, kind, suppressed);
+    }
+
+    #[cfg(test)]
+    fn count(&self, path: NodeChangePath, kind: NodeChangeRejectKind) -> u64 {
+        self.counters[Self::index(path, kind)].load(Ordering::Relaxed)
+    }
+}
+
+fn preflight_event_document(doc: &automerge::Automerge) -> Result<(), NodeChangeRejectKind> {
+    let mut stack = vec![(ROOT, ObjType::Map, 0_usize)];
+    let mut object_count = 1_usize;
+    let mut total_entries = 0_usize;
+    let mut scalar_bytes = 0_usize;
+    let mut output_proxy = 2_usize;
+
+    while let Some((object, object_type, depth)) = stack.pop() {
+        if depth > MAX_EVENT_DOCUMENT_DEPTH {
+            return Err(NodeChangeRejectKind::StructuralLimit);
+        }
+        let mut container_entries = 0_usize;
+        match object_type {
+            ObjType::Map | ObjType::Table => {
+                for item in doc.map_range(&object, ..) {
+                    let child_id = item.id();
+                    container_entries = container_entries.saturating_add(1);
+                    total_entries = total_entries.saturating_add(1);
+                    output_proxy = output_proxy
+                        .saturating_add(item.key.len().saturating_mul(6))
+                        .saturating_add(4);
+                    preflight_value(
+                        item.value,
+                        child_id,
+                        depth,
+                        &mut stack,
+                        &mut object_count,
+                        &mut scalar_bytes,
+                        &mut output_proxy,
+                    )?;
+                    enforce_preflight_counts(
+                        container_entries,
+                        total_entries,
+                        object_count,
+                        scalar_bytes,
+                        output_proxy,
+                    )?;
+                }
+            }
+            ObjType::List => {
+                for item in doc.list_range(&object, ..) {
+                    let child_id = item.id();
+                    container_entries = container_entries.saturating_add(1);
+                    total_entries = total_entries.saturating_add(1);
+                    output_proxy = output_proxy.saturating_add(1);
+                    preflight_value(
+                        item.value,
+                        child_id,
+                        depth,
+                        &mut stack,
+                        &mut object_count,
+                        &mut scalar_bytes,
+                        &mut output_proxy,
+                    )?;
+                    enforce_preflight_counts(
+                        container_entries,
+                        total_entries,
+                        object_count,
+                        scalar_bytes,
+                        output_proxy,
+                    )?;
+                }
+            }
+            ObjType::Text => {
+                let text_len = doc.length(&object);
+                scalar_bytes = scalar_bytes.saturating_add(text_len);
+                output_proxy = output_proxy.saturating_add(text_len.saturating_mul(6));
+                enforce_preflight_counts(
+                    0,
+                    total_entries,
+                    object_count,
+                    scalar_bytes,
+                    output_proxy,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_value(
+    value: ValueRef<'_>,
+    id: ObjId,
+    depth: usize,
+    stack: &mut Vec<(ObjId, ObjType, usize)>,
+    object_count: &mut usize,
+    scalar_bytes: &mut usize,
+    output_proxy: &mut usize,
+) -> Result<(), NodeChangeRejectKind> {
+    match value {
+        ValueRef::Object(object_type) => {
+            *object_count = object_count.saturating_add(1);
+            if *object_count > MAX_EVENT_DOCUMENT_OBJECTS || depth >= MAX_EVENT_DOCUMENT_DEPTH {
+                return Err(NodeChangeRejectKind::StructuralLimit);
+            }
+            stack.push((id, object_type, depth + 1));
+        }
+        ValueRef::Scalar(scalar) => {
+            let (bytes, proxy) = match scalar {
+                ScalarValueRef::Str(value) => (value.len(), value.len().saturating_mul(6) + 2),
+                ScalarValueRef::Bytes(value) => (value.len(), 4),
+                ScalarValueRef::Unknown { bytes, .. } => (bytes.len(), 4),
+                ScalarValueRef::Int(_)
+                | ScalarValueRef::Uint(_)
+                | ScalarValueRef::F64(_)
+                | ScalarValueRef::Counter(_)
+                | ScalarValueRef::Timestamp(_) => (0, 32),
+                ScalarValueRef::Boolean(_) => (0, 5),
+                ScalarValueRef::Null => (0, 4),
+            };
+            *scalar_bytes = scalar_bytes.saturating_add(bytes);
+            *output_proxy = output_proxy.saturating_add(proxy);
+        }
+    }
+    Ok(())
+}
+
+fn enforce_preflight_counts(
+    container_entries: usize,
+    total_entries: usize,
+    object_count: usize,
+    scalar_bytes: usize,
+    output_proxy: usize,
+) -> Result<(), NodeChangeRejectKind> {
+    if container_entries > MAX_EVENT_CONTAINER_ENTRIES
+        || total_entries > MAX_EVENT_TOTAL_ENTRIES
+        || object_count > MAX_EVENT_DOCUMENT_OBJECTS
+        || scalar_bytes > MAX_EVENT_SCALAR_BYTES
+        || output_proxy > MAX_EVENT_OUTPUT_PROXY_BYTES
+    {
+        return Err(NodeChangeRejectKind::StructuralLimit);
+    }
+    Ok(())
+}
+
+/// Read-only facade over the node's document store.
+///
+/// The backing `Arc<AutomergeStore>` is intentionally private and this type
+/// implements no `Deref`, `AsRef`, or `Borrow`, so callers cannot recover a
+/// mutable store handle.
+///
+#[derive(Clone)]
+pub struct DocumentStoreReader {
+    store: Arc<AutomergeStore>,
+}
+
+impl DocumentStoreReader {
+    pub fn get(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        self.store
+            .get(key)
+            .map(|doc| doc.map(|doc| automerge_to_json(&doc)))
+    }
+
+    pub fn scan_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        self.store.scan_prefix(prefix).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(key, doc)| (key, automerge_to_json(&doc)))
+                .collect()
+        })
+    }
+
+    pub fn keys_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        self.store.keys_with_prefix(prefix)
+    }
+
+    pub fn subscribe_to_observer_changes(&self) -> broadcast::Receiver<String> {
+        self.store.subscribe_to_observer_changes()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ChangeType {
     Upsert,
     Delete,
+}
+
+/// Fixed, source-free classifications returned by bridge create operations.
+///
+/// Ingress uses these variants to decide whether an operation is permanent or
+/// retryable without exposing payload text, encryption details, or store
+/// error chains through bridge diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateBridgeDocumentError {
+    AlreadyExists,
+    InvalidInput,
+    Encryption,
+    Conversion,
+    StoreRead,
+    StoreWrite,
+    Ledger,
+}
+
+impl std::fmt::Display for CreateBridgeDocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AlreadyExists => "bridge document already exists",
+            Self::InvalidInput => "bridge document input is invalid",
+            Self::Encryption => "bridge document encryption failed",
+            Self::Conversion => "bridge document conversion failed",
+            Self::StoreRead => "bridge document store read failed",
+            Self::StoreWrite => "bridge document store write failed",
+            Self::Ledger => "bridge document local-exclusion persistence failed",
+        })
+    }
+}
+
+impl std::error::Error for CreateBridgeDocumentError {}
+
+#[derive(Clone, Copy)]
+enum DocumentWriteMode {
+    Upsert,
+    CreateOnly,
+}
+
+enum DocumentWriteError {
+    AlreadyExists,
+    InvalidInput(serde_json::Error),
+    Encryption(anyhow::Error),
+    Conversion(anyhow::Error),
+    StoreRead(anyhow::Error),
+    StoreWrite(anyhow::Error),
+    Ledger,
+}
+
+impl DocumentWriteError {
+    fn classification(&self) -> CreateBridgeDocumentError {
+        match self {
+            Self::AlreadyExists => CreateBridgeDocumentError::AlreadyExists,
+            Self::InvalidInput(_) => CreateBridgeDocumentError::InvalidInput,
+            Self::Encryption(_) => CreateBridgeDocumentError::Encryption,
+            Self::Conversion(_) => CreateBridgeDocumentError::Conversion,
+            Self::StoreRead(_) => CreateBridgeDocumentError::StoreRead,
+            Self::StoreWrite(_) => CreateBridgeDocumentError::StoreWrite,
+            Self::Ledger => CreateBridgeDocumentError::Ledger,
+        }
+    }
+
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::AlreadyExists => anyhow::anyhow!("document already exists"),
+            Self::InvalidInput(error) => anyhow::anyhow!("invalid JSON: {error}"),
+            Self::Encryption(error)
+            | Self::Conversion(error)
+            | Self::StoreRead(error)
+            | Self::StoreWrite(error) => error,
+            Self::Ledger => anyhow::anyhow!("bridge local-exclusion persistence failed"),
+        }
+    }
 }
 
 impl SidecarNode {
@@ -371,6 +800,8 @@ impl SidecarNode {
         };
 
         let (change_tx, _) = broadcast::channel(256);
+        let (bridge_change_tx, _) = broadcast::channel(BRIDGE_CHANGE_CAPACITY);
+        let node_change_diagnostics = NodeChangeDiagnostics::default();
 
         // Forward AutomergeStore observer events into our ChangeEvent shape
         // (collection/doc_id split + cipher decrypt) for service.rs::subscribe.
@@ -380,9 +811,16 @@ impl SidecarNode {
         let change_tx_clone = change_tx.clone();
         let store_clone = Arc::clone(backend.store());
         let cipher_clone = cipher.clone();
+        let observer_diagnostics = node_change_diagnostics.clone();
         tokio::spawn(async move {
-            Self::forward_store_changes(observer_rx, change_tx_clone, store_clone, cipher_clone)
-                .await;
+            Self::forward_store_changes(
+                observer_rx,
+                change_tx_clone,
+                store_clone,
+                cipher_clone,
+                observer_diagnostics,
+            )
+            .await;
         });
 
         // On every change (local or sync-received), push the doc to
@@ -404,6 +842,21 @@ impl SidecarNode {
         // latency-sensitive document preempts a lower-priority backlog instead
         // of being head-of-line-blocked behind it in the inline loop.
         let sync_rx = backend.store().subscribe_to_changes_with_origin();
+        let bridge_rx = backend.store().subscribe_to_changes_with_origin();
+        let bridge_store = Arc::clone(backend.store());
+        let bridge_tx = bridge_change_tx.clone();
+        let bridge_cipher = cipher.clone();
+        let bridge_diagnostics = node_change_diagnostics.clone();
+        tokio::spawn(async move {
+            Self::forward_bridge_changes(
+                bridge_rx,
+                bridge_tx,
+                bridge_store,
+                bridge_cipher,
+                bridge_diagnostics,
+            )
+            .await;
+        });
         let fanout = crate::fanout::PriorityFanout::new();
         tokio::spawn(Arc::clone(&fanout).run(
             Arc::clone(backend.coordinator()),
@@ -798,6 +1251,11 @@ impl SidecarNode {
             relay_fanout: fanout,
             sync_active: Arc::new(AtomicBool::new(false)),
             change_tx,
+            bridge_change_tx,
+            bridge_ledger: RwLock::new(None),
+            bridge_ledger_data_dir: config.data_dir.clone(),
+            #[cfg(test)]
+            node_change_diagnostics,
             cipher,
             attachment_config: config.attachment_config,
             bundle_registry,
@@ -985,7 +1443,7 @@ impl SidecarNode {
 
     /// PRD-006 distribution substrate. `None` when attachments are
     /// disabled (no `--attachment-root` configured).
-    pub fn file_distribution(&self) -> Option<&Arc<IrohFileDistribution>> {
+    pub(crate) fn file_distribution(&self) -> Option<&Arc<IrohFileDistribution>> {
         self.file_distribution.as_ref()
     }
 
@@ -996,7 +1454,7 @@ impl SidecarNode {
         self.backend.blob_store()
     }
 
-    /// The Automerge document store the backend holds.
+    /// Read-only access to documents held by the backend.
     ///
     /// Exposed for the attachment subsystem's inbox watcher (which writes
     /// receiver-side `NodeTransferStatus` into the `file_distributions`
@@ -1004,8 +1462,48 @@ impl SidecarNode {
     /// sees real cross-peer state — see `attachments/inbox.rs`), and for
     /// integration tests that need to read the local document state
     /// directly rather than through the gRPC surface.
-    pub fn document_store(&self) -> &Arc<AutomergeStore> {
-        self.backend.store()
+    ///
+    /// Former raw-store mutation is intentionally a compile error:
+    ///
+    /// ```compile_fail
+    /// fn raw_mutation_is_unavailable(reader: &peat_node::node::DocumentStoreReader) {
+    ///     reader.delete("frames:one").unwrap();
+    ///     reader.put("frames:one", panic!("type is irrelevant")).unwrap();
+    /// }
+    /// ```
+    pub fn document_store(&self) -> DocumentStoreReader {
+        DocumentStoreReader {
+            store: Arc::clone(self.backend.store()),
+        }
+    }
+
+    /// Typed attachment-document read for integration and attachment code.
+    pub fn read_attachment_distribution(
+        &self,
+        distribution_id: &str,
+    ) -> anyhow::Result<Option<DistributionDocument>> {
+        peat_protocol::storage::read_distribution_document(
+            self.backend.store().as_ref(),
+            distribution_id,
+        )
+    }
+
+    /// Narrow attachment mutation used by the discovery-grace promoter.
+    ///
+    /// The only collection this can mutate is peat-mesh's canonical
+    /// `file_distributions`, which bridge configuration reserves exactly.
+    pub(crate) fn write_attachment_node_status(
+        &self,
+        distribution_id: &str,
+        node_id: &str,
+        status: &NodeTransferStatus,
+    ) -> anyhow::Result<()> {
+        peat_protocol::storage::write_receiver_node_status(
+            self.backend.store().as_ref(),
+            distribution_id,
+            node_id,
+            status,
+        )
     }
 
     /// The short-form id of this node's iroh endpoint, the same string the
@@ -1064,12 +1562,22 @@ impl SidecarNode {
         tx: broadcast::Sender<ChangeEvent>,
         store: Arc<AutomergeStore>,
         cipher: Option<StoreCipher>,
+        diagnostics: NodeChangeDiagnostics,
     ) {
         loop {
             match rx.recv().await {
                 Ok(key) => {
                     // Keys are "collection:doc_id"
                     if let Some((collection, doc_id)) = key.split_once(':') {
+                        if collection.len() > MAX_BRIDGE_IDENTITY_BYTES
+                            || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        {
+                            diagnostics.record(
+                                NodeChangePath::PublicObserver,
+                                NodeChangeRejectKind::IdentityTooLarge,
+                            );
+                            continue;
+                        }
                         // Read the current doc and extract a JSON string for the event.
                         // Two storage formats co-exist (peat-node#7):
                         //   - encrypted: {"value":"<ENC:v1:...>"} — extract & decrypt
@@ -1084,19 +1592,38 @@ impl SidecarNode {
                                 {
                                     Some(s.to_string())
                                 } else {
-                                    serde_json::to_string(&j).ok()
+                                    match serde_json::to_string(&j) {
+                                        Ok(json) => Some(json),
+                                        Err(_) => {
+                                            diagnostics.record(
+                                                NodeChangePath::PublicObserver,
+                                                NodeChangeRejectKind::Conversion,
+                                            );
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
-                            _ => None,
+                            Ok(None) => None,
+                            Err(_) => {
+                                diagnostics.record(
+                                    NodeChangePath::PublicObserver,
+                                    NodeChangeRejectKind::StoreRead,
+                                );
+                                continue;
+                            }
                         };
                         // Decrypt if the raw value carries an ENC prefix.
                         let json_data = match raw {
                             Some(v) if crate::crypto::is_encrypted(&v) => match &cipher {
                                 Some(c) => match c.decrypt(&v) {
                                     Ok(plain) => Some(plain),
-                                    Err(e) => {
-                                        warn!(key, "failed to decrypt change event: {e}");
-                                        None
+                                    Err(_) => {
+                                        diagnostics.record(
+                                            NodeChangePath::PublicObserver,
+                                            NodeChangeRejectKind::Decrypt,
+                                        );
+                                        continue;
                                     }
                                 },
                                 None => Some(v),
@@ -1109,10 +1636,161 @@ impl SidecarNode {
                             change_type: ChangeType::Upsert,
                             json_data,
                         });
+                    } else {
+                        diagnostics.record(
+                            NodeChangePath::PublicObserver,
+                            NodeChangeRejectKind::InvalidKey,
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("store observer lagged {n} messages");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+
+    /// Forward present remote-origin bridge documents to the egress path.
+    ///
+    /// Bridge ingress creates immutable documents with unique IDs. A remote
+    /// notification therefore identifies the document to publish; it does not
+    /// need local revision mediation or a same-key write race workaround.
+    async fn forward_bridge_changes(
+        mut rx: broadcast::Receiver<DocChange>,
+        tx: broadcast::Sender<BridgeChangeEvent>,
+        store: Arc<AutomergeStore>,
+        cipher: Option<StoreCipher>,
+        diagnostics: NodeChangeDiagnostics,
+    ) {
+        loop {
+            match rx.recv().await {
+                Ok(DocChange {
+                    key,
+                    origin: ChangeOrigin::Remote(remote_peer_id),
+                }) => {
+                    // Reject attacker-controlled identities before the store
+                    // read. The pinned notification contains no snapshot or
+                    // encoded size, so this is the only admission work
+                    // possible without materializing the current document.
+                    let Some((collection, doc_id)) = key.split_once(':') else {
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::InvalidKey,
+                        );
+                        continue;
+                    };
+                    if collection.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+                        || remote_peer_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+                    {
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::IdentityTooLarge,
+                        );
+                        continue;
+                    }
+                    let collection = collection.to_owned();
+                    let doc_id = doc_id.to_owned();
+
+                    let doc = match store.get(&key) {
+                        Ok(Some(doc)) => doc,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            diagnostics.record(
+                                NodeChangePath::BridgeRemote,
+                                NodeChangeRejectKind::StoreRead,
+                            );
+                            continue;
+                        }
+                    };
+
+                    // `save_nocompress` is the earliest size signal available
+                    // from Automerge 0.9.0 and prevents an oversized document
+                    // from entering recursive Value hydration/JSON encoding.
+                    // It allocates one full encoded Vec, as does pinned
+                    // `AutomergeStore::get` when it deep-clones a cache hit;
+                    // neither upstream API offers a borrowed/chunked/limited
+                    // alternative. Those two transient allocations can scale
+                    // with an attacker document, but the bridge adds no
+                    // unbounded Value tree or serialized String after this
+                    // gate and retains neither allocation.
+                    let encoded = doc.save_nocompress();
+                    if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::EncodedTooLarge,
+                        );
+                        continue;
+                    }
+                    drop(encoded);
+                    if let Err(kind) = preflight_event_document(&doc) {
+                        diagnostics.record(NodeChangePath::BridgeRemote, kind);
+                        continue;
+                    }
+                    let snapshot = automerge_to_json(&doc);
+                    let json_data = if let Some(encrypted) = snapshot
+                        .get("value")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| crate::crypto::is_encrypted(value))
+                    {
+                        let Some(cipher) = &cipher else {
+                            diagnostics.record(
+                                NodeChangePath::BridgeRemote,
+                                NodeChangeRejectKind::Decrypt,
+                            );
+                            continue;
+                        };
+                        match cipher.decrypt(encrypted) {
+                            Ok(plaintext) => plaintext,
+                            Err(_) => {
+                                diagnostics.record(
+                                    NodeChangePath::BridgeRemote,
+                                    NodeChangeRejectKind::Decrypt,
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        match serde_json::to_string(&snapshot) {
+                            Ok(json) => json,
+                            Err(_) => {
+                                diagnostics.record(
+                                    NodeChangePath::BridgeRemote,
+                                    NodeChangeRejectKind::Conversion,
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
+                    // The upstream document and origin notification are
+                    // attacker-controlled. Enforce every retained field's
+                    // byte ceiling before cloning key slices or moving the
+                    // serialized document into the 256-slot broadcast ring.
+                    // Oversized events fail closed; the listener remains live
+                    // for later valid remote changes.
+                    if json_data.len() > MAX_BRIDGE_EVENT_JSON_BYTES {
+                        diagnostics.record(
+                            NodeChangePath::BridgeRemote,
+                            NodeChangeRejectKind::EventTooLarge,
+                        );
+                        continue;
+                    }
+
+                    let _ = tx.send(BridgeChangeEvent {
+                        collection,
+                        doc_id,
+                        remote_peer_id,
+                        json_data,
+                    });
+                }
+                Ok(DocChange {
+                    origin: ChangeOrigin::Local,
+                    ..
+                }) => {}
+                Err(broadcast::error::RecvError::Lagged(count)) => {
+                    warn!(dropped_count = count, "bridge change listener lagged");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1447,29 +2125,9 @@ impl SidecarNode {
         doc_id: &str,
         json_data: &str,
     ) -> anyhow::Result<()> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(json_data).map_err(|e| anyhow::anyhow!("invalid JSON: {e}"))?;
-
-        let key = format!("{collection}:{doc_id}");
-        let store = self.backend.store();
-        let existing = store.get(&key)?;
-
-        let doc = match &self.cipher {
-            Some(c) => {
-                // Ciphertext is opaque — wrap in {"value":"<ciphertext>"} so
-                // json_to_automerge has a map root to work with.
-                let ciphertext = c.encrypt(json_data)?;
-                let wrapped = serde_json::json!({ "value": ciphertext });
-                json_to_automerge(&wrapped, existing.as_ref())?
-            }
-            None => {
-                // Write user JSON directly as structured Automerge fields for
-                // field-level CRDT merging (peat-node#7).
-                json_to_automerge(&parsed, existing.as_ref())?
-            }
-        };
-
-        store.put(&key, &doc)?;
+        self.write_document(collection, doc_id, json_data, DocumentWriteMode::Upsert)
+            .await
+            .map_err(DocumentWriteError::into_anyhow)?;
 
         // `store.put` fires the AutomergeStore observer, which the
         // `forward_store_changes` task re-emits as a `ChangeEvent` on
@@ -1479,6 +2137,77 @@ impl SidecarNode {
         // counting subscribers. The forwarder is the single source of
         // truth for upsert events — local and remote-sync alike.
 
+        Ok(())
+    }
+
+    /// Persist one immutable bridge envelope through the canonical store path.
+    ///
+    /// This is a Rust-only API for native bridge ingress. It deliberately does
+    /// not emit a change directly: the successful `store.put` below remains
+    /// the single source for observer events and local-origin mesh fanout.
+    pub async fn create_bridge_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        envelope_json: &str,
+    ) -> Result<(), CreateBridgeDocumentError> {
+        self.write_document(
+            collection,
+            doc_id,
+            envelope_json,
+            DocumentWriteMode::CreateOnly,
+        )
+        .await
+        .map_err(|error| error.classification())
+    }
+
+    async fn write_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        json_data: &str,
+        mode: DocumentWriteMode,
+    ) -> Result<(), DocumentWriteError> {
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_data).map_err(DocumentWriteError::InvalidInput)?;
+
+        let key = format!("{collection}:{doc_id}");
+        self.record_local_exclusion(collection, doc_id)
+            .await
+            .map_err(|_| DocumentWriteError::Ledger)?;
+        let store = self.backend.store();
+        let _key_guard = store.lock_doc(&key);
+        let existing = store.get(&key).map_err(DocumentWriteError::StoreRead)?;
+        if matches!(mode, DocumentWriteMode::CreateOnly) && existing.is_some() {
+            return Err(DocumentWriteError::AlreadyExists);
+        }
+        let conversion_base = match mode {
+            DocumentWriteMode::Upsert => existing.as_ref(),
+            DocumentWriteMode::CreateOnly => None,
+        };
+
+        let doc = match &self.cipher {
+            Some(cipher) => {
+                // Ciphertext is opaque — wrap in {"value":"<ciphertext>"} so
+                // json_to_automerge has a map root to work with.
+                let ciphertext = cipher
+                    .encrypt(json_data)
+                    .map_err(DocumentWriteError::Encryption)?;
+                let wrapped = serde_json::json!({ "value": ciphertext });
+                json_to_automerge(&wrapped, conversion_base)
+                    .map_err(DocumentWriteError::Conversion)?
+            }
+            None => {
+                // Write JSON directly as structured Automerge fields for
+                // field-level CRDT merging (peat-node#7).
+                json_to_automerge(&parsed, conversion_base)
+                    .map_err(DocumentWriteError::Conversion)?
+            }
+        };
+
+        store
+            .put(&key, &doc)
+            .map_err(DocumentWriteError::StoreWrite)?;
         Ok(())
     }
 
@@ -1512,9 +2241,85 @@ impl SidecarNode {
         }
     }
 
+    /// Bounded canonical document read used by bridge reconciliation.
+    pub(crate) fn get_bridge_document(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if collection.len() > MAX_BRIDGE_IDENTITY_BYTES || doc_id.len() > MAX_BRIDGE_IDENTITY_BYTES
+        {
+            return Ok(None);
+        }
+        let key = format!("{collection}:{doc_id}");
+        let Some(doc) = self.backend.store().get(&key)? else {
+            return Ok(None);
+        };
+        let encoded = doc.save_nocompress();
+        if encoded.len() > MAX_BRIDGE_AUTOMERGE_BYTES {
+            return Ok(None);
+        }
+        drop(encoded);
+        if preflight_event_document(&doc).is_err() {
+            return Ok(None);
+        }
+        let json = automerge_to_json(&doc);
+        let value = if let Some(encrypted) = json
+            .get("value")
+            .and_then(|value| value.as_str())
+            .filter(|value| crate::crypto::is_encrypted(value))
+        {
+            let Some(cipher) = &self.cipher else {
+                return Ok(None);
+            };
+            cipher.decrypt(encrypted)?
+        } else {
+            serde_json::to_string(&json)?
+        };
+        Ok((value.len() <= MAX_BRIDGE_EVENT_JSON_BYTES).then_some(value))
+    }
+
+    /// Hydrate and offer one reconciliation candidate after local-exclusion
+    /// filtering.
+    pub(crate) async fn deliver_bridge_reconciliation_candidate(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        exclusion: &LocalExclusionLedger,
+        coordinator: &DeliveryCoordinator,
+    ) -> Result<CandidateOutcome, CandidateError> {
+        let Some(json_data) = self
+            .get_bridge_document(collection, doc_id)
+            .map_err(|_| CandidateError::Read)?
+        else {
+            return Ok(CandidateOutcome::Missing);
+        };
+        if exclusion
+            .contains(document_digest(collection, doc_id))
+            .await
+            .map_err(|_| CandidateError::Exclusion)?
+        {
+            return Ok(CandidateOutcome::LocalExcluded);
+        }
+        let _ = coordinator
+            .deliver(BridgeChangeEvent {
+                collection: collection.to_owned(),
+                doc_id: doc_id.to_owned(),
+                remote_peer_id: String::new(),
+                json_data,
+            })
+            .await;
+        Ok(CandidateOutcome::Offered)
+    }
+
     pub async fn delete_document(&self, collection: &str, doc_id: &str) -> anyhow::Result<()> {
         let key = format!("{collection}:{doc_id}");
-        self.backend.store().delete(&key)?;
+        self.record_local_exclusion(collection, doc_id)
+            .await
+            .map_err(|_| anyhow::anyhow!("bridge local-exclusion persistence failed"))?;
+        let store = self.backend.store();
+        let _key_guard = store.lock_doc(&key);
+        store.delete(&key)?;
 
         let _ = self.change_tx.send(ChangeEvent {
             collection: collection.to_string(),
@@ -1547,9 +2352,113 @@ impl SidecarNode {
         }
     }
 
+    /// Install the validated mapped-collection set and its journals exactly
+    /// once. An identical second call is idempotent; conflicting mappings are
+    /// rejected before any bridge subscription can be started.
+    pub(crate) async fn install_bridge_ledger(
+        &self,
+        collections: impl IntoIterator<Item = String>,
+    ) -> Result<BridgeLedgerHealth, LedgerError> {
+        let collections: BTreeSet<_> = collections.into_iter().collect();
+        {
+            let installed = self
+                .bridge_ledger
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(installed) = installed.as_ref() {
+                if installed.collections != collections {
+                    return Err(LedgerError::Corrupt);
+                }
+                return Ok(BridgeLedgerHealth {
+                    exclusion_healthy: installed
+                        .exclusion
+                        .as_ref()
+                        .is_some_and(LocalExclusionLedger::is_healthy),
+                    delivery_healthy: installed
+                        .delivery
+                        .as_ref()
+                        .is_some_and(DeliveryLedger::is_healthy),
+                });
+            }
+        }
+
+        let data_dir = self.bridge_ledger_data_dir.clone();
+        let opened = tokio::task::spawn_blocking(move || BridgeLedger::open(&data_dir))
+            .await
+            .map_err(|_| LedgerError::Unavailable)?;
+        let (exclusion, delivery) = match opened {
+            Ok(ledger) => (Some(ledger.exclusion()), Some(ledger.delivery())),
+            Err(LedgerOpenError::Delivery {
+                error: _,
+                exclusion,
+            }) => (Some(exclusion), None),
+            Err(LedgerOpenError::Exclusion(_)) => (None, None),
+        };
+        let health = BridgeLedgerHealth {
+            exclusion_healthy: exclusion
+                .as_ref()
+                .is_some_and(LocalExclusionLedger::is_healthy),
+            delivery_healthy: delivery.as_ref().is_some_and(DeliveryLedger::is_healthy),
+        };
+        let mut installed = self
+            .bridge_ledger
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        *installed = Some(InstalledBridgeLedger {
+            collections,
+            exclusion,
+            delivery,
+        });
+        Ok(health)
+    }
+
+    /// Cloned journal facades for the runtime coordinator and reconciler.
+    pub(crate) fn bridge_ledgers(
+        &self,
+    ) -> Option<(Option<LocalExclusionLedger>, Option<DeliveryLedger>)> {
+        self.bridge_ledger
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|installed| (installed.exclusion.clone(), installed.delivery.clone()))
+    }
+
+    async fn record_local_exclusion(
+        &self,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<(), LedgerError> {
+        let exclusion = {
+            let installed = self
+                .bridge_ledger
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            installed.as_ref().and_then(|installed| {
+                installed
+                    .collections
+                    .contains(collection)
+                    .then(|| installed.exclusion.clone())
+            })
+        };
+        match exclusion {
+            Some(Some(exclusion)) => {
+                exclusion
+                    .record_local_excluded(document_digest(collection, doc_id))
+                    .await
+            }
+            Some(None) => Err(LedgerError::Unavailable),
+            None => Ok(()),
+        }
+    }
+
     /// Subscribe to document changes. Returns a broadcast receiver.
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeEvent> {
         self.change_tx.subscribe()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_bridge_changes(&self) -> broadcast::Receiver<BridgeChangeEvent> {
+        self.bridge_change_tx.subscribe()
     }
 
     // --- Collection Lifecycle Configuration (peat-node#55 / ADR-016) ---
@@ -1586,6 +2495,707 @@ impl SidecarNode {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.backend.blob_store().shutdown().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nats_bridge::config::{BridgeConfig, BridgeConfigIssueKind};
+    use peat_mesh::storage::IROH_DISTRIBUTION_COLLECTION;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static BRIDGE_ALLOC_ENABLED: Cell<bool> = const { Cell::new(false) };
+        static BRIDGE_ALLOC_CURRENT: Cell<i128> = const { Cell::new(0) };
+        static BRIDGE_ALLOC_HIGH_WATER: Cell<i128> = const { Cell::new(0) };
+    }
+
+    struct BridgeTestAllocator;
+
+    fn adjust_bridge_alloc(delta: i128) {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| {
+            if !enabled.get() {
+                return;
+            }
+            BRIDGE_ALLOC_CURRENT.with(|current| {
+                let next = current.get().saturating_add(delta);
+                current.set(next);
+                BRIDGE_ALLOC_HIGH_WATER.with(|high_water| {
+                    high_water.set(high_water.get().max(next));
+                });
+            });
+        });
+    }
+
+    unsafe impl GlobalAlloc for BridgeTestAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                adjust_bridge_alloc(layout.size() as i128);
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                adjust_bridge_alloc(layout.size() as i128);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+            adjust_bridge_alloc(-(layout.size() as i128));
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+            let replacement = unsafe { System.realloc(pointer, old_layout, new_size) };
+            if !replacement.is_null() {
+                adjust_bridge_alloc(new_size as i128 - old_layout.size() as i128);
+            }
+            replacement
+        }
+    }
+
+    #[global_allocator]
+    static BRIDGE_TEST_ALLOCATOR: BridgeTestAllocator = BridgeTestAllocator;
+
+    fn begin_bridge_alloc_accounting() {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(false));
+        BRIDGE_ALLOC_CURRENT.with(|current| current.set(0));
+        BRIDGE_ALLOC_HIGH_WATER.with(|high_water| high_water.set(0));
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(true));
+    }
+
+    fn finish_bridge_alloc_accounting() -> (i128, i128) {
+        BRIDGE_ALLOC_ENABLED.with(|enabled| enabled.set(false));
+        (
+            BRIDGE_ALLOC_CURRENT.with(Cell::get),
+            BRIDGE_ALLOC_HIGH_WATER.with(Cell::get),
+        )
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingNodeChangeEmitter {
+        actions: Arc<Mutex<Vec<(NodeChangePath, NodeChangeRejectKind, u64)>>>,
+    }
+
+    impl NodeChangeEmitter for RecordingNodeChangeEmitter {
+        fn emit(&self, path: NodeChangePath, kind: NodeChangeRejectKind, suppressed: u64) {
+            self.actions.lock().unwrap().push((path, kind, suppressed));
+        }
+    }
+
+    async fn test_node(encrypted: bool) -> (tempfile::TempDir, SidecarNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let encryption_key =
+            encrypted.then(|| base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]));
+        let node = SidecarNode::new(SidecarConfig {
+            node_id: "bridge-test".to_owned(),
+            app_id: "bridge-test".to_owned(),
+            data_dir: dir.path().to_path_buf(),
+            encryption_key,
+            disable_mdns: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        (dir, node)
+    }
+
+    fn put_remote(node: &SidecarNode, key: &str, json: &str, peer: &str) {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let doc = if let Some(cipher) = &node.cipher {
+            let encrypted = cipher.encrypt(json).unwrap();
+            json_to_automerge(&serde_json::json!({ "value": encrypted }), None).unwrap()
+        } else {
+            json_to_automerge(&value, None).unwrap()
+        };
+        let store = node.backend.store();
+        let _guard = store.lock_doc(key);
+        store
+            .put_with_origin(key, &doc, ChangeOrigin::Remote(peer.to_owned()))
+            .unwrap();
+    }
+
+    async fn expect_no_bridge_event(rx: &mut broadcast::Receiver<BridgeChangeEvent>) {
+        assert!(tokio::time::timeout(Duration::from_millis(75), rx.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn bridge_change_remote_plain_and_encrypted_upserts_are_exact() {
+        for encrypted in [false, true] {
+            let (_dir, node) = test_node(encrypted).await;
+            let mut rx = node.subscribe_bridge_changes();
+            let json = r#"{"kind":"peat.nats-bridge","version":1,"subject":"vision.summary","source_node_id":"other","payload":" {\"frame\":1} "}"#;
+            put_remote(&node, "frames:remote-1", json, "peer-immediate");
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event.collection, "frames");
+            assert_eq!(event.doc_id, "remote-1");
+            assert_eq!(event.remote_peer_id, "peer-immediate");
+            if encrypted {
+                assert_eq!(event.json_data, json);
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&event.json_data).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(json).unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_change_local_mutations_and_all_deletes_are_excluded() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        node.put_document("frames", "local", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        node.create_bridge_document("frames", "ingress", r#"{"ingress":true}"#)
+            .await
+            .unwrap();
+        node.delete_document("frames", "local").await.unwrap();
+        {
+            let store = node.backend.store();
+            let key = "frames:remote-delete";
+            let _guard = store.lock_doc(key);
+            store
+                .delete_with_origin(key, ChangeOrigin::Remote("peer-a".to_owned()))
+                .unwrap();
+        }
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_mapped_put_create_and_delete_are_write_ahead_excluded() {
+        let (_dir, node) = test_node(false).await;
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .expect("healthy journals install");
+        assert_eq!(
+            health,
+            BridgeLedgerHealth {
+                exclusion_healthy: true,
+                delivery_healthy: true,
+            }
+        );
+
+        node.put_document("frames", "rpc-put", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        node.create_bridge_document("frames", "nats-create", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        put_remote(
+            &node,
+            "frames:delete-target",
+            r#"{"source_node_id":"foreign"}"#,
+            "peer-a",
+        );
+        node.delete_document("frames", "delete-target")
+            .await
+            .unwrap();
+        node.put_document("unmapped", "plain", r#"{"local":true}"#)
+            .await
+            .unwrap();
+
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .as_ref()
+            .unwrap()
+            .clone();
+        for doc_id in ["rpc-put", "nats-create", "delete-target"] {
+            assert!(exclusion
+                .contains(document_digest("frames", doc_id))
+                .await
+                .unwrap());
+        }
+        assert!(!exclusion
+            .contains(document_digest("unmapped", "plain"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_exclusion_failure_rejects_before_store_mutation() {
+        let (_dir, node) = test_node(false).await;
+        node.install_bridge_ledger(["frames".to_owned()])
+            .await
+            .unwrap();
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .as_ref()
+            .unwrap()
+            .clone();
+        exclusion.stop_for_test();
+
+        let error = node
+            .put_document("frames", "rejected", r#"{"local":true}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bridge local-exclusion persistence failed"
+        );
+        assert!(node
+            .get_document("frames", "rejected")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_delivery_corruption_keeps_excluded_local_ingress_usable() {
+        let (_dir, node) = test_node(false).await;
+        let ledger = BridgeLedger::open(&node.bridge_ledger_data_dir).unwrap();
+        ledger.join().unwrap();
+        let delivery_path = node
+            .bridge_ledger_data_dir
+            .join("nats-bridge-ledger-v1")
+            .join("remote-delivery-v1");
+        let mut bytes = std::fs::read(&delivery_path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&delivery_path, bytes).unwrap();
+
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .expect("delivery corruption preserves exclusion installation");
+        assert!(health.exclusion_healthy);
+        assert!(!health.delivery_healthy);
+        node.create_bridge_document("frames", "after-corruption", r#"{"local":true}"#)
+            .await
+            .unwrap();
+        assert!(node
+            .get_document("frames", "after-corruption")
+            .await
+            .unwrap()
+            .is_some());
+        let exclusion = node
+            .bridge_ledger
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .exclusion
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(exclusion
+            .contains(document_digest("frames", "after-corruption"))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_exclusion_open_failure_rejects_mapped_mutation() {
+        let (_dir, node) = test_node(false).await;
+        let ledger = BridgeLedger::open(&node.bridge_ledger_data_dir).unwrap();
+        ledger.join().unwrap();
+        let exclusion_path = node
+            .bridge_ledger_data_dir
+            .join("nats-bridge-ledger-v1")
+            .join("local-exclusion-v1");
+        let mut bytes = std::fs::read(&exclusion_path).unwrap();
+        bytes[8] ^= 1;
+        std::fs::write(&exclusion_path, bytes).unwrap();
+
+        let health = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .expect("corrupt exclusion installs an explicitly unhealthy facade");
+        assert!(!health.exclusion_healthy);
+        assert!(!health.delivery_healthy);
+
+        let error = node
+            .put_document("frames", "rejected", r#"{"local":true}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "bridge local-exclusion persistence failed"
+        );
+        assert!(node
+            .get_document("frames", "rejected")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_ledger_install_is_idempotent_but_rejects_conflicting_routes() {
+        let (_dir, node) = test_node(false).await;
+        let first = node
+            .install_bridge_ledger(["frames".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            node.install_bridge_ledger(["frames".to_owned()])
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            node.install_bridge_ledger(["other".to_owned()]).await,
+            Err(LedgerError::Corrupt)
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_change_broadcast_is_bounded_and_recovers_after_lag() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        for index in 0..=BRIDGE_CHANGE_CAPACITY {
+            node.bridge_change_tx
+                .send(BridgeChangeEvent {
+                    collection: "frames".to_owned(),
+                    doc_id: index.to_string(),
+                    remote_peer_id: "peer".to_owned(),
+                    json_data: "{}".to_owned(),
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
+        assert!(rx.recv().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bridge_change_oversized_remote_document_is_suppressed_and_later_valid_continues() {
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let oversized = serde_json::json!({
+            "forged": "x".repeat(MAX_BRIDGE_EVENT_JSON_BYTES + 1),
+        });
+        put_remote(
+            &node,
+            "frames:oversized",
+            &serde_json::to_string(&oversized).unwrap(),
+            "peer-a",
+        );
+        put_remote(&node, "frames:later-valid", r#"{"valid":true}"#, "peer-a");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("later valid event must not be stalled")
+            .expect("bridge event channel remains open");
+        assert_eq!(event.doc_id, "later-valid");
+        assert_eq!(event.json_data, r#"{"valid":true}"#);
+        expect_no_bridge_event(&mut rx).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridge_change_large_remote_processing_has_bounded_amplification_and_no_retention() {
+        const FORGED_BYTES: usize = 16 * 1_048_576;
+        let (_dir, node) = test_node(false).await;
+        let mut rx = node.subscribe_bridge_changes();
+        let forged = serde_json::json!({ "forged": "z".repeat(FORGED_BYTES) });
+        put_remote(
+            &node,
+            "frames:allocator-forged",
+            &serde_json::to_string(&forged).unwrap(),
+            "peer-a",
+        );
+        put_remote(
+            &node,
+            "frames:allocator-valid",
+            r#"{"valid":true}"#,
+            "peer-a",
+        );
+
+        // Both notifications are queued before accounting starts. On this
+        // current-thread runtime, the bridge forwarder executes on this same
+        // allocator-accounted thread when recv() yields. The high-water bound
+        // includes pinned AutomergeStore::get's deep clone and the one
+        // uncompressed size-probe Vec. It excludes fixture/store construction.
+        begin_bridge_alloc_accounting();
+        let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("later valid event must continue")
+            .expect("bridge event channel remains open");
+        let (live_delta, high_water) = finish_bridge_alloc_accounting();
+
+        assert_eq!(event.doc_id, "allocator-valid");
+        assert!(
+            high_water >= FORGED_BYTES as i128,
+            "allocator scope did not observe the forged document: {high_water}"
+        );
+        assert!(
+            high_water <= (FORGED_BYTES * 4 + 1_048_576) as i128,
+            "bridge processing amplified one forged document beyond clone + size probe budget: {high_water}"
+        );
+        assert!(
+            live_delta <= 1_048_576,
+            "oversized bridge processing retained forged-document memory: {live_delta}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_and_wide_remote_documents_reject_iteratively_and_both_streams_continue() {
+        let (_dir, node) = test_node(false).await;
+        let mut bridge_rx = node.subscribe_bridge_changes();
+        let mut public_rx = node.subscribe();
+
+        let mut deep = serde_json::json!({"leaf": true});
+        for _ in 0..=MAX_EVENT_DOCUMENT_DEPTH {
+            deep = serde_json::json!({"child": deep});
+        }
+        put_remote(
+            &node,
+            "frames:too-deep",
+            &serde_json::to_string(&deep).unwrap(),
+            "peer-a",
+        );
+
+        let wide = serde_json::json!({
+            "wide": serde_json::Value::Array(
+                (0..=MAX_EVENT_CONTAINER_ENTRIES)
+                    .map(|_| serde_json::json!({}))
+                    .collect(),
+            )
+        });
+        put_remote(
+            &node,
+            "frames:too-wide",
+            &serde_json::to_string(&wide).unwrap(),
+            "peer-a",
+        );
+        put_remote(&node, "frames:shape-valid", r#"{"valid":true}"#, "peer-a");
+
+        let bridge = tokio::time::timeout(Duration::from_secs(10), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let public = tokio::time::timeout(Duration::from_secs(10), public_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bridge.doc_id, "shape-valid");
+        let mut public_doc_ids = vec![public.doc_id];
+        for _ in 0..2 {
+            public_doc_ids.push(
+                tokio::time::timeout(Duration::from_secs(10), public_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .doc_id,
+            );
+        }
+        public_doc_ids.sort();
+        assert_eq!(public_doc_ids, vec!["shape-valid", "too-deep", "too-wide"]);
+        expect_no_bridge_event(&mut bridge_rx).await;
+        assert_eq!(
+            node.node_change_diagnostics.count(
+                NodeChangePath::BridgeRemote,
+                NodeChangeRejectKind::StructuralLimit
+            ),
+            2
+        );
+        assert_eq!(
+            node.node_change_diagnostics.count(
+                NodeChangePath::PublicObserver,
+                NodeChangeRejectKind::StructuralLimit
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn node_change_rejection_diagnostics_count_all_and_rate_limit_by_fixed_path_and_kind() {
+        let emitter = RecordingNodeChangeEmitter::default();
+        let diagnostics = NodeChangeDiagnostics::with_emitter(emitter.clone());
+        let start = Instant::now();
+        for path in [NodeChangePath::PublicObserver, NodeChangePath::BridgeRemote] {
+            diagnostics.record_at(path, NodeChangeRejectKind::StructuralLimit, start);
+            for _ in 0..100 {
+                diagnostics.record_at(
+                    path,
+                    NodeChangeRejectKind::StructuralLimit,
+                    start + Duration::from_secs(59),
+                );
+            }
+            diagnostics.record_at(
+                path,
+                NodeChangeRejectKind::StructuralLimit,
+                start + NODE_CHANGE_WARNING_INTERVAL,
+            );
+            assert_eq!(
+                diagnostics.count(path, NodeChangeRejectKind::StructuralLimit),
+                102
+            );
+        }
+        assert_eq!(
+            emitter.actions.lock().unwrap().as_slice(),
+            [
+                (
+                    NodeChangePath::PublicObserver,
+                    NodeChangeRejectKind::StructuralLimit,
+                    0
+                ),
+                (
+                    NodeChangePath::PublicObserver,
+                    NodeChangeRejectKind::StructuralLimit,
+                    100
+                ),
+                (
+                    NodeChangePath::BridgeRemote,
+                    NodeChangeRejectKind::StructuralLimit,
+                    0
+                ),
+                (
+                    NodeChangePath::BridgeRemote,
+                    NodeChangeRejectKind::StructuralLimit,
+                    100
+                ),
+            ]
+        );
+        assert_eq!(
+            diagnostics.warnings.lock().unwrap().len(),
+            NODE_CHANGE_DIAGNOSTIC_BUCKETS
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_change_reader_facade_supports_reads_without_raw_store_extraction() {
+        let (_dir, node) = test_node(false).await;
+        let mut observer = node.document_store().subscribe_to_observer_changes();
+        node.put_document("frames", "one", r#"{"value":1}"#)
+            .await
+            .unwrap();
+        assert_eq!(observer.recv().await.unwrap(), "frames:one");
+        assert_eq!(
+            node.document_store().get("frames:one").unwrap(),
+            Some(serde_json::json!({"value": 1}))
+        );
+        assert_eq!(
+            node.document_store()
+                .keys_with_prefix("frames:")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            node.document_store().scan_prefix("frames:").unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_change_public_subscription_keeps_remote_upsert_semantics() {
+        let (_dir, node) = test_node(false).await;
+        let mut public_rx = node.subscribe();
+        let mut bridge_rx = node.subscribe_bridge_changes();
+        put_remote(
+            &node,
+            "frames:public-contract",
+            r#"{"remote":true}"#,
+            "peer-a",
+        );
+
+        let public = tokio::time::timeout(Duration::from_secs(2), public_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(public.collection, "frames");
+        assert_eq!(public.doc_id, "public-contract");
+        assert!(matches!(public.change_type, ChangeType::Upsert));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(public.json_data.as_deref().unwrap())
+                .unwrap(),
+            serde_json::json!({"remote": true})
+        );
+
+        let private = tokio::time::timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(private.remote_peer_id, "peer-a");
+    }
+
+    #[test]
+    fn bridge_change_diagnostics_are_fixed_and_payload_safe() {
+        let source = include_str!("node.rs");
+        let diagnostics: Vec<_> = source
+            .lines()
+            .filter(|line| {
+                line.contains("bridge snapshot") || line.contains("bridge change listener")
+            })
+            .collect();
+        assert!(!diagnostics.is_empty());
+        for line in diagnostics {
+            for forbidden in ["json_data", "remote_peer_id", "ciphertext", "{key}", "%key"] {
+                assert!(
+                    !line.contains(forbidden),
+                    "unsafe bridge diagnostic: {line}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_change_reserved_collection_blocks_envelope_shaped_attachment_adversary() {
+        let (_dir, node) = test_node(false).await;
+        let key = format!("{IROH_DISTRIBUTION_COLLECTION}:adversary");
+        let value = serde_json::json!({
+            "kind": "peat.nats-bridge",
+            "version": 1,
+            "subject": "vision.summary",
+            "source_node_id": "remote",
+            "payload": "{\"frame\":1}",
+            "blob_hash": "attachment-like-extra-field"
+        });
+        let doc = json_to_automerge(&value, None).unwrap();
+        node.backend.store().put(&key, &doc).unwrap();
+        assert!(node.backend.store().get(&key).unwrap().is_some());
+
+        let error = BridgeConfig::from_raw(
+            Some("nats://127.0.0.1:4222"),
+            &[format!("vision.summary={IROH_DISTRIBUTION_COLLECTION}")],
+        )
+        .expect_err("internal attachment collection must not create a runtime");
+        assert_eq!(
+            error.issues()[0].kind,
+            BridgeConfigIssueKind::ReservedCollection
+        );
+        assert!(BridgeConfig::from_raw(
+            Some("nats://127.0.0.1:4222"),
+            &["vision.summary=File_Distributions".to_owned()],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn bridge_change_source_inventory_keeps_raw_mutation_private_and_reserved() {
+        let node_source = include_str!("node.rs");
+        let handler_source = include_str!("attachments/handlers.rs");
+        assert!(!node_source.contains(&["pub fn ", "backend("].concat()));
+        assert!(!node_source.contains(&["pub fn ", "raw_store("].concat()));
+        assert!(!node_source.contains(&["pub fn ", "file_distribution("].concat()));
+        assert!(!handler_source.contains("document_store().put"));
+        assert!(!handler_source.contains("document_store().delete"));
+        assert!(node_source.contains("write_attachment_node_status"));
+        assert_eq!(IROH_DISTRIBUTION_COLLECTION, "file_distributions");
     }
 }
 

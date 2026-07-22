@@ -210,6 +210,9 @@ jobs:
         # fails the build with "Could not find protoc".
         uses: arduino/setup-protoc@v3
         with:
+          # Avoid the action's unauthenticated latest-release lookup, which
+          # can fail transiently on hosted Windows runners.
+          version: "23.2"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       # macOS builds the whole workspace; Windows builds peat-cli only.
       # The peat-node root crate uses Unix-only crates (e.g. iroh's

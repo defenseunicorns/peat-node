@@ -3,3 +3,12 @@
 
 # Per-session runtime lockfile from local scheduling tooling — never source-controlled.
 .claude/scheduled_tasks.lock
+
+# Local Obsidian research vault. It is intentionally not source-controlled.
+/peat-node-knowledge-vault/
+
+# GSD planning artifacts are local-only for this feature branch.
+/.planning/
+
+# Local Obsidian workspace metadata is not source-controlled.
+/.obsidian/

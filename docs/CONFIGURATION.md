@@ -98,6 +98,418 @@ Publish the **UDP** `PEAT_NODE_IROH_UDP_PORT` on each host (and open it in the f
 |---|---|---|---|---|
 | `PEAT_NODE_ENCRYPTION_KEY` | `--encryption-key` | base64 | unset | Base64-encoded 32-byte AES-256-GCM key. When set, document payloads are encrypted before storage (Automerge envelope stays unencrypted so sync still works) and decrypted transparently on read. See `src/crypto.rs` for the `ENC:v1:` envelope format. |
 
+## Core NATS bridge (optional)
+
+The bridge is opt-in and uses Core NATS only. With no mappings configured,
+peat-node creates no NATS connection, retry timer, or bridge task. A URL by
+itself is validated but does not enable the subsystem.
+
+| Env var | Flag | Type | Default | Description |
+|---|---|---|---|---|
+| `PEAT_NODE_NATS_URL` | `--nats-url` | URL | unset | Local Core NATS endpoint. Only explicit `nats://` and `tls://` schemes are accepted. URL user-info authentication is permitted. |
+| `PEAT_NODE_NATS_MAPPING` | `--nats-mapping` | `subject=collection` (repeatable; comma-delimited in the environment) | *empty (bridge disabled)* | Literal subject-to-Peat-collection routes. Repeat `--nats-mapping` on the command line or separate environment entries with commas. When both sources are present, CLI mappings replace the environment mappings; they are not merged. |
+
+Example:
+
+```bash
+peat-node \
+  --nats-url 'nats://bridge-user:bridge-password@127.0.0.1:4222' \
+  --nats-mapping vision.summary=vision_frames \
+  --nats-mapping node.health=node_health
+```
+
+Authenticated user-info is retained only for the client connection. The URL
+appears only in the opt-in `--print-config` / `PEAT_NODE_PRINT_CONFIG` resolved
+configuration dump, where the entire user-info is replaced with `<redacted>`;
+ordinary startup output does not render a NATS URL.
+
+Bridge configuration is validated before data-directory or mesh bootstrap.
+Startup reports all detected safe issues together, including blank or
+ambiguous mappings, embedded whitespace, wildcard or reserved subjects,
+collection names outside `[A-Za-z0-9][A-Za-z0-9._-]*`, and exact duplicate
+subjects or collections. Accepted subjects and collections remain exact and
+case-sensitive after outer whitespace trimming. A mapped collection may be at
+most 1,024 bytes. When at least one route enables the bridge, the effective
+node ID must also be non-empty, at most 1,024 bytes, and representable as an
+async-nats header value; this is checked before any data directory, mesh, or
+NATS task is created. The node-ID restriction does not apply when the bridge
+is disabled because no origin header is produced.
+
+Bridge readiness is internal to the bridge subsystem and does not change the
+public `GetStatusResponse` or reinterpret `NodePhase`. The runtime creates one
+generation containing every configured literal subscription, with subscriber
+capacity 1 per mapping, before it attempts to establish readiness. It then
+sends an empty Core NATS request to the reserved
+`_PEAT.NATS_BRIDGE.READINESS` subject with a two-second timeout. A broker
+`503 No Responders` reply (or a normal response) confirms the post-subscription
+round trip; only then are all configured subjects marked established in one
+atomic transition. A timeout or client error leaves readiness false. Messages
+may still be consumed before this barrier completes because readiness is an
+establishment signal, not an ingestion gate. Application mappings cannot use
+the reserved `_PEAT` namespace.
+
+The NATS account used by the bridge must be allowed to subscribe to every
+configured application subject, publish to the exact
+`_PEAT.NATS_BRIDGE.READINESS` subject, and subscribe to its async-nats request
+inbox (`_INBOX.>` in a permission allow-list). The barrier carries an empty
+payload and no application document, credentials, or error detail. It is never
+part of a configured subscription generation and therefore never enters a Peat
+collection or the later egress path. Brokers that deny either request
+permission or do not return a no-responder status when no service is listening
+will leave the bridge not ready.
+
+Readiness is not an authorization guarantee under the pinned async-nats
+0.49.1 client. `subscribe` returns after locally enqueueing `SUB`; the broker
+does not acknowledge that command, and async-nats sends `CONNECT verbose=false`.
+Broker `-ERR` frames are forwarded through async-nats's bounded 128-event
+`try_send` queue, while the later 503 or normal readiness response completes on
+a separate request path. If that upstream queue drops a subscription-permission
+`-ERR`, the outcome is indistinguishable from authorized subscriptions even
+though the bridge invalidates every client/server error that reaches its event
+callback. Operators must provision and independently validate subscribe
+permission for every configured mapping. Under the developer-approved residual
+risk dated 2026-07-15, `ING-01: partial` and internal bridge readiness must not
+be used as proof that every application `SUB` was authorized.
+
+Ingress admits payloads of at most 1,048,576 bytes (1 MiB). A larger frame is
+rejected before the bridge clones it into an ingress item or awaits the shared
+queue; every rejection increments the label-free `oversized_payloads` counter
+and produces only bounded, rate-limited route/length diagnostics. Rejection
+does not stop the subscription reader from accepting a later within-cap frame.
+
+Accepted input is the bounded `serde_json::Value` subset, not every
+grammar-valid JSON value. Default recursion protection accepts at most 127
+nested arrays/objects and rejects the 128th. Numbers must fit serde_json's
+enabled `Number` modes, including finite `f64` fallback (`1e308` is accepted;
+`1e309` is rejected). Every accepted UTF-8 JSON message creates one immutable
+Peat document with a fresh UUID v4. The five-field envelope contains fixed
+`kind`, numeric `version`, literal `subject`, effective operator-visible
+`source_node_id`, and `payload`; the payload preserves every accepted byte,
+including whitespace, key order, numeric spelling, escapes, and Unicode.
+
+For `M` configured mappings and a compliant broker, **1 MiB × (257 + 2M)** is
+the **bridge-owned post-dispatch raw-body subtotal** only: 256 bodies in the
+shared FIFO, one serial processor `IngressItem`, and per mapping at most one
+blocked-reader clone plus one capacity-1 async-nats subscriber body. This is
+not a maximum total raw-body value, a process-memory bound, or a memory
+ceiling. Readers await shared FIFO capacity rather than deliberately dropping
+at that boundary.
+
+Before dispatch and before the bridge can inspect or enforce its 1 MiB policy,
+async-nats connection parser/read buffering retains the broker-declared
+transport frame. That pre-policy retention is additional to the subtotal.
+Consequently a hostile or misbehaving broker has no strict bridge-enforced
+bound on total raw-body or process retention; broker payload policy remains an
+operational requirement.
+
+The active serial processor also has payload-dependent transient allocations:
+its raw `Vec`, the serde_json validation tree, the copied
+`BridgeEnvelope.payload` `String`, the escaped serialized-envelope `String`,
+the node-side parsed `Value`, optional ciphertext/base64/wrapper values, and
+Automerge conversion/document allocations. Serial processing limits this
+amplification to one active item. Small fixed route/item structs and allocator
+metadata are separate fixed overhead; none of the payload-dependent terms
+above is included in that label.
+
+The regression budget for this one-active-item work is a
+**scoped Rust-global-allocator live-byte delta** of 41,943,040 bytes (40 MiB).
+The 2026-07-15 calibration maximum was 32,863,033 bytes, so the committed
+threshold adds 9,080,007 bytes (27.6%) of conservative allocator/platform
+headroom. Reproduce the ordinary fixed-threshold assertion with:
+
+```bash
+cargo test --test nats_bridge_memory_test -- --nocapture
+```
+
+Recalibration is intentionally separate and ignored by default:
+
+```bash
+cargo test --test nats_bridge_memory_test calibrate_scoped_allocator_delta -- --ignored --nocapture
+```
+
+The scoped measurement covers only Rust global-allocator activity on the
+enabled current OS thread during a no-yield window. It explicitly excludes
+mmap allocations, native-library and kernel buffers, allocations on other OS
+threads, RSS, async-nats transport retention, and whole-process memory; it is
+not a transport or process-memory bound.
+
+### Remote-origin egress and loop safety
+
+The bridge publishes only a private node event classified as a remote Peat
+upsert. Local NATS ingress, local `PutDocument`/`DeleteDocument` operations,
+all deletes and tombstones, and other local mutations never enter that event
+stream. A remote document is eligible only when its stored envelope has the
+exact `peat.nats-bridge` kind and numeric version `1`, its collection is a
+configured route, its envelope subject exactly and case-sensitively matches
+that route, and its durable `source_node_id` differs from the receiving node's
+ID. Ordinary JSON, malformed or unsupported envelopes, route mismatches, and
+documents returning to their durable source are skipped. The immediate Peat
+peer is diagnostic transport context only; it is never trusted as durable
+provenance.
+
+The eligible envelope's `payload` string is moved directly to the configured
+Core NATS subject as bytes. It is never parsed or reserialized on egress. The
+wire body therefore contains no Peat envelope, document ID, timestamp, source
+identity, or transformation. One serial worker publishes events in their
+observed FIFO order; concurrent Peat activity and event loss mean this is not
+a global or durable ordering guarantee.
+
+Each publication has exactly one private
+`Peat-Nats-Bridge-Origin: <local-node-id>` header. Ingress suppresses a message
+only when that header has exactly one value and it equals the local node ID
+byte-for-byte. An absent header, a foreign/case-variant/empty/unfamiliar value,
+or repeated values are accepted as ordinary input. The marker is deliberately
+unauthenticated: an application able to publish the exact local value can
+cause that local message to be dropped. The shared async-nats connection also
+uses `no_echo` (`CONNECT echo=false`) as defense in depth; `no_echo` alone does
+not protect another connection and does not replace the exact marker check.
+
+The remote event broadcast retains at most 256 pending events. Before an event
+enters that ring, its serialized document is capped at 2,101,248 bytes and
+each retained collection, document, and immediate-peer identity is capped at
+1,024 bytes; an over-limit remote document is skipped and later valid changes
+continue. The allowance preserves a 1,048,576-byte ingress payload even when
+its JSON string needs escaping in the durable envelope while preventing the
+broadcast from retaining attacker-sized documents or identities. The egress
+FIFO retains at most 256 eligible payloads of at most 1,048,576 bytes each.
+Collection, document, and immediate-peer identity limits are checked before
+the bridge reads the store. Before recursive Automerge-to-JSON hydration, the
+bridge also rejects a `save_nocompress()` representation larger than 8 MiB.
+It then performs a non-recursive Automerge traversal with these exact ceilings:
+depth 64, 4,096 objects, 4,096 entries in any one map/list, 65,536 entries
+across the document, 2 MiB of string/byte scalar data, and a conservative
+12,607,488-byte JSON-output proxy. These gates protect the private remote
+bridge forwarder only. The existing public `Subscribe` observer retains its
+prior document-shape and size behavior; bridge admission limits do not
+silently change delivery to existing Subscribe clients. A rejected deep, wide,
+or otherwise over-limit remote document emits no bridge event, and the bridge
+forwarder continues with later valid changes. This prevents an admitted remote
+document from reaching the recursive JSON converter with attacker-controlled
+structure.
+
+The pinned peat-mesh/Automerge API has an explicit residual limitation:
+`DocChange` carries only a key and origin, `AutomergeStore::get()` deep-clones
+the cached document, and there is no borrowed store read, encoded-size
+metadata, bounded iterator, or limited serializer. `save_nocompress()` itself
+also returns a newly allocated full-document vector. Consequently those two
+pre-gate transient allocations can scale with an attacker-controlled stored
+document even though they are dropped immediately and never enter bridge
+queues. A current-thread allocator regression uses a 16 MiB forged remote
+document to bound observed amplification to four document sizes plus 1 MiB,
+prove no more than 1 MiB remains live after rejection, and verify a later
+valid event continues. Eliminating the two inherited transient allocations
+requires a new bounded/borrowed peat-mesh store API and is not an RSS or
+whole-process memory guarantee. peat-node directly names the already locked
+`automerge = 0.9.0` package so it can use the read-only iterator API for this
+preflight; the exact version matches peat-mesh and introduces no second
+Automerge version.
+
+Admission from the Peat listener is non-blocking. Broadcast lag, queue-full,
+queue-closed, unavailable-client, publish, flush, and negotiated `max_payload`
+failures are terminal losses for the already-reserved document; later events
+continue. There is no per-item retry or disconnected publication backlog.
+Success means async-nats accepted the publish, the bounded bridge flush
+completed, and the local delivery journal reached `Completed`; neither flush
+nor drain is a broker or subscriber delivery acknowledgement. The two
+supervisor signal FIFOs each hold 64 events, each configured async-nats
+subscriber holds one message, the shared ingress FIFO holds 256, the private
+and public node broadcasts each hold 256, and lifecycle/readiness use watch
+channels that retain only their latest snapshot. The pinned async-nats client
+separately uses its bounded 128-event callback queue described above.
+
+Egress classification and delivery counters remain label-free monotonic
+counters. Diagnostic emission allocates exactly 16 fixed classification
+buckets for route-less events plus 16 buckets for each finite validated
+startup route. The first event is emitted, subsequent events in the same
+classification and route are aggregated for 60 seconds, and the next periodic
+event reports the suppressed count. Cross-route floods cannot be attributed
+to another route; route-less broadcast lag remains explicitly route-less and
+is never rendered as route zero. No document, peer, payload, marker,
+credential, parser text, or source error becomes a diagnostic label. A
+delivery diagnostic carries the finite validated startup route index preserved
+with its FIFO item; it does not infer or default the route after publication.
+
+Node-side event rejection has a separate fixed table of 16 counters and 16
+warning buckets: eight rejection kinds for each of the public-observer and
+private-bridge paths. Every rejection increments its monotonic counter. The
+first warning for a path/kind pair is immediate, later warnings are suppressed
+for a fixed 60-second interval, and the next event reports the aggregate
+suppressed count. These diagnostics retain and render only the two fixed enums
+and the count; document keys, collection/document/peer identities, payloads,
+stored values, and error text are never labels or log fields.
+
+The required origin header counts toward the broker's negotiated
+`max_payload`. Consequently an exact 1,048,576-byte message accepted on
+ingress can be rejected on egress by a broker whose `max_payload` is also
+1,048,576, because the HPUB header block increases the total publish size.
+Provision broker headroom for the NATS header. The bridge reports a fixed
+`max_payload` loss classification and never truncates, rewrites, or retries the
+payload.
+
+Remote duplicate suppression is persistent and node-local. It is described in
+[Delivery ledger and reconciliation](#delivery-ledger-and-reconciliation).
+
+Before 1.0, `SidecarNode::document_store()` changed from a mutable raw-store
+handle to `DocumentStoreReader`. Existing reads (`get`, `scan_prefix`,
+`keys_with_prefix`, and observer subscription) remain available, but callers
+can no longer recover the backing `AutomergeStore` or call raw `put`/`delete`.
+This closes the public mutation path that could bypass local-origin
+attribution.
+
+The exact, case-sensitive collection name `file_distributions` is reserved and
+rejected in NATS bridge mappings. Public `IrohFileDistribution`/attachment
+mutation can preserve arbitrary pre-existing root fields, including content
+that resembles a bridge envelope, so this boundary must not depend on a fixed
+attachment schema or unknown-field rejection. The attachment mutation facade
+is restricted to that canonical collection. Inventory found no other public
+facade that mutates document collections: watcher writes are mediated through
+the node, while blob and bundle APIs do not mutate Automerge documents.
+
+Egress logs and metrics use fixed enums, monotonic label-free counters,
+startup-bounded route indexes, and byte counts. They do not include payload or
+envelope text, origin-header values, peer or document IDs, credentials,
+untrusted NATS/store/parser error text, or error chains.
+
+Core NATS remains at-most-once: sustained overload can still trigger client
+slow-consumer loss. Such events are counted and warned about at a rate-limited
+cadence without changing readiness, and lost Core NATS messages cannot be
+replayed.
+
+Peat storage is serial and preserves FIFO processing. The envelope is stored
+and synchronized through the existing Peat document path; it is not published
+to NATS. A transient store failure gets three total attempts using the same
+generated document ID and envelope, with 50 ms then 200 ms delays. Final loss
+is reported once with only safe route metadata, payload byte length, document
+ID, bounded attempt values, and a fixed error classification. Payload text,
+NATS credentials, unrestricted parser or store errors, parser source text, and
+source chains are never logged. Invalid UTF-8, malformed JSON, excessive
+nesting, and out-of-range numbers are counted safely and never stored or
+relayed.
+
+### Delivery ledger and reconciliation
+
+The bridge anchors a fixed `nats-bridge-ledger-v1` directory beneath
+`PEAT_NODE_DATA_DIR` and opens it through a directory file descriptor with
+no-follow checks on every path component, the directory, child, and active
+file. It never follows or replaces a symlink supplied at those boundaries.
+The directory contains two independent version-1 journals:
+
+- `local-exclusion-v1` contains only `LocalExcluded`. A mapped local mutation
+  first awaits this durable record, then takes the peat-mesh document guard and
+  performs the non-awaiting store mutation. No `.await` occurs while that
+  standard lock is held. If the exclusion writer is unhealthy, the mapped
+  mutation stores nothing.
+- `remote-delivery-v1` contains `Reserved` and `Completed`. An eligible remote
+  document is durably `Reserved` before FIFO admission or NATS publication and
+  becomes `Completed` only after publish acceptance and the bounded flush.
+
+The files retain fixed 32-byte, domain-separated, length-framed SHA-256
+digests of `(collection, document ID)`, never the raw values. Each journal
+accepts at most 262,144 unique entries and 524,288 fixed 80-byte records; the
+maximum active file is 41,943,072 bytes. Each journal worker has a fixed
+64-command queue. Compaction writes and syncs a replacement, syncs the
+directory, then reopens the anchored active file. A torn final record is
+truncated to the last complete verified record. Complete corruption is
+preserved for operator recovery and is never silently rebuilt.
+
+Exclusion and delivery health are deliberately isolated. Delivery open,
+write, sync, corruption, or capacity failure clears remote readiness and stops
+egress and reconciliation, but a healthy exclusion writer may still admit
+local ingress after its durable `LocalExcluded` record. Exclusion failure
+rejects mapped local mutation; it is never bypassed merely to keep ingestion
+available.
+
+Reserve-first is the selected at-most-once crash tradeoff. A crash after
+`Reserved` but before publish, flush, or `Completed` leaves an uncertain entry
+that is suppressed after restart. That is a documented loss window, not a
+retry. Publishing before reservation would choose a duplicate window and is
+not this implementation. Core NATS still supplies no durable input, replay,
+subscriber acknowledgement, global ordering, or exactly-once delivery.
+
+One single-flight reconciliation scanner runs after startup readiness, after
+reconnect readiness, and after detected private-event lag. Repeated triggers
+coalesce. It processes retained bridge work in 64-key batches, hydrates at
+most 16 documents per second, holds one body at a time, and yields between
+batches. The pinned peat-mesh `keys_with_prefix` API first returns one complete
+whole-key vector per collection. That inherited transient is explicitly not
+bounded by the 64-key bridge batch and is not a process-memory or RSS ceiling.
+
+Reconciliation treats durable `LocalExcluded`, `Reserved`, and `Completed`
+entries as suppressed. A missing local exclusion is not proof of remote
+origin: bridge-shaped documents created before this journal existed remain
+ambiguous during an upgrade and can be considered eligible. A foreign
+`source_node_id` is envelope provenance, not historical origin proof. After
+upgrade, canonical local ingress and RPC mutations record exclusion before the
+store change and therefore remain excluded across restart.
+
+### Bridge shutdown and operational observations
+
+`PEAT_NODE_NATS_SHUTDOWN_TIMEOUT_SECS` /
+`--nats-shutdown-timeout-secs` is one total shutdown budget, default 10
+seconds, startup-validated from 1 through 300 seconds. Shutdown immediately
+clears readiness and admission, closes reconciliation triggers, and stops
+reconnect work. Every subsequent producer stop, admitted ingress/egress drain,
+client flush, client drain, consumer join, and exclusion/delivery worker join
+consumes the same absolute deadline; stages do not receive fresh timeouts.
+Shutdown never starts a reconciliation scan.
+
+At deadline expiry, remaining controlled Tokio tasks are aborted and joined,
+node cleanup continues, and shutdown returns a fixed payload-safe failure.
+Ledger workers cooperate with stop/join, but a regular-file kernel syscall
+cannot be forcibly cancelled. If it does not return within the shared budget,
+`LedgerIoUnjoined` identifies the exclusion or delivery worker. Such a report
+is non-clean and never claims zero surviving work. A Core NATS flush or drain
+remains transport lifecycle work, not subscriber acknowledgement.
+
+No Connect proto, status field, or metrics endpoint is added. The enabled
+bridge exposes one internal typed, fixed-cardinality cumulative snapshot and
+structured tracing. It emits serious readiness/lifecycle transitions
+immediately, a cumulative summary every 60 seconds with missed ticks skipped,
+and exactly one final snapshot after controlled producers and consumers stop
+and shutdown counters settle. A disabled bridge creates no observation task
+or emission. Counters reset on process restart; only the journals persist.
+
+The label-free counters cover received, stored, invalid input,
+self-suppressed, final store failure, slow consumer, completed
+remote-published, publish/flush/max-payload failure, reconnect (excluding the
+initial connect), exact event lag, queue loss, ledger failure and uncertain
+reservation outcomes, reconciliation trigger/coalescing/scan/hydration/
+suppression/failure, and clean/failure/timeout/abort/unjoined shutdown
+outcomes. Readiness separately exposes accepting, connected, subscription,
+delivery-health, and exclusion-health inputs. Logs contain only fixed enums,
+booleans, and cumulative integers; subjects, document IDs, peers, payloads,
+credentials, marker values, raw errors, and other attacker-controlled labels
+are excluded.
+
+This Core NATS bridge provides no durable input, subscriber acknowledgement,
+replay, global ordering, exactly-once delivery, or zero-loss overload
+guarantee; JetStream is out of scope.
+
+### Executable validation and edge smoke
+
+The bridge's delivery contract is Core NATS at-most-once. In one place, the
+complete REL-04 exclusions are: no durable input, replay, subscriber
+acknowledgement or subscriber-delivery proof, global ordering, exactly-once
+delivery, or zero-loss overload guarantee. Peat document persistence and
+reconciliation do not upgrade Core NATS into any of those mechanisms.
+Publish, flush, and drain are transport lifecycle signals, not subscriber
+acknowledgement. JetStream remains out of scope.
+
+Validation is split deliberately by evidence level:
+
+- Automated TEST-03 is `./test/nats-bridge-e2e.sh`; it owns the bounded local
+  lifecycle and produces a single PASS/FAIL result.
+- The [local Compose walkthrough](../examples/compose/nats-bridge/README.md)
+  expands that same topology and proof for inspection and troubleshooting.
+- Physical TEST-04 is the
+  [Jetson and second-host smoke guide](NATS_BRIDGE_EDGE_SMOKE.md). Its run
+  record must come from the two actual hosts; TEST-03 is not a substitute.
+
+These observations demonstrate only the run performed. Reserve-first remains
+the documented uncertain suppressed loss window, not a retry, and neither
+validation path implies durable, acknowledged, ordered, at-least-once, or
+exactly-once subscriber delivery.
+
 ## Agent watcher (optional)
 
 The watcher polls a co-located service (e.g. UDS Remote Agent) and mirrors its
