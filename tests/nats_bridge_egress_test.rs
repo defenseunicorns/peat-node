@@ -19,24 +19,23 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Instant};
+use tokio::time::timeout;
 
-const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
-const NO_PUBLISH_WINDOW: Duration = Duration::from_millis(300);
 const BARRIER_SUBJECT: &str = "_PEAT.NATS_BRIDGE.READINESS";
 const ORIGIN_HEADER: &str = "Peat-Nats-Bridge-Origin";
 const INFO: &[u8] = b"INFO {\"server_id\":\"PEATTEST0000000000000000000000000000000000000000000000000000\",\"server_name\":\"peat-egress-test\",\"version\":\"2.10.0\",\"proto\":1,\"host\":\"127.0.0.1\",\"port\":4222,\"max_payload\":2097152,\"headers\":true}\r\n";
 
 #[derive(Debug)]
 enum PeerCommand {
+    ReleaseBarrier,
     Inject { subject: String, payload: Vec<u8> },
     Stop,
 }
 
 #[derive(Debug)]
 enum PeerEvent {
-    Ready,
+    BarrierObserved,
     Publish {
         subject: String,
         headers: Vec<u8>,
@@ -74,60 +73,68 @@ impl ScriptedNats {
         }
     }
 
-    async fn wait_ready(&mut self) {
-        assert!(matches!(
-            timeout(STEP_TIMEOUT, self.events.recv())
-                .await
-                .expect("NATS readiness timeout"),
-            Some(PeerEvent::Ready)
-        ));
+    async fn next_event(&mut self) -> PeerEvent {
+        match self.events.recv().await {
+            Some(event) => event,
+            None => {
+                let result = (&mut self.task).await;
+                panic!("scripted NATS peer stopped before the expected event: {result:?}");
+            }
+        }
     }
 
-    async fn inject(&self, subject: &str, payload: &[u8]) {
-        timeout(
-            STEP_TIMEOUT,
-            self.commands.send(PeerCommand::Inject {
-                subject: subject.to_owned(),
-                payload: payload.to_vec(),
-            }),
-        )
-        .await
-        .expect("NATS inject timeout")
-        .expect("scripted NATS peer active");
+    async fn send_command(&mut self, command: PeerCommand) {
+        if self.commands.send(command).await.is_err() {
+            let result = (&mut self.task).await;
+            panic!("scripted NATS peer stopped before the expected command: {result:?}");
+        }
+    }
+
+    async fn wait_barrier(&mut self) {
+        assert!(
+            matches!(self.next_event().await, PeerEvent::BarrierObserved),
+            "NATS publication preceded the readiness barrier"
+        );
+    }
+
+    async fn release_barrier(&mut self) {
+        self.send_command(PeerCommand::ReleaseBarrier).await;
+    }
+
+    async fn inject(&mut self, subject: &str, payload: &[u8]) {
+        self.send_command(PeerCommand::Inject {
+            subject: subject.to_owned(),
+            payload: payload.to_vec(),
+        })
+        .await;
     }
 
     async fn next_publish(&mut self) -> (String, Vec<u8>, Vec<u8>) {
-        match timeout(STEP_TIMEOUT, self.events.recv())
-            .await
-            .expect("HPUB timeout")
-            .expect("scripted NATS peer active")
-        {
+        match self.next_event().await {
             PeerEvent::Publish {
                 subject,
                 headers,
                 payload,
             } => (subject, headers, payload),
-            PeerEvent::Ready => panic!("duplicate readiness event"),
+            PeerEvent::BarrierObserved => panic!("duplicate readiness barrier"),
         }
     }
 
-    async fn assert_no_publish(&mut self) {
-        match timeout(NO_PUBLISH_WINDOW, self.events.recv()).await {
-            Err(_) => {}
-            Ok(Some(PeerEvent::Publish { .. })) => panic!("unexpected local NATS publication"),
-            Ok(Some(PeerEvent::Ready)) => panic!("duplicate readiness event"),
-            Ok(None) => panic!("scripted NATS peer stopped"),
+    fn assert_no_buffered_publish(&mut self) {
+        match self.events.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                panic!("scripted NATS peer stopped")
+            }
+            Ok(PeerEvent::Publish { .. }) => panic!("unexpected NATS publication"),
+            Ok(PeerEvent::BarrierObserved) => panic!("duplicate readiness barrier"),
         }
     }
 
     async fn finish(mut self) {
-        self.commands
-            .send(PeerCommand::Stop)
+        self.send_command(PeerCommand::Stop).await;
+        (&mut self.task)
             .await
-            .expect("scripted NATS peer active");
-        timeout(STEP_TIMEOUT, &mut self.task)
-            .await
-            .expect("scripted NATS shutdown timeout")
             .expect("scripted NATS task panicked")
             .expect("scripted NATS protocol error");
     }
@@ -157,9 +164,7 @@ async fn run_nats_peer(
     mut commands: mpsc::Receiver<PeerCommand>,
     events: mpsc::Sender<PeerEvent>,
 ) -> io::Result<()> {
-    let (stream, _) = timeout(STEP_TIMEOUT, listener.accept())
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "accept timeout"))??;
+    let (stream, _) = listener.accept().await?;
     run_nats_connection(stream, &mut commands, &events).await
 }
 
@@ -187,6 +192,9 @@ async fn run_nats_connection(
                     writer.write_all(b"\r\n").await?;
                     writer.flush().await?;
                 }
+                Some(PeerCommand::ReleaseBarrier) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate barrier release"));
+                }
                 Some(PeerCommand::Stop) | None => return Ok(()),
             },
             frame = read_client_frame(&mut reader) => match frame? {
@@ -199,19 +207,36 @@ async fn run_nats_connection(
                     writer.flush().await?;
                 }
                 ClientFrame::Request { reply } => {
+                    if ready {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "duplicate readiness request",
+                        ));
+                    }
                     let reply_sid = subscriptions
                         .iter()
                         .find_map(|(subject, sid)| subject.strip_suffix('*').is_some_and(|prefix| reply.starts_with(prefix)).then_some(sid))
                         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing reply subscription"))?;
+                    events
+                        .send(PeerEvent::BarrierObserved)
+                        .await
+                        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event receiver dropped"))?;
+                    match commands.recv().await {
+                        Some(PeerCommand::ReleaseBarrier) => {}
+                        Some(PeerCommand::Stop) | None => return Ok(()),
+                        Some(PeerCommand::Inject { .. }) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "injection preceded barrier release",
+                            ));
+                        }
+                    }
                     const STATUS: &[u8] = b"NATS/1.0 503\r\n\r\n";
                     writer.write_all(format!("HMSG {reply} {reply_sid} {} {}\r\n", STATUS.len(), STATUS.len()).as_bytes()).await?;
                     writer.write_all(STATUS).await?;
                     writer.write_all(b"\r\n").await?;
                     writer.flush().await?;
-                    if !ready {
-                        ready = true;
-                        events.send(PeerEvent::Ready).await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event receiver dropped"))?;
-                    }
+                    ready = true;
                 }
                 ClientFrame::Publish { subject, headers, payload } => {
                     events.send(PeerEvent::Publish { subject, headers, payload }).await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "event receiver dropped"))?;
@@ -226,9 +251,7 @@ where
     R: AsyncBufReadExt + Unpin,
 {
     let mut line = Vec::new();
-    let count = timeout(STEP_TIMEOUT, reader.read_until(b'\n', &mut line))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "client frame timeout"))??;
+    let count = reader.read_until(b'\n', &mut line).await?;
     if count == 0 || line.len() > 8192 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -332,18 +355,19 @@ async fn mesh_node(node_id: &str, directory: &std::path::Path) -> Arc<SidecarNod
 }
 
 async fn wait_runtime_ready(handle: &BridgeRuntimeHandle) {
-    let deadline = Instant::now() + STEP_TIMEOUT;
-    while !handle.readiness().snapshot().is_ready() {
-        assert!(
-            Instant::now() < deadline,
-            "bridge runtime did not become ready"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut status = handle.readiness().subscribe();
+    loop {
+        if status.borrow().is_ready() {
+            return;
+        }
+        status
+            .changed()
+            .await
+            .expect("bridge readiness publisher stopped");
     }
 }
 
 async fn wait_document(node: &SidecarNode, collection: &str, doc_id: &str, present: bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let found = node
             .get_document(collection, doc_id)
@@ -353,11 +377,50 @@ async fn wait_document(node: &SidecarNode, collection: &str, doc_id: &str, prese
         if found == present {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "document synchronization timeout for {collection}/{doc_id} (present={present})"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_connected(node_a: &SidecarNode, node_b: &SidecarNode) {
+    while node_a.connected_peer_count() == 0 || node_b.connected_peer_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_ingress_stored(handle: &BridgeRuntimeHandle) {
+    while handle.stats().snapshot().stored == 0 {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_egress_published(handle: &BridgeRuntimeHandle, expected: u64) {
+    while handle.egress_snapshot().published < expected {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        handle.egress_snapshot().published,
+        expected,
+        "unexpected number of terminal egress publications"
+    );
+}
+
+async fn wait_document_contains(
+    node: &SidecarNode,
+    collection: &str,
+    doc_id: &str,
+    expected: &str,
+) {
+    loop {
+        if node
+            .get_document(collection, doc_id)
+            .await
+            .expect("read synchronized document")
+            .as_deref()
+            .is_some_and(|json| json.contains(expected))
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -382,22 +445,24 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
         let dir_b = tempfile::tempdir().expect("node B directory");
         let node_a = mesh_node("node-a", dir_a.path()).await;
         let node_b = mesh_node("node-b", dir_b.path()).await;
-        let runtime_a = BridgeRuntime::spawn(
-            enabled_config(&nats_a.url),
-            "node-a".to_owned(),
-            Arc::clone(&node_a),
-        )
-        .await;
-        let runtime_b = BridgeRuntime::spawn(
-            enabled_config(&nats_b.url),
-            "node-b".to_owned(),
-            Arc::clone(&node_b),
-        )
-        .await;
-        nats_a.wait_ready().await;
-        nats_b.wait_ready().await;
-        wait_runtime_ready(&runtime_a).await;
-        wait_runtime_ready(&runtime_b).await;
+        let (runtime_a, runtime_b) = tokio::join!(
+            BridgeRuntime::spawn(
+                enabled_config(&nats_a.url),
+                "node-a".to_owned(),
+                Arc::clone(&node_a),
+            ),
+            BridgeRuntime::spawn(
+                enabled_config(&nats_b.url),
+                "node-b".to_owned(),
+                Arc::clone(&node_b),
+            ),
+        );
+        tokio::join!(nats_a.wait_barrier(), nats_b.wait_barrier());
+        tokio::join!(nats_a.release_barrier(), nats_b.release_barrier());
+        tokio::join!(
+            wait_runtime_ready(&runtime_a),
+            wait_runtime_ready(&runtime_b)
+        );
 
         let a_port = node_a.bound_udp_port().expect("node A UDP port");
         node_b
@@ -408,22 +473,14 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             )
             .await
             .expect("connect B to A");
-        let peer_deadline = Instant::now() + STEP_TIMEOUT;
-        while node_a.connected_peer_count() == 0 || node_b.connected_peer_count() == 0 {
-            assert!(
-                Instant::now() < peer_deadline,
-                "Peat handshake did not settle"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        // Match the canonical sync integration fixture: transport attachment
-        // can precede coordinator readiness by a short interval.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        wait_connected(&node_a, &node_b).await;
         node_a.start_sync().await.expect("start A sync");
         node_b.start_sync().await.expect("start B sync");
 
         // The methods below are the exact SidecarNode methods dispatched by
         // PutDocument/DeleteDocument; no test-only raw-store mutation is used.
+        // The first later remote publication is the causal fence proving these
+        // earlier local operations emitted no NATS frames.
         node_b
             .put_document("frames", "local-rpc", r#"{"local":true}"#)
             .await
@@ -443,15 +500,7 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
         nats_b
             .inject("vision.summary", br#"{"local_ingress":true}"#)
             .await;
-        let ingress_deadline = Instant::now() + STEP_TIMEOUT;
-        while runtime_b.stats().snapshot().stored == 0 {
-            assert!(
-                Instant::now() < ingress_deadline,
-                "local ingress was not stored"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        nats_b.assert_no_publish().await;
+        wait_ingress_stored(&runtime_b).await;
 
         for (doc_id, document) in [
             ("ordinary", r#"{"ordinary":true}"#.to_owned()),
@@ -480,11 +529,11 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
                 .await
                 .expect("remote negative write");
             wait_document(&node_b, "frames", doc_id, true).await;
-            nats_b.assert_no_publish().await;
         }
 
         // A real Remote(node-a) arrival is suppressed because its durable
-        // source is node-b. This is not described as an ordinary fanout echo.
+        // source is node-b. The following valid publication is the causal
+        // fence for this and every earlier negative event.
         node_a
             .create_bridge_document(
                 "frames",
@@ -494,22 +543,8 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             .await
             .expect("receiver-sourced envelope");
         wait_document(&node_b, "frames", "receiver-sourced", true).await;
-        nats_b.assert_no_publish().await;
-        node_a
-            .delete_document("frames", "receiver-sourced")
-            .await
-            .expect("remote tombstone");
-        node_a.start_sync().await.expect("flush remote tombstone");
-        node_b.start_sync().await.expect("receive remote tombstone");
-        // The node-level remote-origin test deterministically injects
-        // delete_with_origin and proves the private stream excludes the
-        // tombstone. Here the real transport assertion is intentionally only
-        // that a delete never becomes HPUB: absence replication timing is an
-        // upstream Peat concern and is not used as the egress oracle.
-        nats_b.assert_no_publish().await;
 
         let exact = "  {\"frame\":1.0,\"label\":\"\\u03bb\"}\n\t ";
-        let a_published_before = runtime_a.egress_snapshot().published;
         node_a
             .create_bridge_document(
                 "frames",
@@ -526,15 +561,10 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             headers,
             b"NATS/1.0\r\nPeat-Nats-Bridge-Origin: node-b\r\n\r\n"
         );
-        assert_eq!(
-            runtime_a.egress_snapshot().published,
-            a_published_before,
-            "node A's local creation must not publish on node A"
-        );
-        assert_eq!(runtime_b.egress_snapshot().published, 1);
+        wait_egress_published(&runtime_b, 1).await;
 
         // A second remote change notification for the same document key is
-        // terminally suppressed by process-lifetime deduplication.
+        // terminally suppressed by durable deduplication.
         node_a
             .put_document(
                 "frames",
@@ -543,21 +573,7 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             )
             .await
             .expect("duplicate remote notification");
-        let duplicate_deadline = Instant::now() + Duration::from_secs(20);
-        while node_b
-            .get_document("frames", "remote-valid")
-            .await
-            .expect("read duplicate")
-            .as_deref()
-            .is_none_or(|json| !json.contains("duplicate"))
-        {
-            assert!(
-                Instant::now() < duplicate_deadline,
-                "duplicate update did not synchronize"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        nats_b.assert_no_publish().await;
+        wait_document_contains(&node_b, "frames", "remote-valid", "duplicate").await;
 
         let later = r#"{"later_valid":true}"#;
         node_a
@@ -576,14 +592,69 @@ async fn real_sync_is_remote_only_byte_exact_and_fail_closed() {
             headers,
             format!("NATS/1.0\r\n{ORIGIN_HEADER}: node-b\r\n\r\n").as_bytes()
         );
-        assert_eq!(runtime_b.egress_snapshot().published, 2);
-        assert_eq!(runtime_b.egress_snapshot().publish_failed, 0);
-        let operations = runtime_b.operations_snapshot();
-        assert_eq!(operations.remote_published, 2);
-        assert_eq!(operations.publish_failures, 0);
-        assert_eq!(operations.queue_loss, 0);
-        assert_eq!(operations.ledger_failures, 0);
-        assert!(operations.ready);
+        wait_egress_published(&runtime_b, 2).await;
+        nats_b.assert_no_buffered_publish();
+
+        // Node B's local bridge creation and local NATS ingress, plus the
+        // receiver-sourced envelope attributed durably to node B, are valid
+        // remote deliveries on node A. Consume them without assuming CRDT
+        // document ordering, then use the exact count to prove node A did not
+        // publish any of its own node-A-attributed mutations.
+        wait_egress_published(&runtime_a, 3).await;
+        let mut initial_a_payloads = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let (subject, headers, payload) = nats_a.next_publish().await;
+            assert_eq!(subject, "vision.summary");
+            assert_eq!(
+                headers,
+                format!("NATS/1.0\r\n{ORIGIN_HEADER}: node-a\r\n\r\n").as_bytes()
+            );
+            initial_a_payloads.push(payload);
+        }
+        initial_a_payloads.sort();
+        let mut expected_initial_a_payloads = vec![
+            br#"{"local_bridge":true}"#.to_vec(),
+            br#"{"local_ingress":true}"#.to_vec(),
+            br#"{"returned":true}"#.to_vec(),
+        ];
+        expected_initial_a_payloads.sort();
+        assert_eq!(initial_a_payloads, expected_initial_a_payloads);
+        nats_a.assert_no_buffered_publish();
+
+        // A final reverse-direction publication proves the bridge continues
+        // after the exact node-A publication set above.
+        let reverse = r#"{"reverse_fence":true}"#;
+        node_b
+            .create_bridge_document(
+                "frames",
+                "reverse-fence",
+                &envelope("vision.summary", "node-b", reverse),
+            )
+            .await
+            .expect("reverse remote bridge write");
+        wait_document(&node_a, "frames", "reverse-fence", true).await;
+        let (subject, headers, payload) = nats_a.next_publish().await;
+        assert_eq!(subject, "vision.summary");
+        assert_eq!(payload, reverse.as_bytes());
+        assert_eq!(
+            headers,
+            format!("NATS/1.0\r\n{ORIGIN_HEADER}: node-a\r\n\r\n").as_bytes()
+        );
+        wait_egress_published(&runtime_a, 4).await;
+        nats_a.assert_no_buffered_publish();
+
+        let operations_a = runtime_a.operations_snapshot();
+        let operations_b = runtime_b.operations_snapshot();
+        assert_eq!(operations_a.remote_published, 4);
+        assert_eq!(operations_b.remote_published, 2);
+        assert_eq!(operations_a.publish_failures, 0);
+        assert_eq!(operations_b.publish_failures, 0);
+        assert_eq!(operations_a.queue_loss, 0);
+        assert_eq!(operations_b.queue_loss, 0);
+        assert_eq!(operations_a.ledger_failures, 0);
+        assert_eq!(operations_b.ledger_failures, 0);
+        assert!(operations_a.ready);
+        assert!(operations_b.ready);
         assert!(!runtime_a.is_finished());
         assert!(!runtime_b.is_finished());
 
