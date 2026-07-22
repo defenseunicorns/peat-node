@@ -142,7 +142,16 @@ path = "src/main.rs"
 # rc.49 (peat-mesh#306/#307): retry distribution documents whose Automerge key
 #   arrives before metadata materializes, so multi-receiver attachment delivery
 #   cannot permanently skip a partially synchronized document.
-peat-mesh = { version = "=0.9.0-rc.49", features = ["automerge-backend", "kubernetes"] }
+#
+# rc.50 (peat-mesh#313/#314): LatestOnly documents persist and sync as
+#   deterministic one-change snapshots, bounding Automerge history under
+#   sustained telemetry writes. Deprecated compaction APIs were removed and
+#   JSON updates now take ownership of existing documents.
+#
+# rc.51 (peat-mesh#316): persistent-channel setup and recovery activate the
+#   winning authenticated QUIC connection's accept loop before opening streams,
+#   preserving bidirectional convergence after reconnect.
+peat-mesh = { version = "=0.9.0-rc.51", features = ["automerge-backend", "kubernetes"] }
 # Directly match peat-mesh's locked Automerge API because peat-node performs a
 # non-recursive structural preflight before delegating to peat-mesh helpers.
 automerge = "=0.9.0"
