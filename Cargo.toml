@@ -261,6 +261,7 @@ depends = "$auto, adduser, systemd"
 maintainer-scripts = "packaging/debian"
 assets = [
     ["target/release/peat-node", "usr/bin/", "755"],
+    ["target/release/peat", "usr/bin/", "755"],
     ["packaging/peat-node.env", "etc/peat-node/peat-node.env", "640"],
 ]
 systemd-units = { unit-scripts = "packaging", unit-name = "peat-node", enable = true, start = true }
@@ -271,6 +272,7 @@ post_install_script = "packaging/rpm/postinstall.sh"
 pre_uninstall_script = "packaging/rpm/preuninstall.sh"
 assets = [
     { source = "target/release/peat-node", dest = "/usr/bin/peat-node", mode = "755" },
+    { source = "target/release/peat", dest = "/usr/bin/peat", mode = "755" },
     { source = "packaging/peat-node.service", dest = "/usr/lib/systemd/system/peat-node.service", mode = "644" },
     { source = "packaging/peat-node.env", dest = "/etc/peat-node/peat-node.env", mode = "640", config = "noreplace" },
 ]

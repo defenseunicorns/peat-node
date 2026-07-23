@@ -7,9 +7,10 @@ x86_64 and ARM64 to GitHub Pages:
 - DNF/YUM: `https://defenseunicorns.github.io/peat-node/rpm/stable`
 - Signing key: `https://defenseunicorns.github.io/peat-node/peat-node-archive-key.gpg`
 
-The package installs `/usr/bin/peat-node`, creates the `peat` system user and
-`/var/lib/peat-node`, installs `/etc/peat-node/peat-node.env`, and enables and
-starts `peat-node.service`. The generic configuration listens only on
+The package installs both `/usr/bin/peat-node` and the `/usr/bin/peat` operator
+CLI, creates the `peat` system user and `/var/lib/peat-node`, installs
+`/etc/peat-node/peat-node.env`, and enables and starts `peat-node.service`. The
+generic configuration listens only on
 `127.0.0.1:50051`. Configure deployment identity and credentials before
 exposing the service beyond the host.
 

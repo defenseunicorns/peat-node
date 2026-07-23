@@ -287,8 +287,8 @@ jobs:
           sudo apt-get install -y protobuf-compiler
           cargo install cargo-deb --locked
           cargo install cargo-generate-rpm --locked
-      - name: Build release binary
-        run: cargo build --release --bin peat-node
+      - name: Build release binaries
+        run: cargo build --release --workspace
       - name: Build packages
         run: |
           cargo deb --no-build
@@ -303,6 +303,8 @@ jobs:
               test "$(stat -c %U /var/lib/peat-node)" = peat
               test -f /lib/systemd/system/peat-node.service
               systemd-analyze verify /lib/systemd/system/peat-node.service
+              test -x /usr/bin/peat
+              /usr/bin/peat --help >/dev/null
               set -a
               . /etc/peat-node/peat-node.env
               set +a
@@ -327,6 +329,8 @@ jobs:
               test "$(stat -c %U /var/lib/peat-node)" = peat
               test -f /usr/lib/systemd/system/peat-node.service
               systemd-analyze verify /usr/lib/systemd/system/peat-node.service
+              test -x /usr/bin/peat
+              /usr/bin/peat --help >/dev/null
               set -a
               . /etc/peat-node/peat-node.env
               set +a

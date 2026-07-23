@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Debian and RPM systemd packages in tagged releases.** Packages install
-  `peat-node` as a hardened service owned by the dedicated `peat` user, include
+- **Debian and RPM systemd packages in tagged releases.** Packages install both
+  the `peat-node` service and `peat` operator CLI, run the service under the
+  dedicated `peat` user, include
   a localhost-only generic configuration, and persist state in
   `/var/lib/peat-node`. Release CI builds and verifies both package formats
   natively for x86_64 and ARM64, starts the packaged binary under the service
