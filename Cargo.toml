@@ -151,7 +151,11 @@ path = "src/main.rs"
 # rc.51 (peat-mesh#316): persistent-channel setup and recovery activate the
 #   winning authenticated QUIC connection's accept loop before opening streams,
 #   preserving bidirectional convergence after reconnect.
-peat-mesh = { version = "=0.9.0-rc.51", features = ["automerge-backend", "kubernetes"] }
+#
+# rc.52 (peat-mesh#320/#321): tactical Iroh endpoints disable UDP segmentation
+#   offload to avoid intermittent EIO sends and false active-link QUIC timeouts
+#   on Docker veth/netem paths.
+peat-mesh = { version = "=0.9.0-rc.52", features = ["automerge-backend", "kubernetes"] }
 # Directly match peat-mesh's locked Automerge API because peat-node performs a
 # non-recursive structural preflight before delegating to peat-mesh helpers.
 automerge = "=0.9.0"
