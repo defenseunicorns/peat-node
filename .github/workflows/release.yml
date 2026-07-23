@@ -406,6 +406,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           path: /tmp/peat-packages
@@ -444,6 +445,7 @@ jobs:
           site="$RUNNER_TEMP/site"
           apt_root="$site/apt"
           mkdir -p "$apt_root/pool/main/p/peat-node"
+          cp docs/package-repository-index.html "$site/index.html"
           cp /tmp/peat-packages/debian/*.deb "$apt_root/pool/main/p/peat-node/"
           for arch in amd64 arm64; do
             packages_dir="$apt_root/dists/stable/main/binary-$arch"

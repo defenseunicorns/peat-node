@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Package repository landing page.** GitHub Pages now presents copyable APT
+  and DNF/YUM setup commands, service operation guidance, and a link to the
+  complete package installation documentation.
+
 ## [0.4.14] - 2026-07-23
 
 ### Fixed
