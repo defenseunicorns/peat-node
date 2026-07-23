@@ -75,6 +75,16 @@ PEAT_NODE_SHARED_KEY=replace-with-base64-encoded-32-byte-key
 PEAT_NODE_AUTO_SYNC=true
 ```
 
+Generate a cryptographically random Base64-encoded 32-byte shared key with
+OpenSSL:
+
+```bash
+openssl rand -base64 32
+```
+
+Use the same result as `PEAT_NODE_SHARED_KEY` on every node in the formation.
+Treat it as a secret: do not commit it or paste it into logs.
+
 The environment file is preserved across RPM upgrades. Debian package upgrades
 also treat files under `/etc` as administrator configuration. Apply changes and
 inspect the service with:

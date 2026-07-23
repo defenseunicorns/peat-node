@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install peat-node</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 880px; margin: 0 auto; padding: 2rem 1rem 4rem; line-height: 1.55; }
+    h1, h2 { line-height: 1.2; }
+    pre { overflow-x: auto; padding: 1rem; border: 1px solid #8886; border-radius: .4rem; background: #8881; }
+    code { font-family: ui-monospace, monospace; }
+    .warning { border-left: .3rem solid #d69e2e; padding-left: 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Install peat-node</h1>
+    <p>Stable peat-node packages are available for x86_64 and ARM64 through signed APT and DNF/YUM repositories.</p>
+
+    <h2>Debian and Ubuntu</h2>
+    <pre><code>sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://defenseunicorns.github.io/peat-node/peat-node-archive-key.gpg \
+  | sudo tee /etc/apt/keyrings/peat-node.gpg &gt;/dev/null
+sudo chmod 0644 /etc/apt/keyrings/peat-node.gpg
+
+cat &lt;&lt;'EOF' | sudo tee /etc/apt/sources.list.d/peat-node.list
+deb [signed-by=/etc/apt/keyrings/peat-node.gpg] https://defenseunicorns.github.io/peat-node/apt stable main
+EOF
+sudo apt update
+sudo apt install peat-node</code></pre>
+
+    <h2>Fedora, RHEL, and Rocky Linux</h2>
+    <pre><code>cat &lt;&lt;'EOF' | sudo tee /etc/yum.repos.d/peat-node.repo
+[peat-node]
+name=Peat Node
+baseurl=https://defenseunicorns.github.io/peat-node/rpm/stable/$basearch
+enabled=1
+repo_gpgcheck=1
+gpgcheck=0
+gpgkey=https://defenseunicorns.github.io/peat-node/peat-node-archive-key.asc
+EOF
+sudo dnf makecache
+sudo dnf install peat-node</code></pre>
+    <p><code>yum install peat-node</code> is equivalent where YUM fronts DNF.</p>
+
+    <h2>Configure the service</h2>
+    <p class="warning">The packaged default listens only on <code>127.0.0.1:50051</code>. Set deployment identity and credentials in <code>/etc/peat-node/peat-node.env</code> before exposing the service beyond the host.</p>
+    <p>Generate a cryptographically random Base64-encoded 32-byte shared key with OpenSSL:</p>
+    <pre><code>openssl rand -base64 32</code></pre>
+    <p>Set the result as <code>PEAT_NODE_SHARED_KEY</code> on every node in the same formation. Treat it as a secret: do not commit it or paste it into logs.</p>
+    <pre><code>sudo systemctl restart peat-node
+sudo systemctl status peat-node
+sudo journalctl -u peat-node -f</code></pre>
+
+    <p>The package installs <code>peat-node</code> and the <code>peat</code> operator CLI, runs the service as the dedicated <code>peat</code> system user, and stores state under <code>/var/lib/peat-node</code>.</p>
+    <p><a href="https://github.com/defenseunicorns/peat-node/blob/main/docs/PACKAGE_INSTALLATION.md">Full package installation and configuration documentation</a></p>
+  </main>
+</body>
+</html>
