@@ -234,6 +234,59 @@ jobs:
           cargo test -p peat-cli --lib
           cargo test -p peat-cli --test cli_parser
 
+  package-upgrade:
+    name: Package install and upgrade
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install package build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+      - name: Build packages
+        run: |
+          cargo build --release --workspace
+          cargo deb --no-build
+          cargo generate-rpm
+      - name: Test Debian systemd install and upgrade
+        run: |
+          sudo install -d -o root -g root -m 0750 /var/lib/peat-node/automerge
+          sudo touch /var/lib/peat-node/automerge/legacy-state
+          sudo apt-get install -y "$PWD"/target/debian/*.deb
+          test "$(systemctl is-active peat-node.service)" = active
+          test "$(systemctl show -p User --value peat-node.service)" = peat
+          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          old_pid="$(systemctl show -p MainPID --value peat-node.service)"
+          sudo chown root:root /var/lib/peat-node/automerge/legacy-state
+          sudo apt-get install --reinstall -y "$PWD"/target/debian/*.deb
+          test "$(systemctl is-active peat-node.service)" = active
+          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          new_pid="$(systemctl show -p MainPID --value peat-node.service)"
+          test "$new_pid" != "$old_pid"
+          curl --retry 20 --retry-delay 1 --retry-all-errors \
+            http://127.0.0.1:50051/ >/dev/null
+          sudo apt-get remove -y peat-node
+          test ! -e /lib/systemd/system/peat-node.service
+      - name: Test RPM ownership migration
+        run: |
+          docker run --rm \
+            -v "$PWD/target/generate-rpm:/packages:ro" \
+            fedora:latest bash -euxo pipefail -c '
+              install -d -o root -g root -m 0750 /var/lib/peat-node/automerge
+              touch /var/lib/peat-node/automerge/legacy-state
+              dnf install -y /packages/*.rpm
+              test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+              chown root:root /var/lib/peat-node/automerge/legacy-state
+              dnf reinstall -y /packages/*.rpm
+              test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+              dnf remove -y peat-node
+              test ! -e /usr/lib/systemd/system/peat-node.service
+            '
+
   helm-lint:
     name: Helm Lint
     runs-on: ubuntu-latest

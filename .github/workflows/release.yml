@@ -293,14 +293,42 @@ jobs:
         run: |
           cargo deb --no-build
           cargo generate-rpm
+      - name: Test Debian systemd install and upgrade
+        run: |
+          sudo install -d -o root -g root -m 0750 /var/lib/peat-node/automerge
+          sudo touch /var/lib/peat-node/automerge/legacy-state
+          sudo apt-get install -y "$PWD"/target/debian/*.deb
+          test "$(systemctl is-active peat-node.service)" = active
+          test "$(systemctl show -p User --value peat-node.service)" = peat
+          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          old_pid="$(systemctl show -p MainPID --value peat-node.service)"
+          sudo chown root:root /var/lib/peat-node/automerge/legacy-state
+          sudo apt-get install --reinstall -y "$PWD"/target/debian/*.deb
+          test "$(systemctl is-active peat-node.service)" = active
+          test "$(systemctl show -p User --value peat-node.service)" = peat
+          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          new_pid="$(systemctl show -p MainPID --value peat-node.service)"
+          test "$new_pid" != "$old_pid"
+          curl --retry 20 --retry-delay 1 --retry-all-errors \
+            http://127.0.0.1:50051/ >/dev/null
+          sudo apt-get remove -y peat-node
+          test ! -e /lib/systemd/system/peat-node.service
+          sudo rm -rf /var/lib/peat-node
+          sudo systemctl daemon-reload
+          sudo systemctl reset-failed
+          sudo rm -f /etc/peat-node/peat-node.env
+
       - name: Test Debian package install and startup
         run: |
           docker run --rm \
             -v "$PWD/target/debian:/packages:ro" \
             debian:trixie-slim bash -euxo pipefail -c '
               apt-get update
+              install -d -o root -g root -m 0750 /var/lib/peat-node/automerge
+              touch /var/lib/peat-node/automerge/legacy-state
               apt-get install -y /packages/*.deb curl
               test "$(stat -c %U /var/lib/peat-node)" = peat
+              test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
               test -f /lib/systemd/system/peat-node.service
               systemd-analyze verify /lib/systemd/system/peat-node.service
               test -x /usr/bin/peat
@@ -325,8 +353,11 @@ jobs:
           docker run --rm \
             -v "$PWD/target/generate-rpm:/packages:ro" \
             fedora:latest bash -euxo pipefail -c '
+              install -d -o root -g root -m 0750 /var/lib/peat-node/automerge
+              touch /var/lib/peat-node/automerge/legacy-state
               dnf install -y /packages/*.rpm curl
               test "$(stat -c %U /var/lib/peat-node)" = peat
+              test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
               test -f /usr/lib/systemd/system/peat-node.service
               systemd-analyze verify /usr/lib/systemd/system/peat-node.service
               test -x /usr/bin/peat
