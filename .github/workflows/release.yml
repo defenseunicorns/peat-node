@@ -300,13 +300,13 @@ jobs:
           sudo apt-get install -y "$PWD"/target/debian/*.deb
           test "$(systemctl is-active peat-node.service)" = active
           test "$(systemctl show -p User --value peat-node.service)" = peat
-          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          test "$(sudo stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
           old_pid="$(systemctl show -p MainPID --value peat-node.service)"
           sudo chown root:root /var/lib/peat-node/automerge/legacy-state
           sudo apt-get install --reinstall -y "$PWD"/target/debian/*.deb
           test "$(systemctl is-active peat-node.service)" = active
           test "$(systemctl show -p User --value peat-node.service)" = peat
-          test "$(stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          test "$(sudo stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
           new_pid="$(systemctl show -p MainPID --value peat-node.service)"
           test "$new_pid" != "$old_pid"
           curl --retry 20 --retry-delay 1 --retry-all-errors \
