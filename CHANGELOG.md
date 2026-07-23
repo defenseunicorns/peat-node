@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Package upgrades migrate legacy state ownership.** Debian and RPM
+  installation hooks recursively assign `/var/lib/peat-node` to the dedicated
+  `peat` account before service startup. CI now exercises a real systemd
+  install and reinstall on Debian and verifies ownership, process replacement,
+  service health, and API availability; RPM install/reinstall ownership is also
+  covered.
+
 ## [0.4.13] - 2026-07-22
 
 ### Added
