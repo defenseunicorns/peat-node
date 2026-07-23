@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/2 keepalives, and per-connection stream limits. Add an opt-in glibc
   allocator-statistics hook and regression coverage proving stalled plain-TCP
   clients are reclaimed without disrupting sustained healthy writes.
+- Upgrade peat-node and peat-cli to peat-mesh 0.9.0-rc.52, disabling UDP
+  segmentation offload on tactical Iroh endpoints to prevent intermittent
+  Docker veth/netem `EIO` sends from causing false active-link QUIC timeouts
+  and multi-second delivery backlogs
+  ([peat-mesh#320](https://github.com/defenseunicorns/peat-mesh/issues/320)).
 
 ## [0.4.11] - 2026-07-22
 
