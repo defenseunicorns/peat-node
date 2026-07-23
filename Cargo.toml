@@ -270,6 +270,7 @@ systemd-units = { unit-scripts = "packaging", unit-name = "peat-node", enable = 
 auto-req = "builtin"
 post_install_script = "packaging/rpm/postinstall.sh"
 pre_uninstall_script = "packaging/rpm/preuninstall.sh"
+post_uninstall_script = "packaging/rpm/postuninstall.sh"
 assets = [
     { source = "target/release/peat-node", dest = "/usr/bin/peat-node", mode = "755" },
     { source = "target/release/peat", dest = "/usr/bin/peat", mode = "755" },
