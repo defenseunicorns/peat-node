@@ -67,6 +67,11 @@ signed, hence `gpgcheck=0` and `repo_gpgcheck=1`.
 Review `/etc/peat-node/peat-node.env` before joining a formation. At minimum,
 set the deployment-specific application ID and shared key:
 
+`peat-node.service` reads only `/etc/peat-node/peat-node.env`. An
+`/etc/peat-node.env` file is from an older or external installation and is
+ignored by the packaged service; migrate any required values into the canonical
+file, then archive or remove the old file.
+
 ```ini
 PEAT_NODE_LISTEN=tcp://127.0.0.1:50051
 PEAT_NODE_DATA_DIR=/var/lib/peat-node

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Package environment configuration is canonical and self-repairing.** Debian
+  and RPM packages now ship a complete example, restore an accidentally empty
+  `/etc/peat-node/peat-node.env` during install or upgrade, and include
+  shared-key generation guidance. Package lifecycle tests assert that systemd
+  uses this path and that packages do not create the obsolete
+  `/etc/peat-node.env` path.
+
 ## [0.4.15] - 2026-07-23
 
 ### Added
