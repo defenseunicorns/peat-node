@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "peat-node"
-version = "0.4.12"
+version = "0.4.13"
 edition = "2021"
 authors = ["Kit Plummer <kitplummer@defenseunicorns.com>"]
 license = "Apache-2.0"
@@ -255,3 +255,26 @@ rcgen = "0.13"
 # relevant tests pins them to one-at-a-time execution within their
 # binary; cargo test already runs binaries sequentially.
 serial_test = "3"
+
+[package.metadata.deb]
+depends = "$auto, adduser, systemd"
+maintainer-scripts = "packaging/debian"
+assets = [
+    ["target/release/peat-node", "usr/bin/", "755"],
+    ["packaging/peat-node.env", "etc/peat-node/peat-node.env", "640"],
+]
+systemd-units = { unit-scripts = "packaging", unit-name = "peat-node", enable = true, start = true }
+
+[package.metadata.generate-rpm]
+auto-req = "builtin"
+post_install_script = "packaging/rpm/postinstall.sh"
+pre_uninstall_script = "packaging/rpm/preuninstall.sh"
+assets = [
+    { source = "target/release/peat-node", dest = "/usr/bin/peat-node", mode = "755" },
+    { source = "packaging/peat-node.service", dest = "/usr/lib/systemd/system/peat-node.service", mode = "644" },
+    { source = "packaging/peat-node.env", dest = "/etc/peat-node/peat-node.env", mode = "640", config = "noreplace" },
+]
+
+[package.metadata.generate-rpm.requires]
+shadow-utils = "*"
+systemd = "*"

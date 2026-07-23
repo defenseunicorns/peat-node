@@ -1,0 +1,22 @@
+[Unit]
+Description=Peat mesh node
+Documentation=https://github.com/defenseunicorns/peat-node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=peat
+Group=peat
+EnvironmentFile=-/etc/peat-node/peat-node.env
+ExecStart=/usr/bin/peat-node --node-id=peat-%H
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/peat-node
+
+[Install]
+WantedBy=multi-user.target

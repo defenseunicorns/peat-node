@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.13] - 2026-07-22
+
+### Added
+
+- **Debian and RPM systemd packages in tagged releases.** Packages install
+  `peat-node` as a hardened service owned by the dedicated `peat` user, include
+  a localhost-only generic configuration, and persist state in
+  `/var/lib/peat-node`. Release CI builds and verifies both package formats
+  natively for x86_64 and ARM64, starts the packaged binary under the service
+  account, and tests uninstall cleanup. Stable releases also publish signed APT
+  and DNF repository metadata to GitHub Pages for package-manager installation
+  and upgrades.
+
+
 ## [0.4.12] - 2026-07-23
 
 ### Fixed
