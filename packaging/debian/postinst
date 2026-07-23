@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if ! getent group peat >/dev/null; then
+    addgroup --system peat
+fi
+if ! getent passwd peat >/dev/null; then
+    adduser --system --ingroup peat --home /var/lib/peat-node \
+        --no-create-home --disabled-login --disabled-password peat
+fi
+install -d -o peat -g peat -m 0750 /var/lib/peat-node
+
+#DEBHELPER#

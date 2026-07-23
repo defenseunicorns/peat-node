@@ -147,6 +147,12 @@ Proto definition: [`proto/sidecar.proto`](proto/sidecar.proto)
 
 ## Deployment
 
+### Debian and RPM
+
+Stable releases provide signed APT and DNF repositories for x86_64 and ARM64.
+See [Package installation](docs/PACKAGE_INSTALLATION.md) for host repository
+configuration, service defaults, and repository administrator setup.
+
 ### Docker
 
 ```bash

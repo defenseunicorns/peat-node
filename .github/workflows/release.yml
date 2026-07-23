@@ -261,9 +261,227 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  linux-packages:
+    name: Debian and RPM packages (${{ matrix.arch.label }})
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - label: x86_64
+            runner: ubuntu-24.04
+          - label: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.arch.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-packages-${{ matrix.arch.label }}
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+      - name: Build release binaries
+        run: cargo build --release --workspace
+      - name: Build packages
+        run: |
+          cargo deb --no-build
+          cargo generate-rpm
+      - name: Test Debian package install and startup
+        run: |
+          docker run --rm \
+            -v "$PWD/target/debian:/packages:ro" \
+            debian:trixie-slim bash -euxo pipefail -c '
+              apt-get update
+              apt-get install -y /packages/*.deb curl
+              test "$(stat -c %U /var/lib/peat-node)" = peat
+              test -f /lib/systemd/system/peat-node.service
+              systemd-analyze verify /lib/systemd/system/peat-node.service
+              test -x /usr/bin/peat
+              /usr/bin/peat --help >/dev/null
+              set -a
+              . /etc/peat-node/peat-node.env
+              set +a
+              runuser -u peat --preserve-environment -- \
+                /usr/bin/peat-node --node-id=package-smoke &
+              pid=$!
+              trap "kill $pid" EXIT
+              curl --retry 20 --retry-delay 1 --retry-all-errors \
+                http://127.0.0.1:50051/ >/dev/null
+              kill "$pid"
+              wait "$pid" || true
+              trap - EXIT
+              apt-get remove -y peat-node
+              test ! -e /lib/systemd/system/peat-node.service
+            '
+      - name: Test RPM package install and startup
+        run: |
+          docker run --rm \
+            -v "$PWD/target/generate-rpm:/packages:ro" \
+            fedora:latest bash -euxo pipefail -c '
+              dnf install -y /packages/*.rpm curl
+              test "$(stat -c %U /var/lib/peat-node)" = peat
+              test -f /usr/lib/systemd/system/peat-node.service
+              systemd-analyze verify /usr/lib/systemd/system/peat-node.service
+              test -x /usr/bin/peat
+              /usr/bin/peat --help >/dev/null
+              set -a
+              . /etc/peat-node/peat-node.env
+              set +a
+              chroot --userspec=peat:peat / \
+                /usr/bin/peat-node --node-id=package-smoke &
+              pid=$!
+              trap "kill $pid" EXIT
+              curl --retry 20 --retry-delay 1 --retry-all-errors \
+                http://127.0.0.1:50051/ >/dev/null
+              kill "$pid"
+              wait "$pid" || true
+              trap - EXIT
+              dnf remove -y peat-node
+              test ! -e /usr/lib/systemd/system/peat-node.service
+            '
+      - name: Generate checksums
+        run: |
+          cd target
+          sha256sum debian/*.deb generate-rpm/*.rpm \
+            > "peat-node-packages-${{ matrix.arch.label }}.sha256"
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: peat-node-linux-packages-${{ matrix.arch.label }}
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+            target/peat-node-packages-${{ matrix.arch.label }}.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  package-repository:
+    name: Publish APT and DNF repositories
+    needs: linux-packages
+    if: ${{ !contains(github.ref_name, '-rc.') && !contains(github.ref_name, '-alpha.') && !contains(github.ref_name, '-beta.') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/peat-packages
+          pattern: peat-node-linux-packages-*
+          merge-multiple: true
+      - name: Install repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils createrepo-c gnupg
+      - name: Import repository signing key
+        env:
+          PACKAGE_REPOSITORY_GPG_PRIVATE_KEY: ${{ secrets.PACKAGE_REPOSITORY_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PACKAGE_REPOSITORY_GPG_PRIVATE_KEY" ]; then
+            echo "::error::PACKAGE_REPOSITORY_GPG_PRIVATE_KEY is not configured"
+            exit 1
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          printf '%s' "$PACKAGE_REPOSITORY_GPG_PRIVATE_KEY" \
+            | gpg --batch --import
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys \
+            | awk -F: '$1 == "fpr" { print $10; exit }')"
+          if [ -z "$fingerprint" ]; then
+            echo "::error::The configured key contains no private key"
+            exit 1
+          fi
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "PACKAGE_REPOSITORY_GPG_FINGERPRINT=$fingerprint" >> "$GITHUB_ENV"
+      - name: Build signed APT repository
+        env:
+          PACKAGE_REPOSITORY_GPG_PASSPHRASE: ${{ secrets.PACKAGE_REPOSITORY_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/site"
+          apt_root="$site/apt"
+          mkdir -p "$apt_root/pool/main/p/peat-node"
+          cp /tmp/peat-packages/debian/*.deb "$apt_root/pool/main/p/peat-node/"
+          for arch in amd64 arm64; do
+            packages_dir="$apt_root/dists/stable/main/binary-$arch"
+            mkdir -p "$packages_dir"
+            (
+              cd "$apt_root"
+              apt-ftparchive -a "$arch" packages pool/main \
+                > "dists/stable/main/binary-$arch/Packages"
+            )
+            gzip -9n -c "$packages_dir/Packages" > "$packages_dir/Packages.gz"
+          done
+          (
+            cd "$apt_root"
+            apt-ftparchive \
+              -o APT::FTPArchive::Release::Origin="Defense Unicorns" \
+              -o APT::FTPArchive::Release::Label="Peat Node" \
+              -o APT::FTPArchive::Release::Suite="stable" \
+              -o APT::FTPArchive::Release::Codename="stable" \
+              -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+              -o APT::FTPArchive::Release::Components="main" \
+              release dists/stable > dists/stable/Release
+          )
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$PACKAGE_REPOSITORY_GPG_PASSPHRASE" \
+            --local-user "$PACKAGE_REPOSITORY_GPG_FINGERPRINT" \
+            --armor --detach-sign \
+            --output "$apt_root/dists/stable/Release.gpg" \
+            "$apt_root/dists/stable/Release"
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$PACKAGE_REPOSITORY_GPG_PASSPHRASE" \
+            --local-user "$PACKAGE_REPOSITORY_GPG_FINGERPRINT" \
+            --armor --clearsign \
+            --output "$apt_root/dists/stable/InRelease" \
+            "$apt_root/dists/stable/Release"
+      - name: Build signed DNF repository
+        env:
+          PACKAGE_REPOSITORY_GPG_PASSPHRASE: ${{ secrets.PACKAGE_REPOSITORY_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          site="$RUNNER_TEMP/site"
+          for arch in x86_64 aarch64; do
+            repo="$site/rpm/stable/$arch"
+            mkdir -p "$repo"
+            cp "/tmp/peat-packages/generate-rpm/"*".$arch.rpm" "$repo/"
+            createrepo_c "$repo"
+            gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "$PACKAGE_REPOSITORY_GPG_PASSPHRASE" \
+              --local-user "$PACKAGE_REPOSITORY_GPG_FINGERPRINT" \
+              --armor --detach-sign \
+              --output "$repo/repodata/repomd.xml.asc" \
+              "$repo/repodata/repomd.xml"
+          done
+          gpg --batch --yes \
+            --output "$site/peat-node-archive-key.gpg" \
+            --export "$PACKAGE_REPOSITORY_GPG_FINGERPRINT"
+          gpg --batch --yes --armor \
+            --output "$site/peat-node-archive-key.asc" \
+            --export "$PACKAGE_REPOSITORY_GPG_FINGERPRINT"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+      - name: Deploy package repositories
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   release:
     name: GitHub Release
-    needs: [manifest, peat-cli-binaries]
+    needs: [manifest, peat-cli-binaries, linux-packages]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -313,6 +531,12 @@ jobs:
           path: /tmp/peat-binaries
           pattern: peat-cli-*
           merge-multiple: true
+      - name: Download Linux package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/peat-packages
+          pattern: peat-node-linux-packages-*
+          merge-multiple: true
       - name: Attach peat-cli binaries to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -322,3 +546,12 @@ jobs:
           ls -la
           # --clobber so a re-run of a tag replaces previous assets.
           gh release upload "$GITHUB_REF_NAME" peat-*.tar.gz peat-*.tar.gz.sha256 peat-*.zip peat-*.zip.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Attach Linux packages to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd /tmp/peat-packages
+          gh release upload "$GITHUB_REF_NAME" \
+            debian/*.deb generate-rpm/*.rpm peat-node-packages-*.sha256 \
+            --clobber --repo "$GITHUB_REPOSITORY"
