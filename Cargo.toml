@@ -263,6 +263,7 @@ assets = [
     ["target/release/peat-node", "usr/bin/", "755"],
     ["target/release/peat", "usr/bin/", "755"],
     ["packaging/peat-node.env", "etc/peat-node/peat-node.env", "640"],
+    ["packaging/peat-node.env", "usr/share/peat-node/peat-node.env.example", "640"],
 ]
 systemd-units = { unit-scripts = "packaging", unit-name = "peat-node", enable = true, start = true }
 
@@ -276,6 +277,7 @@ assets = [
     { source = "target/release/peat", dest = "/usr/bin/peat", mode = "755" },
     { source = "packaging/peat-node.service", dest = "/usr/lib/systemd/system/peat-node.service", mode = "644" },
     { source = "packaging/peat-node.env", dest = "/etc/peat-node/peat-node.env", mode = "640", config = "noreplace" },
+    { source = "packaging/peat-node.env", dest = "/usr/share/peat-node/peat-node.env.example", mode = "640" },
 ]
 
 [package.metadata.generate-rpm.requires]

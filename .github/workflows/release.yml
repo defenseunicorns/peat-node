@@ -301,12 +301,21 @@ jobs:
           test "$(systemctl is-active peat-node.service)" = active
           test "$(systemctl show -p User --value peat-node.service)" = peat
           test "$(sudo stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          test -s /etc/peat-node/peat-node.env
+          sudo grep -qx '# PEAT_NODE_SHARED_KEY=' /etc/peat-node/peat-node.env
+          test ! -e /etc/peat-node.env
+          test -f /usr/share/peat-node/peat-node.env.example
           old_pid="$(systemctl show -p MainPID --value peat-node.service)"
           sudo chown root:root /var/lib/peat-node/automerge/legacy-state
+          sudo truncate -s 0 /etc/peat-node/peat-node.env
           sudo apt-get install --reinstall -y "$PWD"/target/debian/*.deb
           test "$(systemctl is-active peat-node.service)" = active
           test "$(systemctl show -p User --value peat-node.service)" = peat
           test "$(sudo stat -c %U:%G /var/lib/peat-node/automerge/legacy-state)" = peat:peat
+          test -s /etc/peat-node/peat-node.env
+          sudo grep -qx '# PEAT_NODE_SHARED_KEY=' /etc/peat-node/peat-node.env
+          test "$(stat -c %U:%G:%a /etc/peat-node)" = root:root:755
+          test "$(stat -c %U:%G:%a /etc/peat-node/peat-node.env)" = root:peat:640
           new_pid="$(systemctl show -p MainPID --value peat-node.service)"
           test "$new_pid" != "$old_pid"
           curl --retry 20 --retry-delay 1 --retry-all-errors \
@@ -332,6 +341,10 @@ jobs:
               test -f /lib/systemd/system/peat-node.service
               systemd-analyze verify /lib/systemd/system/peat-node.service
               test -x /usr/bin/peat
+              test -s /etc/peat-node/peat-node.env
+              grep -qx "# PEAT_NODE_SHARED_KEY=" /etc/peat-node/peat-node.env
+              test ! -e /etc/peat-node.env
+              test -f /usr/share/peat-node/peat-node.env.example
               /usr/bin/peat --help >/dev/null
               set -a
               . /etc/peat-node/peat-node.env
@@ -361,6 +374,10 @@ jobs:
               test -f /usr/lib/systemd/system/peat-node.service
               systemd-analyze verify /usr/lib/systemd/system/peat-node.service
               test -x /usr/bin/peat
+              test -s /etc/peat-node/peat-node.env
+              grep -qx "# PEAT_NODE_SHARED_KEY=" /etc/peat-node/peat-node.env
+              test ! -e /etc/peat-node.env
+              test -f /usr/share/peat-node/peat-node.env.example
               /usr/bin/peat --help >/dev/null
               set -a
               . /etc/peat-node/peat-node.env
